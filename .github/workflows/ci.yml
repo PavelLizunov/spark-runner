@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      # TODO(CP7): pin this action by full commit SHA before release readiness.
+      - uses: actions/checkout@v4
+
+      - name: Validate JSON evidence files
+        run: |
+          set -euo pipefail
+          python3 -c "import json; json.load(open('PROGRESS.json'))"
+          python3 -c "import json; json.load(open('docs/evidence/run.json'))"
+
+      - name: Validate JSONL evidence timeline
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+
+          with open("docs/evidence/events.jsonl", "r", encoding="utf-8") as handle:
+              for line_number, line in enumerate(handle, start=1):
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      json.loads(line)
+                  except json.JSONDecodeError as exc:
+                      raise SystemExit(
+                          f"docs/evidence/events.jsonl:{line_number}: invalid JSON: {exc}"
+                      )
+          PY
+
+      - name: Rust checks (only if a crate exists yet)
+        run: |
+          set -euo pipefail
+          if [ -f Cargo.toml ]; then
+            cargo fmt --all -- --check
+            cargo clippy --all-targets -- -D warnings
+            cargo test --locked
+          else
+            echo "No Cargo.toml present yet; skipping Rust checks."
+          fi

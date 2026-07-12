@@ -1,0 +1,81 @@
+{
+  "run_id": "spark-runner-foundation-20260712",
+  "repo": "PavelLizunov/spark-runner",
+  "current_checkpoint": "CP2",
+  "previous_checkpoint": "CP1",
+  "state": "active",
+  "completed_checkpoints": ["CP1"],
+  "blocker": null,
+  "updated_at": "2026-07-12T23:00:00Z",
+  "next_command": "Implement the minimal Rust binary crate (single crate, no workspace) that spawns `codex app-server --listen stdio://`, performs initialize/account/model/rate-limit reads over JSONL, and drives one thread/start + turn/start to a terminal turn/completed event, per ADR-001..ADR-005.",
+  "checkpoints": {
+    "CP1": {
+      "name": "Phase 0 bootstrap: raw app-server + Python SDK oracle",
+      "state": "green",
+      "started_at": "2026-07-12T22:59:38Z",
+      "completed_at": "2026-07-12T23:00:00Z",
+      "evidence_file": "docs/evidence/cp/CP1.md",
+      "raw_app_server": {
+        "codex_cli_version": "0.142.0",
+        "model_confirmed": "gpt-5.3-codex-spark",
+        "fallback_model_used": false,
+        "duration_s": 8.02,
+        "event_count": 30,
+        "stderr_hash_count": 1,
+        "ok": true,
+        "summary": "initialize, account/read, model/list, rateLimits/read, thread/start and turn/start all ok; terminal turn/completed with status completed observed after correcting sandbox shape to stable thread-level read-only."
+      },
+      "python_sdk_oracle": {
+        "package": "openai-codex",
+        "model_confirmed": "gpt-5.3-codex-spark",
+        "fallback_model_used": false,
+        "duration_ms": 2331,
+        "wall_duration_s": 3.713,
+        "ok": true,
+        "summary": "account/models/rate-limit reads and thread_start/Thread.run oracle green after normalizing enum values for JSON serialization."
+      }
+    },
+    "CP2": {
+      "name": "Minimal Rust runner: app-server client + one full turn",
+      "state": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "evidence_file": "docs/evidence/cp/CP2.md"
+    },
+    "CP3": {
+      "name": "Pending",
+      "state": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "evidence_file": "docs/evidence/cp/CP3.md"
+    },
+    "CP4": {
+      "name": "Pending",
+      "state": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "evidence_file": "docs/evidence/cp/CP4.md"
+    },
+    "CP5": {
+      "name": "Pending",
+      "state": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "evidence_file": "docs/evidence/cp/CP5.md"
+    },
+    "CP6": {
+      "name": "Pending",
+      "state": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "evidence_file": "docs/evidence/cp/CP6.md"
+    },
+    "CP7": {
+      "name": "Pending",
+      "state": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "evidence_file": "docs/evidence/cp/CP7.md"
+    }
+  }
+}
