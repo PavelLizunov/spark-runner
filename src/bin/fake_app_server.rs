@@ -98,6 +98,13 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
+struct ApprovalFixture<'a> {
+    mode: &'a str,
+    approval_key: &'a str,
+    approval_method: &'a str,
+    wire_marker: Option<&'a Path>,
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let fake_mode = arg_value(&args, "--fake-mode");
@@ -356,12 +363,14 @@ fn main() -> io::Result<()> {
                     handle_approval_mode(
                         &mut lines,
                         &mut stdout,
-                        mode,
                         &thread_id,
                         &turn_id,
-                        &approval_key,
-                        &approval_method,
-                        wire_marker.as_deref(),
+                        ApprovalFixture {
+                            mode,
+                            approval_key: &approval_key,
+                            approval_method: &approval_method,
+                            wire_marker: wire_marker.as_deref(),
+                        },
                     )?;
                 } else {
                     send_turn_completed(&mut stdout, &thread_id, &turn_id, "completed")?;
@@ -387,12 +396,9 @@ fn main() -> io::Result<()> {
 fn handle_approval_mode(
     lines: &mut impl Iterator<Item = io::Result<String>>,
     stdout: &mut impl Write,
-    mode: &str,
     thread_id: &str,
     turn_id: &str,
-    approval_key: &str,
-    approval_method: &str,
-    wire_marker: Option<&Path>,
+    fixture: ApprovalFixture<'_>,
 ) -> io::Result<()> {
     let approval_id = 9001;
     send_approval_request(
@@ -400,16 +406,16 @@ fn handle_approval_mode(
         approval_id,
         thread_id,
         turn_id,
-        approval_key,
-        approval_method,
+        fixture.approval_key,
+        fixture.approval_method,
     )?;
 
-    if mode == "timeout" {
+    if fixture.mode == "timeout" {
         std::process::exit(0);
     }
 
     let first = read_server_message(lines)?;
-    record_wire(wire_marker, first.as_ref())?;
+    record_wire(fixture.wire_marker, first.as_ref())?;
     if first
         .as_ref()
         .and_then(|value| value.get("method"))
@@ -427,10 +433,10 @@ fn handle_approval_mode(
         .and_then(|result| result.get("decision"))
         .and_then(Value::as_str)
         .unwrap_or("missing");
-    match mode {
+    match fixture.mode {
         "wait_interrupt" => {
             let second = read_server_message(lines)?;
-            record_wire(wire_marker, second.as_ref())?;
+            record_wire(fixture.wire_marker, second.as_ref())?;
             if second
                 .as_ref()
                 .and_then(|value| value.get("method"))
@@ -448,11 +454,11 @@ fn handle_approval_mode(
                 approval_id,
                 thread_id,
                 turn_id,
-                approval_key,
-                approval_method,
+                fixture.approval_key,
+                fixture.approval_method,
             )?;
             let duplicate = read_server_message(lines)?;
-            record_wire(wire_marker, duplicate.as_ref())?;
+            record_wire(fixture.wire_marker, duplicate.as_ref())?;
         }
         "restart_unresolved" => {
             stdout.write_all(b"not-a-valid-jsonl-frame\n")?;
