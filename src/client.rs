@@ -31,6 +31,17 @@ pub enum ClientError {
     SessionPoisoned,
 }
 
+impl ClientError {
+    /// Whether this error is a JSONL protocol desync (oversized/malformed
+    /// frame or an unexpected response id) that poisoned the session and may
+    /// be worth a single controlled app-server restart. Other failures
+    /// (fallback model, invalid state transitions, timeouts) are not
+    /// automatically retried.
+    pub fn is_recoverable_desync(&self) -> bool {
+        matches!(self, ClientError::Jsonl(error) if error.is_desync())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ThreadStarted {
     pub thread_id: String,
@@ -61,35 +72,58 @@ impl CodexClient {
         }
     }
 
-    pub async fn initialize(&self) -> Result<Value, ClientError> {
-        let result = self
-            .rpc
-            .call(
-                "initialize",
-                json!({
-                    "clientInfo": {
-                        "name": "spark-runner",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    }
-                }),
-            )
-            .await?;
-        Ok(result)
+    /// Send an RPC call and poison the session if the app-server response
+    /// desyncs (oversized/malformed frame or an unexpected response id),
+    /// so every direct `CodexClient` caller observes the poison, not just
+    /// the higher-level doctor/run orchestration.
+    async fn rpc_call(&mut self, method: &str, params: Value) -> Result<Value, ClientError> {
+        match self.rpc.call(method, params).await {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if error.is_desync() {
+                    self.state.poison();
+                }
+                Err(error.into())
+            }
+        }
     }
 
-    pub async fn account_read(&self) -> Result<Value, ClientError> {
-        let result = self.rpc.call("account/read", json!({})).await?;
-        Ok(result)
+    /// Same as [`Self::rpc_call`] but for notification waits.
+    async fn rpc_wait_for_notification(&mut self, method: &str) -> Result<Value, ClientError> {
+        match self.rpc.wait_for_notification(method).await {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if error.is_desync() {
+                    self.state.poison();
+                }
+                Err(error.into())
+            }
+        }
     }
 
-    pub async fn model_list(&self) -> Result<Value, ClientError> {
-        let result = self.rpc.call("model/list", json!({})).await?;
-        Ok(result)
+    pub async fn initialize(&mut self) -> Result<Value, ClientError> {
+        self.rpc_call(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "spark-runner",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            }),
+        )
+        .await
     }
 
-    pub async fn rate_limits_read(&self) -> Result<Value, ClientError> {
-        let result = self.rpc.call("account/rateLimits/read", json!({})).await?;
-        Ok(result)
+    pub async fn account_read(&mut self) -> Result<Value, ClientError> {
+        self.rpc_call("account/read", json!({})).await
+    }
+
+    pub async fn model_list(&mut self) -> Result<Value, ClientError> {
+        self.rpc_call("model/list", json!({})).await
+    }
+
+    pub async fn rate_limits_read(&mut self) -> Result<Value, ClientError> {
+        self.rpc_call("account/rateLimits/read", json!({})).await
     }
 
     /// Start an ephemeral, read-only, on-request-approval thread pinned to
@@ -102,7 +136,7 @@ impl CodexClient {
             "model": REQUIRED_MODEL,
             "cwd": cwd.to_string_lossy(),
         });
-        let result = self.rpc.call("thread/start", params).await?;
+        let result = self.rpc_call("thread/start", params).await?;
 
         let thread_id = result
             .get("thread")
@@ -134,7 +168,7 @@ impl CodexClient {
             "threadId": thread_id,
             "input": [{ "type": "text", "text": prompt }],
         });
-        self.rpc.call("turn/start", params).await?;
+        self.rpc_call("turn/start", params).await?;
         self.state.on_turn_started()?;
         Ok(())
     }
@@ -142,7 +176,7 @@ impl CodexClient {
     /// Wait for the terminal `turn/completed` notification. Raw model output
     /// is intentionally not extracted or logged here — only the status field.
     pub async fn wait_turn_completed(&mut self) -> Result<TurnCompleted, ClientError> {
-        let params = self.rpc.wait_for_notification("turn/completed").await?;
+        let params = self.rpc_wait_for_notification("turn/completed").await?;
         let status = params
             .get("turn")
             .and_then(|turn| turn.get("status"))
