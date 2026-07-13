@@ -3,6 +3,9 @@
 
 use thiserror::Error;
 
+const MAX_INTERNAL_EVENTS: usize = 256;
+const MAX_INTERNAL_EVENT_BYTES: usize = 16 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerState {
     Idle,
@@ -86,6 +89,7 @@ pub struct SessionState {
     poisoned: bool,
     next_event_seq: u64,
     events: Vec<InternalEvent>,
+    event_bytes: usize,
 }
 
 impl SessionState {
@@ -96,6 +100,7 @@ impl SessionState {
             poisoned: false,
             next_event_seq: 1,
             events: Vec::new(),
+            event_bytes: 0,
         }
     }
 
@@ -232,9 +237,48 @@ impl SessionState {
     }
 
     fn emit(&mut self, kind: InternalEventKind) {
+        let event_bytes = internal_event_bytes(&kind);
+        while !self.events.is_empty()
+            && (self.events.len() >= MAX_INTERNAL_EVENTS
+                || self.event_bytes.saturating_add(event_bytes) > MAX_INTERNAL_EVENT_BYTES)
+        {
+            let removed = self.events.remove(0);
+            self.event_bytes = self
+                .event_bytes
+                .saturating_sub(internal_event_bytes(&removed.kind));
+        }
+        // Every currently emitted event has bounded, locally constructed
+        // strings. This guard also prevents a future untrusted variant from
+        // crossing the advertised internal queue cap.
+        if event_bytes > MAX_INTERNAL_EVENT_BYTES {
+            return;
+        }
         let seq = self.next_event_seq;
         self.next_event_seq += 1;
         self.events.push(InternalEvent { seq, kind });
+        self.event_bytes = self.event_bytes.saturating_add(event_bytes);
+    }
+}
+
+fn internal_event_bytes(kind: &InternalEventKind) -> usize {
+    match kind {
+        InternalEventKind::ApprovalRequested {
+            request_key,
+            method,
+        }
+        | InternalEventKind::ApprovalDecided {
+            request_key,
+            method,
+            ..
+        } => 64usize
+            .saturating_add(request_key.len())
+            .saturating_add(method.len()),
+        InternalEventKind::InterruptRequested { thread_id, turn_id } => 64usize
+            .saturating_add(thread_id.len())
+            .saturating_add(turn_id.len()),
+        InternalEventKind::WorkerTransition { .. }
+        | InternalEventKind::TurnTransition { .. }
+        | InternalEventKind::Poisoned => 32,
     }
 }
 

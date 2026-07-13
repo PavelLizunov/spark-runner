@@ -103,6 +103,10 @@ fn main() -> io::Result<()> {
     let fake_mode = arg_value(&args, "--fake-mode");
     let fail_marker = arg_value(&args, "--fail-marker").map(PathBuf::from);
     let approval_mode = arg_value(&args, "--approval-mode");
+    if let Some(marker) = arg_value(&args, "--pid-marker") {
+        std::fs::write(marker, std::process::id().to_string())?;
+    }
+    let wire_marker = arg_value(&args, "--wire-marker").map(PathBuf::from);
     if approval_mode.is_some() {
         if let Some(marker) = fail_marker.as_ref() {
             let _ = record_attempt(marker)?;
@@ -343,7 +347,14 @@ fn main() -> io::Result<()> {
                             }),
                 )?;
                 if let Some(mode) = approval_mode.as_deref() {
-                    handle_approval_mode(&mut lines, &mut stdout, mode, &thread_id, &turn_id)?;
+                    handle_approval_mode(
+                        &mut lines,
+                        &mut stdout,
+                        mode,
+                        &thread_id,
+                        &turn_id,
+                        wire_marker.as_deref(),
+                    )?;
                 } else {
                     send_turn_completed(&mut stdout, &thread_id, &turn_id, "completed")?;
                 }
@@ -371,6 +382,7 @@ fn handle_approval_mode(
     mode: &str,
     thread_id: &str,
     turn_id: &str,
+    wire_marker: Option<&Path>,
 ) -> io::Result<()> {
     let approval_id = 9001;
     send_approval_request(stdout, approval_id, thread_id, turn_id)?;
@@ -380,6 +392,7 @@ fn handle_approval_mode(
     }
 
     let first = read_server_message(lines)?;
+    record_wire(wire_marker, first.as_ref())?;
     if first
         .as_ref()
         .and_then(|value| value.get("method"))
@@ -398,6 +411,20 @@ fn handle_approval_mode(
         .and_then(Value::as_str)
         .unwrap_or("missing");
     match mode {
+        "wait_interrupt" => {
+            let second = read_server_message(lines)?;
+            record_wire(wire_marker, second.as_ref())?;
+            if second
+                .as_ref()
+                .and_then(|value| value.get("method"))
+                .and_then(Value::as_str)
+                == Some("turn/interrupt")
+            {
+                let id = second.as_ref().and_then(|value| value.get("id")).cloned();
+                send(stdout, &json!({ "id": id, "result": {} }))?;
+                send_turn_completed(stdout, thread_id, turn_id, "failed")?;
+            }
+        }
         "duplicate" => {
             send_approval_request(stdout, approval_id, thread_id, turn_id)?;
             let _ = read_server_message(lines)?;
@@ -414,6 +441,20 @@ fn handle_approval_mode(
             };
             send_turn_completed(stdout, thread_id, turn_id, status)?;
         }
+    }
+    Ok(())
+}
+
+fn record_wire(marker: Option<&Path>, value: Option<&Value>) -> io::Result<()> {
+    let Some(marker) = marker else {
+        return Ok(());
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(marker)?;
+    if let Some(value) = value {
+        writeln!(file, "{}", serde_json::to_string(value)?)?;
     }
     Ok(())
 }

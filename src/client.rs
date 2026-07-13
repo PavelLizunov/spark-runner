@@ -16,6 +16,36 @@ use crate::process::ChildProcess;
 use crate::state::{ApprovalDecision, ApprovalSource, InternalEvent, SessionState, StateError};
 
 pub const REQUIRED_MODEL: &str = "gpt-5.3-codex-spark";
+const MAX_SEEN_APPROVALS: usize = 256;
+const MAX_SEEN_APPROVAL_BYTES: usize = 16 * 1024;
+
+/// The child controls both JSON-RPC request ids and approval identifiers.
+/// Keep only fixed-size opaque keys and bound the duplicate detector so a
+/// hostile server cannot turn an approval stream into retained memory.
+#[derive(Default)]
+struct SeenApprovals {
+    keys: HashSet<String>,
+    bytes: usize,
+}
+
+impl SeenApprovals {
+    fn insert(&mut self, key: String) -> Result<bool, ClientError> {
+        if self.keys.contains(&key) {
+            return Ok(false);
+        }
+        if self.keys.len() >= MAX_SEEN_APPROVALS
+            || self.bytes.saturating_add(key.len()) > MAX_SEEN_APPROVAL_BYTES
+        {
+            return Err(ClientError::SessionPoisoned);
+        }
+        self.bytes = self.bytes.saturating_add(key.len());
+        Ok(self.keys.insert(key))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -196,7 +226,7 @@ pub struct CodexClient {
     auth_refresh_policy: AuthRefreshPolicy,
     /// Requests can arrive while any ordinary RPC is awaited.  Keep this
     /// shared with that dispatch path so an id can never receive two answers.
-    seen_approvals: Arc<Mutex<HashSet<String>>>,
+    seen_approvals: Arc<Mutex<SeenApprovals>>,
 }
 
 impl CodexClient {
@@ -220,7 +250,7 @@ impl CodexClient {
             state: SessionState::new(),
             approval_policy,
             auth_refresh_policy: AuthRefreshPolicy::Unavailable,
-            seen_approvals: Arc::new(Mutex::new(HashSet::new())),
+            seen_approvals: Arc::new(Mutex::new(SeenApprovals::default())),
         }
     }
 
@@ -498,7 +528,7 @@ impl CodexClient {
         state: &mut SessionState,
         approval_policy: &ApprovalPolicy,
         auth_refresh_policy: &AuthRefreshPolicy,
-        seen_approvals: &Arc<Mutex<HashSet<String>>>,
+        seen_approvals: &Arc<Mutex<SeenApprovals>>,
         message: &Value,
     ) -> Result<(), ClientError> {
         let method = message
@@ -521,11 +551,11 @@ impl CodexClient {
 
         let params = message.get("params").unwrap_or(&Value::Null);
         let request_key = approval_request_key(method, &id, params);
-        if !seen_approvals
+        let seen = seen_approvals
             .lock()
             .expect("approval id mutex poisoned")
-            .insert(request_key.clone())
-        {
+            .insert(request_key.clone())?;
+        if !seen {
             rpc.respond(
                 id.clone(),
                 approval_response(method, ApprovalDecision::Deny),
@@ -536,9 +566,9 @@ impl CodexClient {
         }
 
         state.on_approval_requested(request_key.clone(), method.to_string())?;
-        let (decision, delivered_by_command) = match approval_policy {
-            ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, false),
-            ApprovalPolicy::Deny => (ApprovalDecision::Deny, false),
+        let (decision, delivered_by_command, acknowledgement) = match approval_policy {
+            ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, false, None),
+            ApprovalPolicy::Deny => (ApprovalDecision::Deny, false, None),
             ApprovalPolicy::External {
                 pending,
                 timeout,
@@ -562,24 +592,24 @@ impl CodexClient {
                         .map_err(|_| ClientError::SessionPoisoned)?;
                 }
                 if pending.send(pending_approval).await.is_err() {
-                    (ApprovalDecision::Deny, false)
+                    (ApprovalDecision::Deny, false, None)
                 } else {
                     match tokio::time::timeout(*timeout, decision_rx).await {
                         Ok(Ok(command)) => {
-                            let delivered = rpc
+                            if rpc
                                 .respond(id.clone(), approval_response(method, command.decision))
                                 .await
-                                .is_ok();
-                            let _ = command.delivered.send(delivered);
-                            if !delivered {
+                                .is_err()
+                            {
+                                let _ = command.delivered.send(false);
                                 return Err(ClientError::SessionPoisoned);
                             }
-                            (command.decision, true)
+                            (command.decision, true, Some(command.delivered))
                         }
                         // A closed local authority or deadline must still
                         // receive one schema-valid fail-closed response on the
                         // original JSON-RPC request id.
-                        Ok(Err(_)) | Err(_) => (ApprovalDecision::Timeout, false),
+                        Ok(Err(_)) | Err(_) => (ApprovalDecision::Timeout, false, None),
                     }
                 }
             }
@@ -591,11 +621,16 @@ impl CodexClient {
             rpc.respond(id, approval_response(method, decision)).await?;
         }
         state.on_approval_decided(
-            request_key,
+            request_key.clone(),
             method.to_string(),
             decision,
             ApprovalSource::Owner,
         )?;
+        append_external_approval_decision(approval_policy, &request_key, method, decision).await?;
+        if let Some(acknowledgement) = acknowledgement {
+            let _ = acknowledgement.send(true);
+            tokio::task::yield_now().await;
+        }
         Ok(())
     }
 
@@ -603,7 +638,7 @@ impl CodexClient {
         rpc: &JsonlClient,
         approval_policy: &ApprovalPolicy,
         auth_refresh_policy: &AuthRefreshPolicy,
-        seen_approvals: &Arc<Mutex<HashSet<String>>>,
+        seen_approvals: &Arc<Mutex<SeenApprovals>>,
         message: Value,
     ) -> Result<(), ClientError> {
         let id = message
@@ -626,18 +661,18 @@ impl CodexClient {
         }
         let params = message.get("params").unwrap_or(&Value::Null);
         let request_key = approval_request_key(method, &id, params);
-        if !seen_approvals
+        let seen = seen_approvals
             .lock()
             .expect("approval id mutex poisoned")
-            .insert(request_key.clone())
-        {
+            .insert(request_key.clone())?;
+        if !seen {
             rpc.respond(id, approval_response(method, ApprovalDecision::Deny))
                 .await?;
             return Err(ClientError::DuplicateApproval { request_key });
         }
-        let (decision, delivered_by_command) = match approval_policy {
-            ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, false),
-            ApprovalPolicy::Deny => (ApprovalDecision::Deny, false),
+        let (decision, delivered_by_command, acknowledgement) = match approval_policy {
+            ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, false, None),
+            ApprovalPolicy::Deny => (ApprovalDecision::Deny, false, None),
             ApprovalPolicy::External {
                 pending,
                 timeout,
@@ -669,27 +704,32 @@ impl CodexClient {
                     // so fail closed *on the original id* rather than
                     // returning an internal hand-off error without a wire
                     // response.
-                    (ApprovalDecision::Timeout, false)
+                    (ApprovalDecision::Timeout, false, None)
                 } else {
                     match tokio::time::timeout(*timeout, decision_rx).await {
                         Ok(Ok(command)) => {
-                            let delivered = rpc
+                            if rpc
                                 .respond(id.clone(), approval_response(method, command.decision))
                                 .await
-                                .is_ok();
-                            let _ = command.delivered.send(delivered);
-                            if !delivered {
+                                .is_err()
+                            {
+                                let _ = command.delivered.send(false);
                                 return Err(ClientError::SessionPoisoned);
                             }
-                            (command.decision, true)
+                            (command.decision, true, Some(command.delivered))
                         }
-                        Ok(Err(_)) | Err(_) => (ApprovalDecision::Timeout, false),
+                        Ok(Err(_)) | Err(_) => (ApprovalDecision::Timeout, false, None),
                     }
                 }
             }
         };
         if !delivered_by_command {
             rpc.respond(id, approval_response(method, decision)).await?;
+        }
+        append_external_approval_decision(approval_policy, &request_key, method, decision).await?;
+        if let Some(acknowledgement) = acknowledgement {
+            let _ = acknowledgement.send(true);
+            tokio::task::yield_now().await;
         }
         Ok(())
     }
@@ -790,6 +830,36 @@ impl CodexClient {
     }
 }
 
+async fn append_external_approval_decision(
+    policy: &ApprovalPolicy,
+    request_key: &str,
+    method: &str,
+    decision: ApprovalDecision,
+) -> Result<(), ClientError> {
+    let ApprovalPolicy::External {
+        receipt: Some(receipt),
+        ..
+    } = policy
+    else {
+        return Ok(());
+    };
+    let decision = match decision {
+        ApprovalDecision::Allow => crate::journal::ApprovalTerminalDecision::Allowed,
+        ApprovalDecision::Deny => crate::journal::ApprovalTerminalDecision::Denied,
+        ApprovalDecision::Timeout => crate::journal::ApprovalTerminalDecision::TimedOut,
+    };
+    receipt
+        .journal
+        .append(JournalEvent::ApprovalDecided {
+            execution_id: receipt.execution_id.clone(),
+            request_key: request_key.to_string(),
+            method: method.to_string(),
+            decision,
+        })
+        .await
+        .map_err(|_| ClientError::SessionPoisoned)
+}
+
 fn rate_limit_windows(rate_limits: &Value) -> Vec<&Value> {
     fn collect<'a>(windows: &mut Vec<&'a Value>, snapshot: &'a Value) {
         for key in ["primary", "secondary"] {
@@ -881,11 +951,20 @@ fn approval_request_key(method: &str, id: &Value, params: &Value) -> String {
         .or_else(|| params.get("itemId").and_then(Value::as_str))
         .or_else(|| params.get("callId").and_then(Value::as_str))
         .unwrap_or("");
-    if stable.is_empty() {
-        format!("{method}:{id}")
+    // Do not expose the original id, approvalId, itemId, or callId to SSE,
+    // SQLite, error text, or duplicate tracking. The original JSON-RPC id is
+    // retained only in this stack frame long enough to send its response.
+    let material = if stable.is_empty() {
+        serde_json::to_string(id).unwrap_or_default()
     } else {
-        format!("{method}:{stable}")
-    }
+        stable.to_string()
+    };
+    format!("approval:{method}:{:016x}", {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        material.hash(&mut hasher);
+        hasher.finish()
+    })
 }
 
 fn approval_response(method: &str, decision: ApprovalDecision) -> Value {
@@ -979,5 +1058,30 @@ mod tests {
             .as_str()
             .is_some_and(|hash| hash.len() == 16));
         assert_eq!(sanitized["quota_available"], true);
+    }
+
+    /// CP6: opaque approval keys never retain child ids, and the duplicate
+    /// detector has explicit count and byte limits even under repeated input.
+    #[test]
+    fn approval_identifier_tracking_is_opaque_and_bounded() {
+        let canary = "CHILD_APPROVAL_ID_DO_NOT_EXPORT".repeat(4096);
+        let key = approval_request_key(
+            "item/commandExecution/requestApproval",
+            &json!(-9001),
+            &json!({ "approvalId": canary }),
+        );
+        assert!(key.len() < 128);
+        assert!(!key.contains("CHILD_APPROVAL_ID_DO_NOT_EXPORT"));
+
+        let mut seen = SeenApprovals::default();
+        for index in 0..MAX_SEEN_APPROVALS {
+            assert!(seen
+                .insert(format!("approval:bounded:{index:016x}"))
+                .unwrap());
+        }
+        assert!(matches!(
+            seen.insert("approval:bounded:overflow".to_string()),
+            Err(ClientError::SessionPoisoned)
+        ));
     }
 }

@@ -1,16 +1,17 @@
 //! CP6 local loopback HTTP/SSE API.
 //!
-//! The API is deliberately local-only and narrow. It exposes the CP6 routes on
-//! top of the existing runner/fake app-server path, keeps bearer tokens out of
-//! request payloads, accepts only configured workspace aliases, and stores a
-//! bounded replay buffer for SSE `Last-Event-ID` resume.
+//! HTTP is intentionally only an authenticated command adapter.  The small
+//! [`RuntimeOwner`] actor is the one lifecycle root: it owns admission,
+//! turn/approval state, SSE replay, and the command channel into the one
+//! active protocol/process execution.
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::env;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -27,7 +28,8 @@ use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::client::{ApprovalCommand, ApprovalPolicy, PendingApproval, REQUIRED_MODEL};
 use crate::orchestrator::{
-    recover_before_readiness, run_turn_with_approval_policy_controlled, RuntimeControl,
+    bootstrap_runtime, recover_before_readiness, run_turn_with_launcher_controlled, RuntimeControl,
+    RuntimeLauncher,
 };
 use crate::state::ApprovalDecision;
 
@@ -42,6 +44,8 @@ const MAX_CONCURRENT_TURNS: usize = 1;
 const MAX_THREADS: usize = 128;
 const MAX_TURNS: usize = 256;
 const MAX_APPROVALS: usize = 256;
+const OWNER_COMMAND_CAPACITY: usize = 128;
+const OWNER_DEADLINE: Duration = Duration::from_secs(6);
 const DEFAULT_TURN_TIMEOUT_SECONDS: u64 = 120;
 
 #[derive(Debug, thiserror::Error)]
@@ -112,15 +116,15 @@ fn load_token() -> Result<String, ApiError> {
 #[cfg(unix)]
 fn validate_token_file_permissions(path: &str) -> Result<(), ApiError> {
     use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(path)
-        .map_err(ApiError::TokenFile)?
-        .permissions()
-        .mode();
-    if mode & 0o077 != 0 {
-        Err(ApiError::InsecureTokenFile)
-    } else {
-        Ok(())
+
+    let metadata = fs::symlink_metadata(path).map_err(ApiError::TokenFile)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(ApiError::InsecureTokenFile);
     }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -151,16 +155,12 @@ struct Inner {
     owner: RuntimeOwner,
 }
 
-/// The one runtime authority used by the HTTP adapter.  It decides the launch
-/// mode at construction, validates live bytes before reporting readiness, and
-/// is the only route from a turn to the orchestrator.
+/// A persistent command handle. Its task is the only owner of turn state,
+/// approval senders, admission snapshot, and cancellation sequencing.
+#[derive(Clone)]
 struct RuntimeOwner {
+    tx: mpsc::Sender<OwnerCommand>,
     live: bool,
-    snapshot: Mutex<RuntimeSnapshot>,
-    /// The owner, rather than an HTTP projection, is the sole holder of turn,
-    /// approval, event, and task lifecycle state. Each active execution has
-    /// one command channel into the process/protocol owner.
-    data: Mutex<StateData>,
 }
 
 #[derive(Clone)]
@@ -170,64 +170,7 @@ struct RuntimeSnapshot {
     quota_available: bool,
 }
 
-impl RuntimeOwner {
-    fn new(live: bool) -> Self {
-        // Byte pinning is necessary but not an authenticated admission. A
-        // live owner remains fail-closed until its own protocol session has
-        // observed ChatGPT auth, exact model, and usable quota.
-        let ready = !live;
-        Self {
-            live,
-            snapshot: Mutex::new(RuntimeSnapshot {
-                ready,
-                // The offline fixture is an explicit deterministic runtime;
-                // live values stay absent until a live admission has observed
-                // them, rather than being fabricated by an HTTP handler.
-                model: (!live).then_some(REQUIRED_MODEL),
-                quota_available: !live,
-            }),
-            data: Mutex::new(StateData {
-                next_thread: 1,
-                next_turn: 1,
-                next_event: 1,
-                next_approval: 1,
-                active_turns: 0,
-                replay_bytes: 0,
-                threads: HashMap::new(),
-                turns: HashMap::new(),
-                approvals: HashMap::new(),
-            }),
-        }
-    }
-
-    fn mode(&self) -> &'static str {
-        if self.live {
-            "live"
-        } else {
-            "offline-fake-app-server"
-        }
-    }
-
-    fn snapshot(&self) -> RuntimeSnapshot {
-        self.snapshot
-            .lock()
-            .expect("owner snapshot mutex poisoned")
-            .clone()
-    }
-}
-
-struct StateData {
-    next_thread: u64,
-    next_turn: u64,
-    next_event: u64,
-    next_approval: u64,
-    active_turns: usize,
-    replay_bytes: usize,
-    threads: HashMap<String, ThreadRecord>,
-    turns: HashMap<String, TurnRecord>,
-    approvals: HashMap<String, ApprovalRecord>,
-}
-
+#[derive(Clone)]
 struct ThreadRecord {
     workspace_alias: String,
 }
@@ -240,7 +183,6 @@ struct TurnRecord {
     events: Vec<TurnEvent>,
     event_bytes: usize,
     sender: broadcast::Sender<TurnEvent>,
-    task: Option<tokio::task::JoinHandle<()>>,
     control: Option<mpsc::Sender<RuntimeControl>>,
     controlling_sse_active: bool,
 }
@@ -250,6 +192,784 @@ struct ApprovalRecord {
     turn_id: String,
     status: ApprovalStatus,
     decision: Option<oneshot::Sender<ApprovalCommand>>,
+}
+
+struct OwnerState {
+    snapshot: RuntimeSnapshot,
+    next_thread: u64,
+    next_turn: u64,
+    next_event: u64,
+    next_approval: u64,
+    active_turns: usize,
+    replay_bytes: usize,
+    threads: HashMap<String, ThreadRecord>,
+    turns: HashMap<String, TurnRecord>,
+    approvals: HashMap<String, ApprovalRecord>,
+}
+
+impl OwnerState {
+    fn new(live: bool) -> Self {
+        Self {
+            // Offline remains immediately usable for deterministic API tests,
+            // while live is fail-closed until the startup bootstrap command.
+            snapshot: RuntimeSnapshot {
+                ready: !live,
+                model: (!live).then_some(REQUIRED_MODEL),
+                quota_available: !live,
+            },
+            next_thread: 1,
+            next_turn: 1,
+            next_event: 1,
+            next_approval: 1,
+            active_turns: 0,
+            replay_bytes: 0,
+            threads: HashMap::new(),
+            turns: HashMap::new(),
+            approvals: HashMap::new(),
+        }
+    }
+}
+
+enum OwnerCommand {
+    Bootstrap(oneshot::Sender<bool>),
+    Snapshot(oneshot::Sender<RuntimeSnapshot>),
+    CreateThread {
+        workspace_alias: String,
+        reply: oneshot::Sender<Result<ThreadResponse, ApiRejection>>,
+    },
+    CreateTurn {
+        thread_id: String,
+        input: String,
+        timeout: Duration,
+        reply: oneshot::Sender<Result<TurnResponse, ApiRejection>>,
+    },
+    GetTurn {
+        id: String,
+        reply: oneshot::Sender<Result<TurnResponse, ApiRejection>>,
+    },
+    Subscribe {
+        id: String,
+        last_seen: u64,
+        observer: bool,
+        reply: oneshot::Sender<Result<Subscription, ApiRejection>>,
+    },
+    Decide {
+        id: String,
+        decision: ApprovalStatus,
+        reply: oneshot::Sender<Result<ApprovalResponse, ApiRejection>>,
+    },
+    Interrupt {
+        turn_id: String,
+        authority: &'static str,
+        reply: Option<oneshot::Sender<Result<TurnResponse, ApiRejection>>>,
+    },
+    ControllerDrop {
+        turn_id: String,
+    },
+    Pending {
+        turn_id: String,
+        pending: PendingApproval,
+    },
+    Finished {
+        turn_id: String,
+        result: Result<String, crate::orchestrator::AppError>,
+    },
+    #[allow(dead_code)]
+    Shutdown(oneshot::Sender<()>),
+}
+
+struct Subscription {
+    replay: Vec<TurnEvent>,
+    receiver: broadcast::Receiver<TurnEvent>,
+    terminal: bool,
+    controller: bool,
+}
+
+impl RuntimeOwner {
+    fn spawn(live: bool, launcher: RuntimeLauncher) -> Self {
+        let (tx, rx) = mpsc::channel(OWNER_COMMAND_CAPACITY);
+        let owner = Self {
+            tx: tx.clone(),
+            live,
+        };
+        tokio::spawn(owner_loop(rx, tx, live, launcher));
+        owner
+    }
+
+    fn mode(&self) -> &'static str {
+        if self.live {
+            "live"
+        } else {
+            "offline-fake-app-server"
+        }
+    }
+
+    async fn snapshot(&self) -> Option<RuntimeSnapshot> {
+        let (reply, response) = oneshot::channel();
+        self.tx.send(OwnerCommand::Snapshot(reply)).await.ok()?;
+        response.await.ok()
+    }
+
+    async fn bootstrap(&self) -> bool {
+        let (reply, response) = oneshot::channel();
+        if self.tx.send(OwnerCommand::Bootstrap(reply)).await.is_err() {
+            return false;
+        }
+        tokio::time::timeout(OWNER_DEADLINE, response)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false)
+    }
+
+    async fn command<T>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<Result<T, ApiRejection>>) -> OwnerCommand,
+    ) -> Result<T, ApiRejection> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(build(reply))
+            .await
+            .map_err(|_| owner_closed())?;
+        tokio::time::timeout(OWNER_DEADLINE, response)
+            .await
+            .map_err(|_| {
+                rejection(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "OWNER_TIMEOUT",
+                    "runtime owner timed out",
+                    true,
+                )
+            })?
+            .map_err(|_| owner_closed())?
+    }
+
+    fn controller_dropped(&self, turn_id: String) {
+        let _ = self.tx.try_send(OwnerCommand::ControllerDrop { turn_id });
+    }
+}
+
+async fn owner_loop(
+    mut rx: mpsc::Receiver<OwnerCommand>,
+    tx: mpsc::Sender<OwnerCommand>,
+    live: bool,
+    launcher: RuntimeLauncher,
+) {
+    let mut state = OwnerState::new(live);
+    while let Some(command) = rx.recv().await {
+        match command {
+            OwnerCommand::Bootstrap(reply) => {
+                // Only `serve` and explicitly injected test owners invoke
+                // this. `app(live=true)` remains inert/fail-closed, avoiding
+                // accidental real authentication attempts in unit tests.
+                let ready =
+                    tokio::time::timeout(OWNER_DEADLINE, bootstrap_runtime(launcher.clone()))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .is_some();
+                state.snapshot.ready = ready;
+                state.snapshot.model = ready.then_some(REQUIRED_MODEL);
+                state.snapshot.quota_available = ready;
+                let _ = reply.send(ready);
+            }
+            OwnerCommand::Snapshot(reply) => {
+                let _ = reply.send(state.snapshot.clone());
+            }
+            OwnerCommand::CreateThread {
+                workspace_alias,
+                reply,
+            } => {
+                let _ = reply.send(owner_create_thread(&mut state, workspace_alias));
+            }
+            OwnerCommand::CreateTurn {
+                thread_id,
+                input,
+                timeout,
+                reply,
+            } => {
+                let result =
+                    owner_create_turn(&mut state, &tx, launcher.clone(), thread_id, input, timeout);
+                let _ = reply.send(result);
+            }
+            OwnerCommand::GetTurn { id, reply } => {
+                let _ = reply.send(turn_response(&state, &id));
+            }
+            OwnerCommand::Subscribe {
+                id,
+                last_seen,
+                observer,
+                reply,
+            } => {
+                let result = owner_subscribe(&mut state, &id, last_seen, observer);
+                let _ = reply.send(result);
+            }
+            OwnerCommand::Decide {
+                id,
+                decision,
+                reply,
+            } => {
+                let result = owner_decide(&mut state, &id, decision).await;
+                let _ = reply.send(result);
+            }
+            OwnerCommand::Interrupt {
+                turn_id,
+                authority,
+                reply,
+            } => {
+                let result = owner_interrupt(&mut state, &turn_id, authority).await;
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
+            }
+            OwnerCommand::ControllerDrop { turn_id } => {
+                let _ = owner_interrupt(&mut state, &turn_id, "controlling_sse_drop").await;
+                if let Some(turn) = state.turns.get_mut(&turn_id) {
+                    turn.controlling_sse_active = false;
+                }
+            }
+            OwnerCommand::Pending { turn_id, pending } => {
+                let _ = owner_register_pending(&mut state, &turn_id, pending).await;
+            }
+            OwnerCommand::Finished { turn_id, result } => {
+                owner_finished(&mut state, &turn_id, result);
+            }
+            OwnerCommand::Shutdown(reply) => {
+                let ids: Vec<String> = state.turns.keys().cloned().collect();
+                for id in ids {
+                    let _ = owner_interrupt(&mut state, &id, "shutdown").await;
+                }
+                let _ = reply.send(());
+                break;
+            }
+        }
+    }
+}
+
+fn owner_create_thread(
+    state: &mut OwnerState,
+    workspace_alias: String,
+) -> Result<ThreadResponse, ApiRejection> {
+    if state.threads.len() >= MAX_THREADS {
+        prune_terminal_records(state);
+    }
+    if state.threads.len() >= MAX_THREADS {
+        return Err(rejection(
+            StatusCode::TOO_MANY_REQUESTS,
+            "THREAD_CAPACITY",
+            "thread capacity is full",
+            true,
+        ));
+    }
+    let id = format!("thread_{}", state.next_thread);
+    state.next_thread += 1;
+    state.threads.insert(
+        id.clone(),
+        ThreadRecord {
+            workspace_alias: workspace_alias.clone(),
+        },
+    );
+    Ok(ThreadResponse {
+        id,
+        workspace_alias,
+        model: REQUIRED_MODEL,
+        sandbox: "read_only",
+        ephemeral: true,
+    })
+}
+
+fn owner_create_turn(
+    state: &mut OwnerState,
+    owner_tx: &mpsc::Sender<OwnerCommand>,
+    launcher: RuntimeLauncher,
+    thread_id: String,
+    input: String,
+    timeout: Duration,
+) -> Result<TurnResponse, ApiRejection> {
+    if !state.snapshot.ready {
+        return Err(rejection(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "RUNTIME_NOT_READY",
+            "live runtime admission has not completed",
+            true,
+        ));
+    }
+    if state.active_turns >= MAX_CONCURRENT_TURNS {
+        return Err(rejection(
+            StatusCode::TOO_MANY_REQUESTS,
+            "SATURATED",
+            "turn queue is full",
+            true,
+        ));
+    }
+    if state.turns.len() >= MAX_TURNS {
+        prune_terminal_records(state);
+    }
+    if state.turns.len() >= MAX_TURNS {
+        return Err(rejection(
+            StatusCode::TOO_MANY_REQUESTS,
+            "TURN_CAPACITY",
+            "terminal turn retention is full",
+            true,
+        ));
+    }
+    let workspace_alias = state
+        .threads
+        .get(&thread_id)
+        .map(|thread| thread.workspace_alias.clone())
+        .ok_or_else(|| {
+            rejection(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                "thread not found",
+                false,
+            )
+        })?;
+    let turn_id = format!("turn_{}", state.next_turn);
+    state.next_turn += 1;
+    state.active_turns += 1;
+    let (sender, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+    let (control_tx, mut control_rx) = mpsc::channel(1);
+    state.turns.insert(
+        turn_id.clone(),
+        TurnRecord {
+            id: turn_id.clone(),
+            thread_id: thread_id.clone(),
+            workspace_alias: workspace_alias.clone(),
+            status: TurnStatus::Running,
+            events: Vec::new(),
+            event_bytes: 0,
+            sender,
+            control: Some(control_tx),
+            controlling_sse_active: false,
+        },
+    );
+    push_event(
+        state,
+        &turn_id,
+        "turn.started",
+        serde_json::json!({}),
+        false,
+    );
+
+    let (pending_tx, mut pending_rx) = mpsc::channel(1);
+    let pending_owner_tx = owner_tx.clone();
+    let pending_turn_id = turn_id.clone();
+    tokio::spawn(async move {
+        while let Some(pending) = pending_rx.recv().await {
+            if pending_owner_tx
+                .send(OwnerCommand::Pending {
+                    turn_id: pending_turn_id.clone(),
+                    pending,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let finished_owner_tx = owner_tx.clone();
+    let finished_turn_id = turn_id.clone();
+    tokio::spawn(async move {
+        let result = run_turn_with_launcher_controlled(
+            input,
+            launcher,
+            ApprovalPolicy::External {
+                pending: pending_tx,
+                timeout,
+                receipt: None,
+            },
+            timeout,
+            &mut control_rx,
+        )
+        .await;
+        let _ = finished_owner_tx
+            .send(OwnerCommand::Finished {
+                turn_id: finished_turn_id,
+                result,
+            })
+            .await;
+    });
+
+    Ok(TurnResponse {
+        id: turn_id,
+        thread_id,
+        workspace_alias,
+        status: TurnStatus::Running,
+    })
+}
+
+fn owner_subscribe(
+    state: &mut OwnerState,
+    id: &str,
+    last_seen: u64,
+    observer: bool,
+) -> Result<Subscription, ApiRejection> {
+    let turn = state
+        .turns
+        .get_mut(id)
+        .ok_or_else(|| rejection(StatusCode::NOT_FOUND, "NOT_FOUND", "turn not found", false))?;
+    let replay = turn
+        .events
+        .iter()
+        .filter(|event| event.id > last_seen)
+        .cloned()
+        .collect();
+    let terminal = is_terminal(turn.status);
+    let controller = !observer && !terminal && !turn.controlling_sse_active;
+    if controller {
+        turn.controlling_sse_active = true;
+    }
+    Ok(Subscription {
+        replay,
+        receiver: turn.sender.subscribe(),
+        terminal,
+        controller,
+    })
+}
+
+async fn owner_register_pending(
+    state: &mut OwnerState,
+    turn_id: &str,
+    pending: PendingApproval,
+) -> Result<(), ApiRejection> {
+    let terminal = state
+        .turns
+        .get(turn_id)
+        .map(|turn| is_terminal(turn.status))
+        .unwrap_or(true);
+    if state.approvals.len() >= MAX_APPROVALS || terminal {
+        let (delivered, response) = oneshot::channel();
+        let sent = pending
+            .decision
+            .send(ApprovalCommand {
+                decision: ApprovalDecision::Deny,
+                delivered,
+            })
+            .is_ok();
+        if sent {
+            let _ = tokio::time::timeout(OWNER_DEADLINE, response).await;
+        }
+        return Err(rejection(
+            StatusCode::TOO_MANY_REQUESTS,
+            "APPROVAL_CAPACITY",
+            "approval capacity is full",
+            true,
+        ));
+    }
+    let id = format!("approval_{}", state.next_approval);
+    state.next_approval += 1;
+    state.approvals.insert(
+        id.clone(),
+        ApprovalRecord {
+            id: id.clone(),
+            turn_id: turn_id.to_string(),
+            status: ApprovalStatus::Pending,
+            decision: Some(pending.decision),
+        },
+    );
+    if let Some(turn) = state.turns.get_mut(turn_id) {
+        turn.status = TurnStatus::WaitingApproval;
+    }
+    push_event(
+        state,
+        turn_id,
+        "approval.requested",
+        serde_json::json!({ "approval_id": id, "request_key": pending.request_key, "method": pending.method }),
+        false,
+    );
+    Ok(())
+}
+
+async fn owner_decide(
+    state: &mut OwnerState,
+    id: &str,
+    decision: ApprovalStatus,
+) -> Result<ApprovalResponse, ApiRejection> {
+    let (approval_id, turn_id, sender) = claim_approval(state, id)?;
+    let protocol_decision = match decision {
+        ApprovalStatus::Approved => ApprovalDecision::Allow,
+        ApprovalStatus::Denied | ApprovalStatus::Pending | ApprovalStatus::Delivering => {
+            ApprovalDecision::Deny
+        }
+    };
+    if !deliver_approval(sender, protocol_decision).await {
+        set_approval_status(state, id, ApprovalStatus::Denied);
+        return Err(rejection(
+            StatusCode::CONFLICT,
+            "APPROVAL_DELIVERY_FAILED",
+            "runtime could not deliver the approval decision",
+            true,
+        ));
+    }
+    set_approval_status(state, id, decision);
+    push_event(
+        state,
+        &turn_id,
+        "approval.decided",
+        serde_json::json!({ "approval_id": approval_id, "decision": decision }),
+        false,
+    );
+    Ok(ApprovalResponse {
+        id: id.to_string(),
+        turn_id,
+        status: decision,
+    })
+}
+
+async fn owner_interrupt(
+    state: &mut OwnerState,
+    turn_id: &str,
+    authority: &'static str,
+) -> Result<TurnResponse, ApiRejection> {
+    let Some(turn) = state.turns.get(turn_id) else {
+        return Err(rejection(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "turn not found",
+            false,
+        ));
+    };
+    if is_terminal(turn.status) {
+        return Err(rejection(
+            StatusCode::BAD_REQUEST,
+            "TURN_TERMINAL",
+            "turn is already terminal",
+            false,
+        ));
+    }
+
+    // Claim every still-pending sender before the asynchronous delivery
+    // boundary. A concurrent approve sees Delivering and can never overwrite
+    // this fail-closed decision.
+    let mut claimed = Vec::new();
+    for approval in state.approvals.values_mut() {
+        if approval.turn_id == turn_id && approval.status == ApprovalStatus::Pending {
+            approval.status = ApprovalStatus::Delivering;
+            if let Some(sender) = approval.decision.take() {
+                claimed.push((approval.id.clone(), sender));
+            }
+        }
+    }
+    for (approval_id, sender) in claimed {
+        let delivered = deliver_approval(sender, ApprovalDecision::Deny).await;
+        set_approval_status(state, &approval_id, ApprovalStatus::Denied);
+        push_event(
+            state,
+            turn_id,
+            "approval.decided",
+            serde_json::json!({ "approval_id": approval_id, "decision": "denied", "authority": authority }),
+            false,
+        );
+        if !delivered {
+            // The runtime task owns the process and will reap it when its
+            // protocol side observes the failed hand-off. Do not lie with a
+            // terminal HTTP status before that task has reported completion.
+            return Err(rejection(
+                StatusCode::CONFLICT,
+                "APPROVAL_DELIVERY_FAILED",
+                "runtime could not deliver the approval decision",
+                true,
+            ));
+        }
+    }
+    let control = state
+        .turns
+        .get(turn_id)
+        .and_then(|turn| turn.control.clone())
+        .ok_or_else(|| {
+            rejection(
+                StatusCode::CONFLICT,
+                "TURN_CLOSED",
+                "turn is no longer owned by a running runtime",
+                false,
+            )
+        })?;
+    let (ack, response) = oneshot::channel();
+    if control.send(RuntimeControl::Interrupt(ack)).await.is_err() {
+        // A schema-valid denial can itself cause a server terminal
+        // notification before the owner has a chance to submit interrupt.
+        // The execution task has already ended (hence the closed control
+        // channel) and reaped its group; retain the caller's cancellation
+        // intent without attempting a second terminal transition.
+        terminalize(
+            state,
+            turn_id,
+            TurnStatus::Interrupted,
+            "turn.interrupted",
+            serde_json::json!({ "status": "interrupted" }),
+        );
+        return turn_response(state, turn_id);
+    }
+    match tokio::time::timeout(OWNER_DEADLINE, response).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            // See the closed-control case above: the server terminalized on
+            // the durable denial before the queued interrupt could be
+            // consumed. The task has dropped the acknowledgement only after
+            // its own cleanup path, so terminalise once locally.
+            terminalize(
+                state,
+                turn_id,
+                TurnStatus::Interrupted,
+                "turn.interrupted",
+                serde_json::json!({ "status": "interrupted" }),
+            );
+            return turn_response(state, turn_id);
+        }
+        Err(_) => {
+            return Err(rejection(
+                StatusCode::GATEWAY_TIMEOUT,
+                "INTERRUPT_TIMEOUT",
+                "runtime cleanup timed out",
+                true,
+            ));
+        }
+    }
+    // The protocol task sends this acknowledgement only after the interrupt
+    // RPC, terminal notification, journal record, and process-group cleanup.
+    terminalize(
+        state,
+        turn_id,
+        TurnStatus::Interrupted,
+        "turn.interrupted",
+        serde_json::json!({ "status": "interrupted" }),
+    );
+    turn_response(state, turn_id)
+}
+
+fn claim_approval(
+    state: &mut OwnerState,
+    id: &str,
+) -> Result<(String, String, oneshot::Sender<ApprovalCommand>), ApiRejection> {
+    let approval = state.approvals.get_mut(id).ok_or_else(|| {
+        rejection(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "approval not found",
+            false,
+        )
+    })?;
+    if approval.status != ApprovalStatus::Pending {
+        return Err(rejection(
+            StatusCode::BAD_REQUEST,
+            "APPROVAL_DECIDED",
+            "approval already decided",
+            false,
+        ));
+    }
+    approval.status = ApprovalStatus::Delivering;
+    let sender = approval.decision.take().ok_or_else(|| {
+        rejection(
+            StatusCode::CONFLICT,
+            "APPROVAL_CLOSED",
+            "approval is no longer owned by a running turn",
+            false,
+        )
+    })?;
+    Ok((approval.id.clone(), approval.turn_id.clone(), sender))
+}
+
+fn set_approval_status(state: &mut OwnerState, id: &str, status: ApprovalStatus) {
+    if let Some(approval) = state.approvals.get_mut(id) {
+        approval.status = status;
+    }
+}
+
+async fn deliver_approval(
+    sender: oneshot::Sender<ApprovalCommand>,
+    decision: ApprovalDecision,
+) -> bool {
+    let (delivered, response) = oneshot::channel();
+    if sender
+        .send(ApprovalCommand {
+            decision,
+            delivered,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    tokio::time::timeout(OWNER_DEADLINE, response)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(false)
+}
+
+fn owner_finished(
+    state: &mut OwnerState,
+    turn_id: &str,
+    result: Result<String, crate::orchestrator::AppError>,
+) {
+    let (status, kind, payload) = match result {
+        Ok(summary) if summary.contains("turn_status=completed") => (
+            TurnStatus::Completed,
+            "turn.completed",
+            serde_json::json!({ "status": "completed", "summary": summary }),
+        ),
+        Ok(summary) if summary.contains("turn_status=interrupted") => (
+            TurnStatus::Interrupted,
+            "turn.interrupted",
+            serde_json::json!({ "status": "interrupted" }),
+        ),
+        Ok(_) => (
+            TurnStatus::Failed,
+            "turn.failed",
+            serde_json::json!({ "status": "failed", "error": { "class": "turn_rejected" } }),
+        ),
+        Err(_) => (
+            TurnStatus::Failed,
+            "turn.failed",
+            serde_json::json!({ "status": "failed", "error": { "class": "runtime_failure" } }),
+        ),
+    };
+    terminalize(state, turn_id, status, kind, payload);
+}
+
+fn terminalize(
+    state: &mut OwnerState,
+    turn_id: &str,
+    status: TurnStatus,
+    kind: &str,
+    payload: serde_json::Value,
+) {
+    let transitioned = if let Some(turn) = state.turns.get_mut(turn_id) {
+        if is_terminal(turn.status) {
+            false
+        } else {
+            turn.status = status;
+            true
+        }
+    } else {
+        false
+    };
+    if !transitioned {
+        return;
+    }
+    state.active_turns = state.active_turns.saturating_sub(1);
+    let pending: Vec<String> = state
+        .approvals
+        .values_mut()
+        .filter_map(|approval| {
+            (approval.turn_id == turn_id && approval.status == ApprovalStatus::Pending).then(|| {
+                approval.status = ApprovalStatus::Denied;
+                let _ = approval.decision.take();
+                approval.id.clone()
+            })
+        })
+        .collect();
+    for approval_id in pending {
+        push_event(
+            state,
+            turn_id,
+            "approval.decided",
+            serde_json::json!({ "approval_id": approval_id, "decision": "denied", "authority": "terminal" }),
+            false,
+        );
+    }
+    push_event(state, turn_id, kind, payload, true);
 }
 
 #[derive(Clone, Copy, Serialize, PartialEq, Eq)]
@@ -266,8 +986,6 @@ enum TurnStatus {
 #[serde(rename_all = "snake_case")]
 enum ApprovalStatus {
     Pending,
-    /// Exactly one authority has removed the one-shot sender and is awaiting
-    /// the write acknowledgement from the process/protocol owner.
     Delivering,
     Approved,
     Denied,
@@ -348,7 +1066,7 @@ struct CreateTurnRequest {
     bearer_token: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct TurnResponse {
     id: String,
     thread_id: String,
@@ -375,8 +1093,6 @@ struct ErrorBody<'a> {
     retryable: bool,
 }
 
-/// A small internal rejection keeps handler results compact while preserving
-/// the documented JSON response body at the HTTP boundary.
 #[derive(Clone, Copy)]
 struct ApiRejection {
     status: StatusCode,
@@ -401,14 +1117,30 @@ impl IntoResponse for ApiRejection {
     }
 }
 
+/// Normal construction uses the pinned live launcher or the canonical fake
+/// fixture. It deliberately does not bootstrap live mode; `serve` performs
+/// that bounded startup action before accepting a connection.
 pub fn app(config: ApiConfig) -> Router {
-    let state = AppState {
-        inner: Arc::new(Inner {
-            owner: RuntimeOwner::new(config.live),
-            config,
-        }),
-    };
+    let launcher = RuntimeLauncher::for_mode(config.live);
+    app_with_owner(config, RuntimeOwner::spawn(launcher.is_live(), launcher))
+}
 
+/// Test-only-friendly construction for an explicitly injected launcher. The
+/// injected launcher still traverses the same owner bootstrap and turn path;
+/// it never changes the production `RuntimeLauncher::Live` selection.
+pub fn app_with_launcher(config: ApiConfig, launcher: RuntimeLauncher) -> Router {
+    let owner = RuntimeOwner::spawn(config.live, launcher);
+    let bootstrap_owner = owner.clone();
+    tokio::spawn(async move {
+        let _ = bootstrap_owner.bootstrap().await;
+    });
+    app_with_owner(config, owner)
+}
+
+fn app_with_owner(config: ApiConfig, owner: RuntimeOwner) -> Router {
+    let state = AppState {
+        inner: Arc::new(Inner { config, owner }),
+    };
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -462,15 +1194,22 @@ async fn health() -> Json<HealthResponse<'static>> {
 async fn ready(
     State(state): State<AppState>,
 ) -> Result<Json<HealthResponse<'static>>, ApiRejection> {
-    if !state.inner.owner.snapshot().ready {
-        return Err(rejection(
+    if state
+        .inner
+        .owner
+        .snapshot()
+        .await
+        .is_some_and(|snapshot| snapshot.ready)
+    {
+        Ok(Json(HealthResponse { status: "ready" }))
+    } else {
+        Err(rejection(
             StatusCode::SERVICE_UNAVAILABLE,
             "RUNTIME_NOT_READY",
             "live runtime admission has not completed",
             true,
-        ));
+        ))
     }
-    Ok(Json(HealthResponse { status: "ready" }))
 }
 
 async fn runtime(State(state): State<AppState>) -> Json<RuntimeResponse> {
@@ -496,7 +1235,16 @@ async fn runtime(State(state): State<AppState>) -> Json<RuntimeResponse> {
 }
 
 async fn models(State(state): State<AppState>) -> Json<ModelsResponse<'static>> {
-    let snapshot = state.inner.owner.snapshot();
+    let snapshot = state
+        .inner
+        .owner
+        .snapshot()
+        .await
+        .unwrap_or(RuntimeSnapshot {
+            ready: false,
+            model: None,
+            quota_available: false,
+        });
     Json(ModelsResponse {
         object: "list",
         data: snapshot
@@ -512,7 +1260,16 @@ async fn models(State(state): State<AppState>) -> Json<ModelsResponse<'static>> 
 }
 
 async fn rate_limits(State(state): State<AppState>) -> Json<RateLimitsResponse> {
-    let snapshot = state.inner.owner.snapshot();
+    let snapshot = state
+        .inner
+        .owner
+        .snapshot()
+        .await
+        .unwrap_or(RuntimeSnapshot {
+            ready: false,
+            model: None,
+            quota_available: false,
+        });
     Json(RateLimitsResponse {
         requests_per_minute: u32::from(snapshot.quota_available) * 60,
         concurrent_turns: MAX_CONCURRENT_TURNS,
@@ -559,34 +1316,15 @@ async fn create_thread(
             false,
         ));
     }
-
-    let mut data = state.inner.owner.data.lock().expect("owner mutex poisoned");
-    if data.threads.len() >= MAX_THREADS {
-        prune_terminal_records(&mut data);
-    }
-    if data.threads.len() >= MAX_THREADS {
-        return Err(rejection(
-            StatusCode::TOO_MANY_REQUESTS,
-            "THREAD_CAPACITY",
-            "thread capacity is full",
-            true,
-        ));
-    }
-    let id = format!("thread_{}", data.next_thread);
-    data.next_thread += 1;
-    data.threads.insert(
-        id.clone(),
-        ThreadRecord {
-            workspace_alias: req.workspace_alias.clone(),
-        },
-    );
-    Ok(Json(ThreadResponse {
-        id,
-        workspace_alias: req.workspace_alias,
-        model: REQUIRED_MODEL,
-        sandbox: "read_only",
-        ephemeral: true,
-    }))
+    state
+        .inner
+        .owner
+        .command(|reply| OwnerCommand::CreateThread {
+            workspace_alias: req.workspace_alias,
+            reply,
+        })
+        .await
+        .map(Json)
 }
 
 async fn create_turn(
@@ -595,14 +1333,6 @@ async fn create_turn(
     Json(req): Json<CreateTurnRequest>,
 ) -> Result<Json<TurnResponse>, ApiRejection> {
     reject_payload_token(req.bearer_token.as_deref())?;
-    if !state.inner.owner.snapshot().ready {
-        return Err(rejection(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "RUNTIME_NOT_READY",
-            "live runtime admission has not completed",
-            true,
-        ));
-    }
     if req.input.is_empty() || req.input.chars().count() > MAX_INPUT_CHARS {
         return Err(rejection(
             StatusCode::BAD_REQUEST,
@@ -622,206 +1352,33 @@ async fn create_turn(
             false,
         ));
     }
-
-    let (turn_id, workspace_alias) = {
-        let mut data = state.inner.owner.data.lock().expect("owner mutex poisoned");
-        if data.active_turns >= MAX_CONCURRENT_TURNS {
-            return Err(rejection(
-                StatusCode::TOO_MANY_REQUESTS,
-                "SATURATED",
-                "turn queue is full",
-                true,
-            ));
-        }
-        if data.turns.len() >= MAX_TURNS {
-            prune_terminal_records(&mut data);
-        }
-        if data.turns.len() >= MAX_TURNS {
-            return Err(rejection(
-                StatusCode::TOO_MANY_REQUESTS,
-                "TURN_CAPACITY",
-                "terminal turn retention is full",
-                true,
-            ));
-        }
-        let thread = data.threads.get(&thread_id).ok_or_else(|| {
-            rejection(
-                StatusCode::NOT_FOUND,
-                "NOT_FOUND",
-                "thread not found",
-                false,
-            )
-        })?;
-        if let Some(alias) = req.workspace_alias.as_deref() {
-            validate_workspace(&state, alias)?;
-            if alias != thread.workspace_alias {
-                return Err(rejection(
-                    StatusCode::BAD_REQUEST,
-                    "WORKSPACE_MISMATCH",
-                    "workspace alias does not match thread",
-                    false,
-                ));
-            }
-        }
-        let workspace_alias = thread.workspace_alias.clone();
-        let turn_id = format!("turn_{}", data.next_turn);
-        data.next_turn += 1;
-        data.active_turns += 1;
-        let (sender, _receiver) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        data.turns.insert(
-            turn_id.clone(),
-            TurnRecord {
-                id: turn_id.clone(),
-                thread_id: thread_id.clone(),
-                workspace_alias: workspace_alias.clone(),
-                status: TurnStatus::Running,
-                events: Vec::new(),
-                event_bytes: 0,
-                sender,
-                task: None,
-                control: None,
-                controlling_sse_active: false,
-            },
-        );
-        (turn_id, workspace_alias)
-    };
-
-    let child_state = state.clone();
-    let child_turn_id = turn_id.clone();
-    let approval_timeout =
-        std::time::Duration::from_secs(req.timeout_seconds.unwrap_or(DEFAULT_TURN_TIMEOUT_SECONDS));
-    let (control_tx, control_rx) = mpsc::channel(1);
-    let task = tokio::spawn(async move {
-        run_runtime_owner_turn(
-            child_state,
-            child_turn_id,
-            req.input,
-            approval_timeout,
-            control_rx,
-        )
-        .await;
-    });
-    if let Some(turn) = state
+    if let Some(alias) = req.workspace_alias.as_deref() {
+        validate_workspace(&state, alias)?;
+    }
+    let timeout = Duration::from_secs(req.timeout_seconds.unwrap_or(DEFAULT_TURN_TIMEOUT_SECONDS));
+    state
         .inner
         .owner
-        .data
-        .lock()
-        .expect("owner mutex poisoned")
-        .turns
-        .get_mut(&turn_id)
-    {
-        turn.task = Some(task);
-        turn.control = Some(control_tx);
-    }
-
-    Ok(Json(TurnResponse {
-        id: turn_id,
-        thread_id,
-        workspace_alias,
-        status: TurnStatus::Running,
-    }))
-}
-
-/// Offline construction is an explicit test fixture.  The HTTP layer never
-/// creates approvals itself: it only receives real app-server requests from
-/// this owner and returns exactly one caller decision to the original RPC id.
-async fn run_runtime_owner_turn(
-    state: AppState,
-    turn_id: String,
-    prompt: String,
-    timeout: std::time::Duration,
-    mut controls: mpsc::Receiver<RuntimeControl>,
-) {
-    push_event(
-        &state,
-        &turn_id,
-        "turn.started",
-        serde_json::json!({}),
-        false,
-    );
-    let (pending_tx, mut pending_rx) = mpsc::channel(1);
-    let runtime_state = state.clone();
-    let mut run = Box::pin(async move {
-        let policy = ApprovalPolicy::External {
-            pending: pending_tx,
+        .command(|reply| OwnerCommand::CreateTurn {
+            thread_id,
+            input: req.input,
             timeout,
-            receipt: None,
-        };
-        run_turn_with_approval_policy_controlled(
-            prompt,
-            runtime_state.inner.owner.live,
-            policy,
-            timeout,
-            &mut controls,
-        )
+            reply,
+        })
         .await
-    });
-
-    let result = loop {
-        tokio::select! {
-            result = &mut run => break result,
-            pending = pending_rx.recv() => if let Some(pending) = pending {
-                if register_runtime_approval(&state, &turn_id, pending).is_err() {
-                    break Err(crate::orchestrator::AppError::Client(
-                        crate::client::ClientError::SessionPoisoned,
-                    ));
-                }
-            }
-        }
-    };
-    if state.inner.owner.live {
-        let mut snapshot = state
-            .inner
-            .owner
-            .snapshot
-            .lock()
-            .expect("owner snapshot mutex poisoned");
-        snapshot.ready = result.is_ok();
-        snapshot.model = result.is_ok().then_some(REQUIRED_MODEL);
-        snapshot.quota_available = result.is_ok();
-    }
-    let (status, kind, payload) = match result {
-        Ok(summary) if summary.contains("turn_status=completed") => (
-            TurnStatus::Completed,
-            "turn.completed",
-            serde_json::json!({ "status": "completed", "summary": summary }),
-        ),
-        Ok(summary) if summary.contains("turn_status=interrupted") => (
-            TurnStatus::Interrupted,
-            "turn.interrupted",
-            serde_json::json!({ "status": "interrupted" }),
-        ),
-        Ok(_) => (
-            TurnStatus::Failed,
-            "turn.failed",
-            serde_json::json!({ "status": "failed", "error": { "class": "turn_rejected" } }),
-        ),
-        Err(_err) => (
-            TurnStatus::Failed,
-            "turn.failed",
-            // AppError Display may contain local paths or child-controlled
-            // text.  HTTP/SSE exports a bounded allowlisted class only.
-            serde_json::json!({ "status": "failed", "error": { "class": "runtime_failure" } }),
-        ),
-    };
-    let _ = update_turn_terminal(&state, &turn_id, status, kind, payload);
+        .map(Json)
 }
 
 async fn get_turn(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<TurnResponse>, ApiRejection> {
-    let data = state.inner.owner.data.lock().expect("owner mutex poisoned");
-    let turn = data
-        .turns
-        .get(&id)
-        .ok_or_else(|| rejection(StatusCode::NOT_FOUND, "NOT_FOUND", "turn not found", false))?;
-    Ok(Json(TurnResponse {
-        id: turn.id.clone(),
-        thread_id: turn.thread_id.clone(),
-        workspace_alias: turn.workspace_alias.clone(),
-        status: turn.status,
-    }))
+    state
+        .inner
+        .owner
+        .command(|reply| OwnerCommand::GetTurn { id, reply })
+        .await
+        .map(Json)
 }
 
 async fn turn_events(
@@ -838,177 +1395,128 @@ async fn turn_events(
         .get("x-spark-runner-observer")
         .and_then(|value| value.to_str().ok())
         == Some("1");
-    let (replay, receiver, terminal, guard) = {
-        let mut data = state.inner.owner.data.lock().expect("owner mutex poisoned");
-        let turn = data.turns.get_mut(&id).ok_or_else(|| {
-            rejection(StatusCode::NOT_FOUND, "NOT_FOUND", "turn not found", false)
-        })?;
-        let replay: Vec<TurnEvent> = turn
-            .events
-            .iter()
-            .filter(|event| event.id > last_seen)
-            .cloned()
-            .collect();
-        let terminal = is_terminal(turn.status);
-        // The first authenticated non-terminal stream is the controlling
-        // authority. Later streams are observers and must never cancel work.
-        let guard = if !observer && !terminal && !turn.controlling_sse_active {
-            turn.controlling_sse_active = true;
-            Some(ControllingSseDropGuard {
-                state: state.clone(),
-                turn_id: id.clone(),
-                control: turn.control.clone(),
-            })
-        } else {
-            None
-        };
-        (replay, turn.sender.subscribe(), terminal, guard)
-    };
-    let replay_stream = tokio_stream::iter(replay.into_iter().map(event_to_sse));
-    let live_stream = BroadcastStream::new(receiver).filter_map(move |event| match event {
-        Ok(event) if event.id > last_seen => Some(event_to_sse(event)),
+    let subscription = state
+        .inner
+        .owner
+        .command(|reply| OwnerCommand::Subscribe {
+            id: id.clone(),
+            last_seen,
+            observer,
+            reply,
+        })
+        .await?;
+    let replay = tokio_stream::iter(subscription.replay);
+    let live = BroadcastStream::new(subscription.receiver).filter_map(move |event| match event {
+        Ok(event) if event.id > last_seen => Some(event),
         Ok(_) | Err(_) => None,
     });
-    let stream: BoxStream<'static, Result<SseEvent, Infallible>> = if terminal {
-        Box::pin(replay_stream)
+    let stream: BoxStream<'static, TurnEvent> = if subscription.terminal {
+        Box::pin(replay)
     } else {
-        Box::pin(replay_stream.chain(live_stream))
+        Box::pin(replay.chain(live))
     };
+    let guard = subscription.controller.then(|| ControllingSseDropGuard {
+        owner: state.inner.owner.clone(),
+        turn_id: id,
+    });
     Ok(Sse::new(ControllingSseStream {
         stream,
+        terminal_seen: false,
         _guard: guard,
     })
     .keep_alive(axum::response::sse::KeepAlive::new()))
 }
 
-/// Owns the controller lease for the lifetime of one SSE body. Axum drops the
-/// stream when the peer disconnects; Drop is deliberately synchronous and
-/// only submits bounded local commands. The process/protocol owner performs
-/// the actual wire denial, cleanup, journal terminal transition, and release.
 struct ControllingSseDropGuard {
-    state: AppState,
+    owner: RuntimeOwner,
     turn_id: String,
-    control: Option<mpsc::Sender<RuntimeControl>>,
 }
-
 impl Drop for ControllingSseDropGuard {
     fn drop(&mut self) {
-        close_pending_approvals(&self.state, &self.turn_id, "controlling_sse_drop");
-        if let Some(control) = &self.control {
-            let (ack, _receiver) = oneshot::channel();
-            let _ = control.try_send(RuntimeControl::Interrupt(ack));
-        }
-        if let Some(turn) = self
-            .state
-            .inner
-            .owner
-            .data
-            .lock()
-            .expect("owner mutex poisoned")
-            .turns
-            .get_mut(&self.turn_id)
-        {
-            turn.controlling_sse_active = false;
-        }
+        self.owner.controller_dropped(self.turn_id.clone());
     }
 }
-
 struct ControllingSseStream {
-    stream: BoxStream<'static, Result<SseEvent, Infallible>>,
+    stream: BoxStream<'static, TurnEvent>,
+    terminal_seen: bool,
     _guard: Option<ControllingSseDropGuard>,
 }
-
 impl Stream for ControllingSseStream {
     type Item = Result<SseEvent, Infallible>;
-
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.stream.as_mut().poll_next(context)
+        if self.terminal_seen {
+            return std::task::Poll::Ready(None);
+        }
+        match self.stream.as_mut().poll_next(context) {
+            std::task::Poll::Ready(Some(event)) => {
+                self.terminal_seen = event.terminal;
+                std::task::Poll::Ready(Some(event_to_sse(event)))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 }
 
 async fn interrupt_turn(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path(turn_id): Path<String>,
 ) -> Result<Json<TurnResponse>, ApiRejection> {
-    let control = {
-        let mut data = state.inner.owner.data.lock().expect("owner mutex poisoned");
-        let turn = data.turns.get_mut(&id).ok_or_else(|| {
-            rejection(StatusCode::NOT_FOUND, "NOT_FOUND", "turn not found", false)
-        })?;
-        if is_terminal(turn.status) {
-            return Err(rejection(
-                StatusCode::BAD_REQUEST,
-                "TURN_TERMINAL",
-                "turn is already terminal",
-                false,
-            ));
-        }
-        turn.control.clone()
-    };
-    let control = control.ok_or_else(|| {
-        rejection(
-            StatusCode::CONFLICT,
-            "TURN_CLOSED",
-            "turn is no longer owned by a running runtime",
-            false,
-        )
-    })?;
-    let (ack_tx, ack_rx) = oneshot::channel();
-    control
-        .send(RuntimeControl::Interrupt(ack_tx))
+    state
+        .inner
+        .owner
+        .command(|reply| OwnerCommand::Interrupt {
+            turn_id,
+            authority: "interrupt",
+            reply: Some(reply),
+        })
         .await
-        .map_err(|_| {
-            rejection(
-                StatusCode::CONFLICT,
-                "TURN_CLOSED",
-                "turn is no longer owned by a running runtime",
-                false,
-            )
-        })?;
-    close_pending_approvals(&state, &id, "interrupt");
-    tokio::time::timeout(std::time::Duration::from_secs(6), ack_rx)
-        .await
-        .map_err(|_| {
-            rejection(
-                StatusCode::GATEWAY_TIMEOUT,
-                "INTERRUPT_TIMEOUT",
-                "runtime cleanup timed out",
-                true,
-            )
-        })?
-        .map_err(|_| {
-            rejection(
-                StatusCode::CONFLICT,
-                "TURN_CLOSED",
-                "runtime ended before interrupt cleanup",
-                false,
-            )
-        })?;
-    let response = update_turn_terminal(
-        &state,
-        &id,
-        TurnStatus::Interrupted,
-        "turn.interrupted",
-        serde_json::json!({ "status": "interrupted" }),
-    )?;
-    Ok(Json(response))
+        .map(Json)
 }
 
 async fn approve(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ApprovalResponse>, ApiRejection> {
-    decide_approval(&state, &id, ApprovalStatus::Approved).await
+    decide_approval(&state, id, ApprovalStatus::Approved).await
 }
-
 async fn deny(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ApprovalResponse>, ApiRejection> {
-    decide_approval(&state, &id, ApprovalStatus::Denied).await
+    decide_approval(&state, id, ApprovalStatus::Denied).await
+}
+async fn decide_approval(
+    state: &AppState,
+    id: String,
+    decision: ApprovalStatus,
+) -> Result<Json<ApprovalResponse>, ApiRejection> {
+    state
+        .inner
+        .owner
+        .command(|reply| OwnerCommand::Decide {
+            id,
+            decision,
+            reply,
+        })
+        .await
+        .map(Json)
+}
+
+fn turn_response(state: &OwnerState, id: &str) -> Result<TurnResponse, ApiRejection> {
+    let turn = state
+        .turns
+        .get(id)
+        .ok_or_else(|| rejection(StatusCode::NOT_FOUND, "NOT_FOUND", "turn not found", false))?;
+    Ok(TurnResponse {
+        id: turn.id.clone(),
+        thread_id: turn.thread_id.clone(),
+        workspace_alias: turn.workspace_alias.clone(),
+        status: turn.status,
+    })
 }
 
 fn reject_payload_token(value: Option<&str>) -> Result<(), ApiRejection> {
@@ -1023,7 +1531,6 @@ fn reject_payload_token(value: Option<&str>) -> Result<(), ApiRejection> {
         Ok(())
     }
 }
-
 fn validate_workspace(state: &AppState, alias: &str) -> Result<(), ApiRejection> {
     if alias.contains('/') || alias.contains('\\') || alias.contains("..") || alias.is_empty() {
         return Err(rejection(
@@ -1044,293 +1551,15 @@ fn validate_workspace(state: &AppState, alias: &str) -> Result<(), ApiRejection>
     Ok(())
 }
 
-fn register_runtime_approval(
-    state: &AppState,
-    turn_id: &str,
-    pending: PendingApproval,
-) -> Result<(), ApiRejection> {
-    let mut data = state.inner.owner.data.lock().expect("owner mutex poisoned");
-    if data.approvals.len() >= MAX_APPROVALS {
-        prune_terminal_records(&mut data);
-    }
-    if data.approvals.len() >= MAX_APPROVALS {
-        let (delivered, _ack) = oneshot::channel();
-        let _ = pending.decision.send(ApprovalCommand {
-            decision: ApprovalDecision::Deny,
-            delivered,
-        });
-        return Err(rejection(
-            StatusCode::TOO_MANY_REQUESTS,
-            "APPROVAL_CAPACITY",
-            "approval capacity is full",
-            true,
-        ));
-    }
-    let turn = data
-        .turns
-        .get(turn_id)
-        .ok_or_else(|| rejection(StatusCode::NOT_FOUND, "NOT_FOUND", "turn not found", false))?;
-    if is_terminal(turn.status) {
-        let (delivered, _ack) = oneshot::channel();
-        let _ = pending.decision.send(ApprovalCommand {
-            decision: ApprovalDecision::Deny,
-            delivered,
-        });
-        return Err(rejection(
-            StatusCode::BAD_REQUEST,
-            "TURN_TERMINAL",
-            "turn is already terminal",
-            false,
-        ));
-    }
-    let id = format!("approval_{}", data.next_approval);
-    data.next_approval += 1;
-    data.approvals.insert(
-        id.clone(),
-        ApprovalRecord {
-            id: id.clone(),
-            turn_id: turn_id.to_string(),
-            status: ApprovalStatus::Pending,
-            decision: Some(pending.decision),
-        },
-    );
-    drop(data);
-    set_turn_status(state, turn_id, TurnStatus::WaitingApproval);
-    push_event(
-        state,
-        turn_id,
-        "approval.requested",
-        serde_json::json!({
-            "approval_id": id,
-            "request_key": pending.request_key,
-            "method": pending.method,
-        }),
-        false,
-    );
-    Ok(())
-}
-
-async fn decide_approval(
-    state: &AppState,
-    id: &str,
-    decision: ApprovalStatus,
-) -> Result<Json<ApprovalResponse>, ApiRejection> {
-    let (approval_id, turn_id, sender) = {
-        let mut data = state.inner.owner.data.lock().expect("owner mutex poisoned");
-        let approval = data.approvals.get_mut(id).ok_or_else(|| {
-            rejection(
-                StatusCode::NOT_FOUND,
-                "NOT_FOUND",
-                "approval not found",
-                false,
-            )
-        })?;
-        if approval.status != ApprovalStatus::Pending {
-            return Err(rejection(
-                StatusCode::BAD_REQUEST,
-                "APPROVAL_DECIDED",
-                "approval already decided",
-                false,
-            ));
-        }
-        approval.status = ApprovalStatus::Delivering;
-        (
-            approval.id.clone(),
-            approval.turn_id.clone(),
-            approval.decision.take().ok_or_else(|| {
-                rejection(
-                    StatusCode::CONFLICT,
-                    "APPROVAL_CLOSED",
-                    "approval is no longer owned by a running turn",
-                    false,
-                )
-            })?,
-        )
-    };
-    let protocol_decision = match decision {
-        ApprovalStatus::Approved => ApprovalDecision::Allow,
-        ApprovalStatus::Denied | ApprovalStatus::Pending | ApprovalStatus::Delivering => {
-            ApprovalDecision::Deny
-        }
-    };
-    let (delivered_tx, delivered_rx) = oneshot::channel();
-    if sender
-        .send(ApprovalCommand {
-            decision: protocol_decision,
-            delivered: delivered_tx,
-        })
-        .is_err()
-    {
-        if let Some(approval) = state
-            .inner
-            .owner
-            .data
-            .lock()
-            .expect("owner mutex poisoned")
-            .approvals
-            .get_mut(id)
-        {
-            approval.status = ApprovalStatus::Denied;
-        }
-        return Err(rejection(
-            StatusCode::CONFLICT,
-            "APPROVAL_CLOSED",
-            "approval is no longer owned by a running turn",
-            false,
-        ));
-    }
-    let delivered = tokio::time::timeout(std::time::Duration::from_secs(6), delivered_rx)
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or(false);
-    if !delivered {
-        if let Some(approval) = state
-            .inner
-            .owner
-            .data
-            .lock()
-            .expect("owner mutex poisoned")
-            .approvals
-            .get_mut(id)
-        {
-            // The API never acknowledges an undelivered allow.  The owner
-            // will clean up this turn on the same bounded failure path.
-            approval.status = ApprovalStatus::Denied;
-        }
-        return Err(rejection(
-            StatusCode::CONFLICT,
-            "APPROVAL_DELIVERY_FAILED",
-            "runtime could not deliver the approval decision",
-            true,
-        ));
-    }
-    let status = {
-        let mut data = state.inner.owner.data.lock().expect("owner mutex poisoned");
-        let approval = data.approvals.get_mut(id).ok_or_else(|| {
-            rejection(
-                StatusCode::NOT_FOUND,
-                "NOT_FOUND",
-                "approval not found",
-                false,
-            )
-        })?;
-        approval.status = decision;
-        approval.status
-    };
-    push_event(
-        state,
-        &turn_id,
-        "approval.decided",
-        serde_json::json!({ "approval_id": approval_id, "decision": status }),
-        false,
-    );
-    Ok(Json(ApprovalResponse {
-        id: id.to_string(),
-        turn_id,
-        status,
-    }))
-}
-
-fn update_turn_terminal(
-    state: &AppState,
-    id: &str,
-    status: TurnStatus,
-    kind: &str,
-    payload: serde_json::Value,
-) -> Result<TurnResponse, ApiRejection> {
-    let (response, transitioned) = {
-        let mut data = state.inner.owner.data.lock().expect("owner mutex poisoned");
-        let mut finished_now = false;
-        let response = {
-            let turn = data.turns.get_mut(id).ok_or_else(|| {
-                rejection(StatusCode::NOT_FOUND, "NOT_FOUND", "turn not found", false)
-            })?;
-            if !is_terminal(turn.status) {
-                turn.status = status;
-                finished_now = true;
-            }
-            TurnResponse {
-                id: turn.id.clone(),
-                thread_id: turn.thread_id.clone(),
-                workspace_alias: turn.workspace_alias.clone(),
-                status: turn.status,
-            }
-        };
-        if finished_now {
-            data.active_turns = data.active_turns.saturating_sub(1);
-        }
-        (response, finished_now)
-    };
-    if transitioned {
-        close_pending_approvals(state, id, "terminal");
-        push_event(state, id, kind, payload, true);
-    }
-    Ok(response)
-}
-
-/// Terminalisation owns approval closure.  This makes a stale URL unable to
-/// approve after interrupt, timeout, shutdown, or another terminal outcome.
-fn close_pending_approvals(state: &AppState, turn_id: &str, authority: &'static str) {
-    let mut closed = Vec::new();
-    {
-        let mut data = state.inner.owner.data.lock().expect("owner mutex poisoned");
-        for approval in data.approvals.values_mut() {
-            // A decision that has claimed the one-shot sender is the atomic
-            // winner.  Do not overwrite Delivering here: doing so used to
-            // emit a synthetic denial followed by the acknowledged allow.
-            // Pending requests still fail closed by transferring their sender
-            // exactly once to the protocol owner below.
-            if approval.turn_id == turn_id && approval.status == ApprovalStatus::Pending {
-                approval.status = ApprovalStatus::Denied;
-                if let Some(sender) = approval.decision.take() {
-                    let (delivered, _ack) = oneshot::channel();
-                    let _ = sender.send(ApprovalCommand {
-                        decision: ApprovalDecision::Deny,
-                        delivered,
-                    });
-                }
-                closed.push(approval.id.clone());
-            }
-        }
-    }
-    for approval_id in closed {
-        push_event(
-            state,
-            turn_id,
-            "approval.decided",
-            serde_json::json!({ "approval_id": approval_id, "decision": "denied", "authority": authority }),
-            false,
-        );
-    }
-}
-
-fn set_turn_status(state: &AppState, id: &str, status: TurnStatus) {
-    if let Some(turn) = state
-        .inner
-        .owner
-        .data
-        .lock()
-        .expect("owner mutex poisoned")
-        .turns
-        .get_mut(id)
-    {
-        if !is_terminal(turn.status) {
-            turn.status = status;
-        }
-    }
-}
-
 fn push_event(
-    state: &AppState,
+    state: &mut OwnerState,
     turn_id: &str,
     kind: &str,
     payload: serde_json::Value,
     terminal: bool,
 ) {
-    let mut data = state.inner.owner.data.lock().expect("owner mutex poisoned");
-    let id = data.next_event;
-    data.next_event += 1;
+    let id = state.next_event;
+    state.next_event += 1;
     let event = TurnEvent {
         id,
         kind: kind.to_string(),
@@ -1342,8 +1571,8 @@ fn push_event(
     if encoded_len > MAX_EVENT_BYTES {
         return;
     }
-    while data.replay_bytes.saturating_add(encoded_len) > MAX_SSE_REPLAY_BYTES {
-        let Some(oldest_turn) = data
+    while state.replay_bytes.saturating_add(encoded_len) > MAX_SSE_REPLAY_BYTES {
+        let Some(oldest_turn) = state
             .turns
             .iter()
             .filter_map(|(id, record)| record.events.first().map(|event| (id.clone(), event.id)))
@@ -1352,64 +1581,61 @@ fn push_event(
         else {
             return;
         };
-        let removed = data
+        let removed = state
             .turns
             .get_mut(&oldest_turn)
             .and_then(|record| (!record.events.is_empty()).then(|| record.events.remove(0)));
         if let Some(removed) = removed {
-            let removed_len = serde_json::to_vec(&removed).map_or(0, |encoded| encoded.len());
-            data.replay_bytes = data.replay_bytes.saturating_sub(removed_len);
-            if let Some(turn) = data.turns.get_mut(&oldest_turn) {
-                turn.event_bytes = turn.event_bytes.saturating_sub(removed_len);
+            let bytes = serde_json::to_vec(&removed).map_or(0, |encoded| encoded.len());
+            state.replay_bytes = state.replay_bytes.saturating_sub(bytes);
+            if let Some(turn) = state.turns.get_mut(&oldest_turn) {
+                turn.event_bytes = turn.event_bytes.saturating_sub(bytes);
             }
         }
     }
-    let (sender, removed_len) = {
-        let Some(turn) = data.turns.get_mut(turn_id) else {
-            return;
-        };
-        turn.events.push(event.clone());
-        turn.event_bytes = turn.event_bytes.saturating_add(encoded_len);
-        let removed_len = if turn.events.len() > MAX_EVENTS_PER_TURN {
-            if let Some(removed) = (!turn.events.is_empty()).then(|| turn.events.remove(0)) {
-                let removed_len = serde_json::to_vec(&removed).map_or(0, |encoded| encoded.len());
-                turn.event_bytes = turn.event_bytes.saturating_sub(removed_len);
-                removed_len
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        (turn.sender.clone(), removed_len)
+    let Some(turn) = state.turns.get_mut(turn_id) else {
+        return;
     };
-    data.replay_bytes = data
+    turn.events.push(event.clone());
+    turn.event_bytes = turn.event_bytes.saturating_add(encoded_len);
+    let removed_len = if turn.events.len() > MAX_EVENTS_PER_TURN {
+        turn.events
+            .first()
+            .cloned()
+            .map(|removed| {
+                turn.events.remove(0);
+                let bytes = serde_json::to_vec(&removed).map_or(0, |encoded| encoded.len());
+                turn.event_bytes = turn.event_bytes.saturating_sub(bytes);
+                bytes
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    state.replay_bytes = state
         .replay_bytes
         .saturating_add(encoded_len)
         .saturating_sub(removed_len);
-    let _ = sender.send(event);
+    let _ = turn.sender.send(event);
 }
 
-/// Only terminal state is evicted. Running turns and pending approvals remain
-/// authoritative until their owner has closed them, while completed records
-/// cannot permanently saturate the local adapter.
-fn prune_terminal_records(data: &mut StateData) {
-    let terminal_turns: Vec<String> = data
+fn prune_terminal_records(state: &mut OwnerState) {
+    let terminal: Vec<String> = state
         .turns
         .iter()
         .filter(|(_, turn)| is_terminal(turn.status))
         .map(|(id, _)| id.clone())
         .collect();
-    for turn_id in terminal_turns {
-        if let Some(turn) = data.turns.remove(&turn_id) {
-            data.replay_bytes = data.replay_bytes.saturating_sub(turn.event_bytes);
+    for id in terminal {
+        if let Some(turn) = state.turns.remove(&id) {
+            state.replay_bytes = state.replay_bytes.saturating_sub(turn.event_bytes);
         }
     }
-    data.approvals.retain(|_, approval| {
-        approval.status == ApprovalStatus::Pending || data.turns.contains_key(&approval.turn_id)
+    state.approvals.retain(|_, approval| {
+        approval.status == ApprovalStatus::Pending || state.turns.contains_key(&approval.turn_id)
     });
-    data.threads
-        .retain(|thread_id, _| data.turns.values().any(|turn| &turn.thread_id == thread_id));
+    // Threads are independently capacity-accounted. Dropping idle threads
+    // here would make the public thread cap bypassable by repeated creates.
 }
 
 fn is_terminal(status: TurnStatus) -> bool {
@@ -1418,7 +1644,6 @@ fn is_terminal(status: TurnStatus) -> bool {
         TurnStatus::Interrupted | TurnStatus::Completed | TurnStatus::Failed
     )
 }
-
 fn event_to_sse(event: TurnEvent) -> Result<SseEvent, Infallible> {
     let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
     Ok(SseEvent::default()
@@ -1426,7 +1651,6 @@ fn event_to_sse(event: TurnEvent) -> Result<SseEvent, Infallible> {
         .event(event.kind)
         .data(data))
 }
-
 fn rejection(
     status: StatusCode,
     code: &'static str,
@@ -1440,98 +1664,38 @@ fn rejection(
         retryable,
     }
 }
-
+fn owner_closed() -> ApiRejection {
+    rejection(
+        StatusCode::CONFLICT,
+        "TURN_CLOSED",
+        "runtime owner is not available",
+        false,
+    )
+}
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let mut diff = left.len() ^ right.len();
-    let max_len = left.len().max(right.len());
-    for index in 0..max_len {
+    for index in 0..left.len().max(right.len()) {
         diff |= usize::from(*left.get(index).unwrap_or(&0) ^ *right.get(index).unwrap_or(&0));
     }
     diff == 0
 }
 
 pub async fn serve(config: ApiConfig) -> Result<SocketAddr, ApiError> {
-    // Recovery is complete (or startup fails) before the listener can expose
-    // readiness or accept a turn.  Its detailed errors never cross HTTP.
     recover_before_readiness()
         .await
         .map_err(|error| ApiError::Serve(std::io::Error::other(error.to_string())))?;
-    let bind = config.bind;
-    let listener = tokio::net::TcpListener::bind(bind)
+    let launcher = RuntimeLauncher::for_mode(config.live);
+    let owner = RuntimeOwner::spawn(config.live, launcher);
+    // A failed bootstrap is deliberately not fatal to loopback diagnostics,
+    // but it leaves /ready and create-turn fail-closed. Successful admission
+    // is the only transition which exposes the pinned model and quota.
+    let _ = owner.bootstrap().await;
+    let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .map_err(ApiError::Serve)?;
     let addr = listener.local_addr().map_err(ApiError::Serve)?;
-    axum::serve(listener, app(config))
+    axum::serve(listener, app_with_owner(config, owner))
         .await
         .map_err(ApiError::Serve)?;
     Ok(addr)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// T07: global eviction and terminal pruning each account for a retained
-    /// event exactly once. The old global-only subtraction left a stale
-    /// per-turn total, so terminal eviction subtracted it a second time.
-    #[test]
-    fn global_sse_eviction_keeps_per_turn_and_global_bytes_in_sync() {
-        let owner = RuntimeOwner::new(false);
-        let (sender, _receiver) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        owner.data.lock().expect("owner mutex").turns.insert(
-            "turn-test".to_string(),
-            TurnRecord {
-                id: "turn-test".to_string(),
-                thread_id: "thread-test".to_string(),
-                workspace_alias: "default".to_string(),
-                status: TurnStatus::Completed,
-                events: Vec::new(),
-                event_bytes: 0,
-                sender,
-                task: None,
-                control: None,
-                controlling_sse_active: false,
-            },
-        );
-        let state = AppState {
-            inner: Arc::new(Inner {
-                config: ApiConfig {
-                    bind: DEFAULT_BIND,
-                    bearer_token: "test".to_string(),
-                    workspace_aliases: HashSet::from(["default".to_string()]),
-                    live: false,
-                },
-                owner,
-            }),
-        };
-        for _ in 0..80 {
-            push_event(
-                &state,
-                "turn-test",
-                "diagnostic",
-                serde_json::json!({ "padding": "x".repeat(MAX_EVENT_BYTES - 256) }),
-                false,
-            );
-        }
-        let before = state
-            .inner
-            .owner
-            .data
-            .lock()
-            .expect("owner mutex")
-            .replay_bytes;
-        assert!(before <= MAX_SSE_REPLAY_BYTES);
-        prune_terminal_records(&mut state.inner.owner.data.lock().expect("owner mutex"));
-        assert_eq!(
-            state
-                .inner
-                .owner
-                .data
-                .lock()
-                .expect("owner mutex")
-                .replay_bytes,
-            0,
-            "pruning must not underflow a stale per-turn byte total"
-        );
-    }
 }

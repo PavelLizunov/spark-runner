@@ -70,6 +70,32 @@ enum Flow {
     Run(String),
 }
 
+/// The runtime-owner launcher capability. `Live` is the only production
+/// choice and always re-verifies the pinned executable. `Fake` is an explicit
+/// deterministic fixture injection used by offline tests; live mode never
+/// falls back to it.
+#[derive(Clone, Debug)]
+pub enum RuntimeLauncher {
+    Live,
+    Fake { args: Vec<String> },
+}
+
+impl RuntimeLauncher {
+    pub fn for_mode(live: bool) -> Self {
+        if live {
+            Self::Live
+        } else {
+            Self::Fake {
+                args: vec!["--approval-mode".to_string(), "command".to_string()],
+            }
+        }
+    }
+
+    pub fn is_live(&self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
 enum LaunchSpec {
     Live {
         executable: crate::config::VerifiedExecutable,
@@ -96,19 +122,22 @@ impl LaunchSpec {
     }
 }
 
-fn launch_spec(live: bool, fake_server_args: &[String]) -> Result<LaunchSpec, AppError> {
-    if live {
-        let lock = CodexLock::load(Path::new(DEFAULT_CODEX_LOCK))?;
-        Ok(LaunchSpec::Live {
-            executable: lock.verified_for_spawn()?,
-            args: LIVE_ARGS.iter().map(|arg| arg.to_string()).collect(),
-        })
-    } else {
-        let path = config::fake_app_server_path()?;
-        Ok(LaunchSpec::Fake {
-            program: path.to_string_lossy().to_string(),
-            args: fake_server_args.to_vec(),
-        })
+fn launch_spec(launcher: &RuntimeLauncher) -> Result<LaunchSpec, AppError> {
+    match launcher {
+        RuntimeLauncher::Live => {
+            let lock = CodexLock::load(Path::new(DEFAULT_CODEX_LOCK))?;
+            Ok(LaunchSpec::Live {
+                executable: lock.verified_for_spawn()?,
+                args: LIVE_ARGS.iter().map(|arg| arg.to_string()).collect(),
+            })
+        }
+        RuntimeLauncher::Fake { args } => {
+            let path = config::fake_app_server_path()?;
+            Ok(LaunchSpec::Fake {
+                program: path.to_string_lossy().to_string(),
+                args: args.clone(),
+            })
+        }
     }
 }
 
@@ -117,7 +146,21 @@ async fn spawn_client(
     fake_server_args: &[String],
     approval_policy: ApprovalPolicy,
 ) -> Result<(CodexClient, PathBuf), AppError> {
-    let launch = launch_spec(live, fake_server_args)?;
+    let launcher = if live {
+        RuntimeLauncher::Live
+    } else {
+        RuntimeLauncher::Fake {
+            args: fake_server_args.to_vec(),
+        }
+    };
+    spawn_client_with_launcher(&launcher, approval_policy).await
+}
+
+async fn spawn_client_with_launcher(
+    launcher: &RuntimeLauncher,
+    approval_policy: ApprovalPolicy,
+) -> Result<(CodexClient, PathBuf), AppError> {
+    let launch = launch_spec(launcher)?;
     let cwd = config::ephemeral_cwd()?;
     // `launch` stays alive across spawn. On Linux its program is an inherited
     // `/proc/self/fd/N` handle to the inode whose bytes were just verified.
@@ -130,6 +173,22 @@ async fn spawn_client(
         approval_policy,
     );
     Ok((client, cwd))
+}
+
+/// Bounded owner bootstrap. It validates the launcher path by spawning only
+/// the selected capability, performs the protocol initialize/auth/model/quota
+/// admission sequence, and then always reaps that process before reporting.
+pub async fn bootstrap_runtime(launcher: RuntimeLauncher) -> Result<(), AppError> {
+    let (mut client, cwd) = spawn_client_with_launcher(&launcher, ApprovalPolicy::Deny).await?;
+    let result = async {
+        client.initialize().await?;
+        let _ = client.admit_live_turn().await?;
+        Ok::<(), AppError>(())
+    }
+    .await;
+    let _ = client.shutdown().await;
+    let _ = std::fs::remove_dir_all(cwd);
+    result
 }
 
 /// Install the durable receipt at the only point that knows both the active
@@ -305,10 +364,18 @@ async fn execute_flow_once(
         },
     )
     .await?;
+    let approval_events_are_synchronous =
+        matches!(&approval_policy, ApprovalPolicy::External { .. });
     let approval_policy = with_approval_receipt(approval_policy, journal, &execution_id);
     let (mut client, cwd) = spawn_client(live, fake_server_args, approval_policy).await?;
     let outcome = run_flow_body(&mut client, &cwd, flow, live, journal, &execution_id).await;
-    append_internal_events(journal, &execution_id, client.internal_events()).await?;
+    append_internal_events(
+        journal,
+        &execution_id,
+        client.internal_events(),
+        approval_events_are_synchronous,
+    )
+    .await?;
     let terminal_status = if outcome.is_ok() {
         ExecutionTerminalStatus::Completed
     } else {
@@ -436,18 +503,30 @@ async fn append_internal_events(
     journal: Option<&JournalWriter>,
     execution_id: &str,
     events: &[crate::state::InternalEvent],
+    approval_events_are_synchronous: bool,
 ) -> Result<(), AppError> {
     for event in events {
         match &event.kind {
-            // ApprovalRequested is appended synchronously at protocol
-            // receipt, before it is exposed to an external authority.  Do
-            // not replay it here after the whole flow has terminalised.
+            InternalEventKind::ApprovalRequested {
+                request_key,
+                method,
+            } if !approval_events_are_synchronous => {
+                append_journal(
+                    journal,
+                    JournalEvent::ApprovalRequested {
+                        execution_id: execution_id.to_string(),
+                        request_key: request_key.clone(),
+                        method: method.clone(),
+                    },
+                )
+                .await?;
+            }
             InternalEventKind::ApprovalRequested { .. } => {}
             InternalEventKind::ApprovalDecided {
                 request_key,
                 method,
                 decision,
-            } => {
+            } if !approval_events_are_synchronous => {
                 append_journal(
                     journal,
                     JournalEvent::ApprovalDecided {
@@ -459,6 +538,7 @@ async fn append_internal_events(
                 )
                 .await?;
             }
+            InternalEventKind::ApprovalDecided { .. } => {}
             _ => {}
         }
     }
@@ -517,6 +597,27 @@ pub async fn run_turn_with_approval_policy_controlled(
     turn_timeout: std::time::Duration,
     controls: &mut mpsc::Receiver<RuntimeControl>,
 ) -> Result<String, AppError> {
+    run_turn_with_launcher_controlled(
+        prompt,
+        RuntimeLauncher::for_mode(live),
+        approval_policy,
+        turn_timeout,
+        controls,
+    )
+    .await
+}
+
+/// Same controlled owner path with an explicit deterministic launcher. This
+/// is the injection seam used by CP6 tests; it changes neither production
+/// live launcher selection nor the protocol/lifecycle implementation.
+pub async fn run_turn_with_launcher_controlled(
+    prompt: String,
+    launcher: RuntimeLauncher,
+    approval_policy: ApprovalPolicy,
+    turn_timeout: std::time::Duration,
+    controls: &mut mpsc::Receiver<RuntimeControl>,
+) -> Result<String, AppError> {
+    let live = launcher.is_live();
     let journal = match JournalConfig::from_env() {
         Some(config) => {
             let projection = project_recovery(&config.path)?;
@@ -534,12 +635,10 @@ pub async fn run_turn_with_approval_policy_controlled(
         },
     )
     .await?;
-    // Offline is an injected deterministic runtime, but it traverses the
-    // exact same owner/client/protocol path as live execution.
-    let fake_args = (!live).then(|| vec!["--approval-mode".to_string(), "command".to_string()]);
+    let approval_events_are_synchronous =
+        matches!(&approval_policy, ApprovalPolicy::External { .. });
     let approval_policy = with_approval_receipt(approval_policy, journal.as_ref(), &execution_id);
-    let (mut client, cwd) =
-        spawn_client(live, fake_args.as_deref().unwrap_or(&[]), approval_policy).await?;
+    let (mut client, cwd) = spawn_client_with_launcher(&launcher, approval_policy).await?;
     let result = 'flow: {
         let initialized = tokio::select! {
             result = client.initialize() => result,
@@ -589,6 +688,14 @@ pub async fn run_turn_with_approval_policy_controlled(
                         .turn_interrupt(&thread.thread_id, &turn_id)
                         .await
                         .map_err(non_idempotent("turn/interrupt"))?;
+                    // The 0.144.3 interrupt response only acknowledges the
+                    // RPC. A terminal state is authoritative only after the
+                    // matching server notification arrives on this same
+                    // protocol stream.
+                    let terminal = client
+                        .wait_turn_completed()
+                        .await
+                        .map_err(non_idempotent("turn/completed"))?;
                     append_journal(
                         journal.as_ref(),
                         JournalEvent::TurnCompleted {
@@ -598,7 +705,7 @@ pub async fn run_turn_with_approval_policy_controlled(
                         },
                     )
                     .await?;
-                    Ok((Some(ack), "interrupted".to_string()))
+                    Ok((Some(ack), terminal.status))
                 }
                 None => Err(AppError::Client(ClientError::TurnDeadlineExceeded)),
             },
@@ -617,7 +724,13 @@ pub async fn run_turn_with_approval_policy_controlled(
             _ = &mut deadline => Err(AppError::Client(ClientError::TurnDeadlineExceeded)),
         }
     };
-    append_internal_events(journal.as_ref(), &execution_id, client.internal_events()).await?;
+    append_internal_events(
+        journal.as_ref(),
+        &execution_id,
+        client.internal_events(),
+        approval_events_are_synchronous,
+    )
+    .await?;
     let ambiguous_delivery = matches!(
         &result,
         Err(AppError::Client(ClientError::AmbiguousNonIdempotent { .. }))
