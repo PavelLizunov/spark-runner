@@ -180,14 +180,22 @@ impl CodexClient {
         Ok(ThreadStarted { thread_id, model })
     }
 
-    pub async fn turn_start(&mut self, thread_id: &str, prompt: &str) -> Result<(), ClientError> {
+    pub async fn turn_start(
+        &mut self,
+        thread_id: &str,
+        prompt: &str,
+    ) -> Result<String, ClientError> {
         let params = json!({
             "threadId": thread_id,
             "input": [{ "type": "text", "text": prompt }],
         });
-        self.rpc_call("turn/start", params).await?;
+        let result = self.rpc_call("turn/start", params).await?;
         self.state.on_turn_started()?;
-        Ok(())
+        Ok(result
+            .get("turnId")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown-turn")
+            .to_string())
     }
 
     /// Wait for the terminal `turn/completed` notification while the same

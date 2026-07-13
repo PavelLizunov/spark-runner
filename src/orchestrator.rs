@@ -8,12 +8,18 @@
 //! errors) are never retried; they fail closed on the first attempt.
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
 use crate::client::{ApprovalPolicy, ClientError, CodexClient, REQUIRED_MODEL};
 use crate::config::{self, CodexLock, ConfigError, DEFAULT_CODEX_LOCK};
+use crate::journal::{
+    ApprovalTerminalDecision, ExecutionTerminalStatus, JournalConfig, JournalEvent, JournalWriter,
+    TurnTerminalStatus,
+};
 use crate::process::{ChildProcess, ProcessError};
+use crate::state::{ApprovalDecision, InternalEventKind};
 
 /// Pinned live app-server binary; the exact path/version/sha256 also live in `codex.lock`.
 const LIVE_ARGS: &[&str] = &["app-server", "--listen", "stdio://"];
@@ -26,6 +32,8 @@ pub enum AppError {
     Process(#[from] ProcessError),
     #[error(transparent)]
     Client(#[from] ClientError),
+    #[error(transparent)]
+    Journal(#[from] crate::journal::JournalError),
 }
 
 impl AppError {
@@ -99,6 +107,8 @@ async fn run_flow_body(
     cwd: &Path,
     flow: &Flow,
     live: bool,
+    journal: Option<&JournalWriter>,
+    execution_id: &str,
 ) -> Result<String, AppError> {
     match flow {
         Flow::Doctor => {
@@ -111,13 +121,38 @@ async fn run_flow_body(
                     required: REQUIRED_MODEL,
                 }));
             }
-            client.rate_limits_read().await?;
+            let rate_limits = client.rate_limits_read().await?;
+            append_journal(
+                journal,
+                JournalEvent::RateLimitSnapshot {
+                    execution_id: execution_id.to_string(),
+                    snapshot: rate_limits,
+                },
+            )
+            .await?;
 
             let thread = client.thread_start(cwd).await?;
-            client
+            let turn_id = client
                 .turn_start(&thread.thread_id, "spark-runner doctor readiness check")
                 .await?;
+            append_journal(
+                journal,
+                JournalEvent::TurnStarted {
+                    execution_id: execution_id.to_string(),
+                    turn_id: turn_id.clone(),
+                },
+            )
+            .await?;
             let turn = client.wait_turn_completed().await?;
+            append_journal(
+                journal,
+                JournalEvent::TurnCompleted {
+                    execution_id: execution_id.to_string(),
+                    turn_id,
+                    status: turn_status(&turn.status),
+                },
+            )
+            .await?;
             if client.is_poisoned() {
                 return Err(AppError::Client(ClientError::SessionPoisoned));
             }
@@ -133,8 +168,25 @@ async fn run_flow_body(
         Flow::Run(prompt) => {
             client.initialize().await?;
             let thread = client.thread_start(cwd).await?;
-            client.turn_start(&thread.thread_id, prompt).await?;
+            let turn_id = client.turn_start(&thread.thread_id, prompt).await?;
+            append_journal(
+                journal,
+                JournalEvent::TurnStarted {
+                    execution_id: execution_id.to_string(),
+                    turn_id: turn_id.clone(),
+                },
+            )
+            .await?;
             let turn = client.wait_turn_completed().await?;
+            append_journal(
+                journal,
+                JournalEvent::TurnCompleted {
+                    execution_id: execution_id.to_string(),
+                    turn_id,
+                    status: turn_status(&turn.status),
+                },
+            )
+            .await?;
             if client.is_poisoned() {
                 return Err(AppError::Client(ClientError::SessionPoisoned));
             }
@@ -158,9 +210,43 @@ async fn execute_flow_once(
     live: bool,
     fake_server_args: &[String],
     approval_policy: ApprovalPolicy,
+    journal: Option<&JournalWriter>,
 ) -> Result<String, AppError> {
+    let execution_id = next_execution_id();
+    append_journal(
+        journal,
+        JournalEvent::ExecutionStarted {
+            execution_id: execution_id.clone(),
+        },
+    )
+    .await?;
     let (mut client, cwd) = spawn_client(live, fake_server_args, approval_policy).await?;
-    let outcome = run_flow_body(&mut client, &cwd, flow, live).await;
+    let outcome = run_flow_body(&mut client, &cwd, flow, live, journal, &execution_id).await;
+    append_internal_events(journal, &execution_id, client.internal_events()).await?;
+    let terminal_status = if outcome.is_ok() {
+        ExecutionTerminalStatus::Completed
+    } else {
+        ExecutionTerminalStatus::Failed
+    };
+    append_journal(
+        journal,
+        JournalEvent::ExecutionCompleted {
+            execution_id: execution_id.clone(),
+            status: terminal_status,
+        },
+    )
+    .await?;
+    if let Err(error) = &outcome {
+        append_journal(
+            journal,
+            JournalEvent::Incident {
+                execution_id: Some(execution_id.clone()),
+                class: "flow_error".to_string(),
+                message: error.to_string(),
+            },
+        )
+        .await?;
+    }
     let _ = client.shutdown().await;
     let _ = std::fs::remove_dir_all(&cwd);
     outcome
@@ -175,17 +261,117 @@ async fn run_with_restart(
     fake_server_args: &[String],
     approval_policy: ApprovalPolicy,
 ) -> Result<String, AppError> {
-    match execute_flow_once(&flow, live, fake_server_args, approval_policy).await {
+    let journal = match JournalConfig::from_env() {
+        Some(config) => Some(JournalWriter::open(config)?),
+        None => None,
+    };
+    let result = match execute_flow_once(
+        &flow,
+        live,
+        fake_server_args,
+        approval_policy,
+        journal.as_ref(),
+    )
+    .await
+    {
         Ok(summary) => Ok(summary),
         Err(error) if error.is_recoverable_desync() => {
             tracing::warn!(
                 error = %error,
                 "recoverable protocol desync on first attempt; restarting app-server once"
             );
-            execute_flow_once(&flow, live, fake_server_args, approval_policy).await
+            execute_flow_once(
+                &flow,
+                live,
+                fake_server_args,
+                approval_policy,
+                journal.as_ref(),
+            )
+            .await
         }
         Err(error) => Err(error),
+    };
+    if let Some(journal) = journal {
+        journal.shutdown().await?;
     }
+    result
+}
+
+async fn append_journal(
+    journal: Option<&JournalWriter>,
+    event: JournalEvent,
+) -> Result<(), AppError> {
+    if let Some(journal) = journal {
+        journal.append(event).await?;
+    }
+    Ok(())
+}
+
+async fn append_internal_events(
+    journal: Option<&JournalWriter>,
+    execution_id: &str,
+    events: &[crate::state::InternalEvent],
+) -> Result<(), AppError> {
+    for event in events {
+        match &event.kind {
+            InternalEventKind::ApprovalRequested {
+                request_key,
+                method,
+            } => {
+                append_journal(
+                    journal,
+                    JournalEvent::ApprovalRequested {
+                        execution_id: execution_id.to_string(),
+                        request_key: request_key.clone(),
+                        method: method.clone(),
+                    },
+                )
+                .await?;
+            }
+            InternalEventKind::ApprovalDecided {
+                request_key,
+                method,
+                decision,
+            } => {
+                append_journal(
+                    journal,
+                    JournalEvent::ApprovalDecided {
+                        execution_id: execution_id.to_string(),
+                        request_key: request_key.clone(),
+                        method: method.clone(),
+                        decision: approval_decision(*decision),
+                    },
+                )
+                .await?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn approval_decision(decision: ApprovalDecision) -> ApprovalTerminalDecision {
+    match decision {
+        ApprovalDecision::Allow => ApprovalTerminalDecision::Allowed,
+        ApprovalDecision::Deny => ApprovalTerminalDecision::Denied,
+        ApprovalDecision::Timeout => ApprovalTerminalDecision::TimedOut,
+    }
+}
+
+fn turn_status(status: &str) -> TurnTerminalStatus {
+    if status == "completed" {
+        TurnTerminalStatus::Completed
+    } else {
+        TurnTerminalStatus::Failed
+    }
+}
+
+fn next_execution_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("exec-{}-{nanos}", std::process::id())
 }
 
 pub async fn run_doctor(live: bool) -> Result<String, AppError> {
