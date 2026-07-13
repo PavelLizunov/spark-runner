@@ -2,7 +2,7 @@
 
 Status: **partial/active**. All evidence below is deterministic and offline: no OAuth, network request, credential value, or model turn was used.
 
-Code SHA evidence: `2812d89f6682275a5d94e2effedb1647c6a1e9f1` (`fix: acknowledge CP6 approval delivery`). This evidence commit intentionally does not state its own final SHA; reviewer/release SHA remains external verification.
+Code SHA evidence: `2812d89f6682275a5d94e2effedb1647c6a1e9f1` (`fix: acknowledge CP6 approval delivery`). Tree evidence: this markdown is committed separately so it cannot self-report its final tree SHA; reviewer/release SHA remains external verification.
 
 ## Executable coverage
 
