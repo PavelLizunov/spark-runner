@@ -1,9 +1,13 @@
-# CP2: Minimal Rust runner — DETERMINISTIC/SCHEMA-READY, PR PENDING
+# CP2: Minimal Rust runner — CI GREEN, MERGE PENDING
 
-Status: **deterministic, schema-ready**. Implementation is complete on branch `cp2-minimal-runner`; local
+Status: **CI green, merge pending**. Implementation is complete on branch `cp2-minimal-runner`; local
 gates, a live `doctor --live` run, and stable schema generation have all been executed on `uap-build-1` and
-passed. CI has not yet been run on the pushed branch, no PR has been opened, and nothing has been merged —
-CP2 is not fully closed out until those remain.
+passed. PR #2 (https://github.com/PavelLizunov/spark-runner/pull/2) is open for commit
+`7c8a9ea96087042c6365f265f59feb0f9ebc7560`, and CI was green on both the push run
+(https://github.com/PavelLizunov/spark-runner/actions/runs/29218755221) and the pull_request run
+(https://github.com/PavelLizunov/spark-runner/actions/runs/29218769616), with the `validate` job passing on
+each. Squash merge remains pending for final closeout: a final evidence update will be pushed and CI rerun
+before the squash merge.
 
 ## Implementation summary
 
@@ -95,15 +99,24 @@ Single binary crate `spark-runner` (no workspace), per ADR-001/ADR-003/ADR-005:
 - [x] Real `schema_hash` generated for `codex.lock`: sha256
       `efdc3e4ef848db9543c29d7f150820fe80e970720cc887e17e6f3c196bc37259` of
       `protocol/0.142.0/stable.schema.json`, generated on build-1.
-- [x] `Cargo.lock` and `protocol/0.142.0/stable.schema.json` are present in the working tree and will be
-      tracked in the PR — commit into the PR pending.
-- [ ] `Cargo.lock` consistent with `--locked` verified in CI on the pushed branch.
-- [ ] GitHub Actions `ubuntu-latest` run green on the pushed branch — not yet run.
-- [ ] PR opened and merged.
+- [x] `Cargo.lock` and `protocol/0.142.0/stable.schema.json` are present in the working tree and tracked in
+      PR #2.
+- [x] `Cargo.lock` consistent with `--locked` verified in CI on the pushed branch: GitHub Actions `validate`
+      job green on push run https://github.com/PavelLizunov/spark-runner/actions/runs/29218755221 and
+      pull_request run https://github.com/PavelLizunov/spark-runner/actions/runs/29218769616.
+- [x] GitHub Actions `ubuntu-latest` run green on the pushed branch — see run ids above.
+- [x] PR opened: https://github.com/PavelLizunov/spark-runner/pull/2 (commit
+      `7c8a9ea96087042c6365f265f59feb0f9ebc7560`).
+- [ ] Squash merge PR #2.
+- [ ] Confirm `main` reflects the merge.
+- [ ] Clean up branch/worktree.
 
 ## Gate decision
 
-CP2 is **green locally**: format, lint, tests (including the process-group shutdown regression test), and a
-live `doctor --live` run against the pinned Codex binary all passed on `uap-build-1`, with clean process-leak
-checks before and after. CP2 is **not yet fully closed** — CI on the pushed branch, opening the PR, and
-merging remain outstanding before `PROGRESS.json` records a `completed_at`.
+CP2 is **green locally and in CI**: format, lint, tests (including the process-group shutdown regression
+test), and a live `doctor --live` run against the pinned Codex binary all passed on `uap-build-1`, with clean
+process-leak checks before and after; PR #2 is open and GitHub Actions `validate` was green on both the push
+and pull_request runs for commit `7c8a9ea96087042c6365f265f59feb0f9ebc7560`. A final evidence update will be
+pushed and CI rerun before the squash merge; this evidence file's own commit has not yet had CI run on it.
+CP2 is **not yet fully closed** — squash merge, confirming `main`, and branch/worktree cleanup remain
+outstanding before `PROGRESS.json` records a `completed_at`.

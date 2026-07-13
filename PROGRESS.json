@@ -6,8 +6,8 @@
   "state": "active",
   "completed_checkpoints": ["CP1"],
   "blocker": null,
-  "updated_at": "2026-07-13T02:05:00Z",
-  "next_command": "Run deterministic local checks, commit CP2, push cp2-minimal-runner, open PR #2, wait for green CI, squash merge, confirm main, clean branches/worktree, then begin CP3.",
+  "updated_at": "2026-07-13T02:14:00Z",
+  "next_command": "Push final CP2 evidence update, wait for green CI, squash merge PR #2, confirm main, clean branches/worktree, then begin CP3.",
   "checkpoints": {
     "CP1": {
       "name": "Phase 0 bootstrap: raw app-server + Python SDK oracle",
