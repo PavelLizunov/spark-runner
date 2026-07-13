@@ -1,29 +1,26 @@
 # CP6 — local HTTP/SSE adapter
 
-Status: **partial/active**. All evidence below is deterministic and offline: no OAuth, network request, credential value, or model turn was used.
+Status: **cycle 11 remediated**. The evidence below is deterministic and offline: no OAuth, network request, credential value, or model turn was used.
 
-Code SHA evidence: `2812d89f6682275a5d94e2effedb1647c6a1e9f1` (`fix: acknowledge CP6 approval delivery`). Tree evidence: this markdown is committed separately so it cannot self-report its final tree SHA; reviewer/release SHA remains external verification.
+Code SHA evidence: `1bd3736a0fbb4d158925e2b3d898916d3c81bd4c` (`fix(cp6): add runtime owner actor`). This evidence commit is intentionally separate; its tree SHA is release metadata, not a claim about the code commit it describes.
 
-## Executable coverage
+## Lifecycle root and executable coverage
 
-- T01: interrupt path sends `turn/interrupt` with accepted identifiers, checks delivery, cleans up before acknowledgement, and has a terminal-once HTTP regression.
-- T02/T03: genuine approval decisions and timeout remain fail-closed. The authenticated decision is recorded by the adapter only after the owner reports that it flushed the original JSON-RPC response. T03 does not yet exercise a dropped controlling SSE lease.
-- T04: unadmitted live mode rejects before the offline launcher can run.
-- T05/T06: post-delivery ambiguity is not replayed; oversized newline-free frames fail closed.
-- T07: executable long-line and many-line stderr fixture proves byte retention is capped and diagnostics disclose only counts.
-- T08: executable ambient-secret canary proves curated child environment and 0700 private `CODEX_HOME`.
-- T09: executable native/schema/platform/version/symlink mismatch checks fail before live spawn.
-- T10: executable exhausted quota and post-admission model reroute fixtures fail closed.
-- T11: strict `initialize` then `initialized`, signed-i64 interleaved approval delegation, and unknown string-ID `-32601` response are covered. Interleaved and terminal request dispatch share duplicate tracking. The generated ChatGPT token-refresh shape has an explicit bounded owner provider; its default absence returns a deterministic error without reading, logging, or persisting secret values.
-- T12: durable, idempotent startup recovery remains covered.
+- `RuntimeOwner` is the sole HTTP lifecycle authority. Authenticated handlers validate inputs then send owner commands for bootstrap/snapshot, thread and turn creation, approval decision, interrupt, controlling-SSE drop, completion, recovery, and shutdown. It owns bounded API admission, turn/approval/SSE state and the one active controlled protocol execution.
+- Startup recovery completes before binding. `serve` sends a bounded bootstrap command which initializes the selected protocol launcher and checks ChatGPT auth, exact model, and quota before readiness is exposed. A failed live bootstrap remains `503 RUNTIME_NOT_READY`; the live launcher never falls back to the fake fixture.
+- T01 in `tests/cp6_runtime_owner.rs` injects the canonical fake launcher into a `live=true` owner and proves bootstrap readiness, original-ID schema-valid denial, `turn/interrupt` RPC plus terminal notification, process PID exit, journal ordering, terminal-once state, and a safely admitted second turn.
+- T03 proves controlling SSE drop uses the identical owner cancellation command and original-ID denial path. Existing API coverage also proves timeout, concurrent decision exclusion, and replayable terminal SSE.
+- External Allow and Deny now append `ApprovalRequested` before `ApprovalDecided`; the wire-delivery acknowledgement is delayed until that durable decision is written. Test-only Allow/Deny policies append the same order from bounded internal events.
+- Child-controlled approval identifiers are hashed into short opaque keys before SSE, journal, storage, or duplicate tracking. Both duplicate tracking and internal event history have count and byte caps; oversized and repeated-id coverage is executable.
+- Token-file owner-only permission and API thread-capacity coverage are executable in `cp6_runtime_owner.rs`; SSE replay/retention remains covered in `cp6_local_http_sse.rs`.
 
-## Cycle-eight author gates
+## Cycle 11 gates (code SHA above)
 
-- `cargo fmt --all -- --check` — exit 0, 0.10s.
-- `CARGO_NET_OFFLINE=true cargo test --locked --all-targets --all-features` — exit 0, 20.51s (52 tests).
-- `CARGO_NET_OFFLINE=true cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0, 0.14s.
-- `git diff --check` — exit 0, 0.00s.
+- `cargo fmt --all -- --check` — exit 0, 0.20s.
+- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-11 CARGO_NET_OFFLINE=true cargo test --locked --all-targets --all-features` — exit 0, 20.41s (60 tests).
+- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-11 CARGO_NET_OFFLINE=true cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0, 0.10s.
+- `git diff --check` — exit 0, 0.10s.
 
-## Remaining risk
+## Residual non-gating risk
 
-The HTTP adapter still has local projection state rather than a fully persistent actor command loop, live admission is fail-closed until a real authenticated session is supplied, and controlling-SSE disconnect ownership lacks the required executable lease/drop test. No claim of live OAuth or production model execution is made.
+The live bootstrap is intentionally not exercised against real credentials or a real model in this repository. The bounded failure path reports only sanitized classes and remains fail-closed; operational deployment still needs a separately authorized live-account smoke test. The test launcher is explicitly injected and cannot select the production live executable path.
