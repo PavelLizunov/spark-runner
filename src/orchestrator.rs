@@ -676,57 +676,6 @@ pub async fn run_turn(prompt: String, live: bool) -> Result<String, AppError> {
     run_with_restart(Flow::Run(prompt), live, &[], ApprovalPolicy::Deny).await
 }
 
-/// Runtime-owner entry point.  HTTP adapters use this rather than selecting a
-/// launcher or inventing an approval path of their own.
-pub async fn run_turn_with_approval_policy(
-    prompt: String,
-    live: bool,
-    approval_policy: ApprovalPolicy,
-) -> Result<String, AppError> {
-    run_with_restart(Flow::Run(prompt), live, &[], approval_policy).await
-}
-
-/// The controlled runtime-owner path used by HTTP.  It intentionally has no
-/// retry after `thread/start`/`turn/start`: delivery ambiguity is an operator
-/// recovery condition, never permission to replay a model turn.
-pub async fn run_turn_with_approval_policy_controlled(
-    prompt: String,
-    live: bool,
-    approval_policy: ApprovalPolicy,
-    turn_timeout: std::time::Duration,
-    controls: &mut mpsc::Receiver<RuntimeControl>,
-) -> Result<String, AppError> {
-    run_turn_with_launcher_controlled(
-        prompt,
-        RuntimeLauncher::for_mode(live),
-        approval_policy,
-        turn_timeout,
-        controls,
-    )
-    .await
-}
-
-/// Same controlled owner path with an explicit deterministic launcher. This
-/// is the injection seam used by CP6 tests; it changes neither production
-/// live launcher selection nor the protocol/lifecycle implementation.
-pub async fn run_turn_with_launcher_controlled(
-    prompt: String,
-    launcher: RuntimeLauncher,
-    approval_policy: ApprovalPolicy,
-    turn_timeout: std::time::Duration,
-    controls: &mut mpsc::Receiver<RuntimeControl>,
-) -> Result<String, AppError> {
-    run_turn_with_launcher_controlled_with_journal(
-        prompt,
-        launcher,
-        approval_policy,
-        turn_timeout,
-        controls,
-        None,
-    )
-    .await
-}
-
 /// All fallible controlled protocol work lives in this inner future so `?`
 /// returns to the caller's single cleanup epilogue, never directly from the
 /// runtime owner. A cancellation before real thread/turn identifiers exist
@@ -1071,17 +1020,6 @@ pub async fn recover_journal_before_readiness(path: &Path) -> Result<(), AppErro
     persist_recovery(&writer, projection).await?;
     writer.shutdown().await?;
     Ok(())
-}
-
-/// Test-support/API entry point for the offline fake app-server only: same as
-/// [`run_turn`], but passes deterministic fake-server args and approval policy
-/// through the existing runtime/client path.
-pub async fn run_turn_with_fake_server_args_and_approval_policy(
-    prompt: String,
-    fake_server_args: &[String],
-    approval_policy: ApprovalPolicy,
-) -> Result<String, AppError> {
-    run_with_restart(Flow::Run(prompt), false, fake_server_args, approval_policy).await
 }
 
 /// Test-support entry point for the offline fake app-server only: same as

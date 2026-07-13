@@ -8,14 +8,26 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      # TODO(CP7): pin this action by full commit SHA before release readiness.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Validate JSON evidence files
         run: |
           set -euo pipefail
           python3 -c "import json; json.load(open('PROGRESS.json'))"
           python3 -c "import json; json.load(open('docs/evidence/run.json'))"
+          python3 -c "import json; json.load(open('protocol/0.142.0/stable.schema.json'))"
+          python3 -c "import json; json.load(open('protocol/0.144.3/codex_app_server_protocol.v2.schemas.json'))"
+          python3 - <<'PY'
+          import hashlib
+          import json
+
+          with open("codex.lock", "r", encoding="utf-8") as handle:
+              lock = json.load(handle)
+          path = lock["schema_path"]
+          actual = hashlib.sha256(open(path, "rb").read()).hexdigest()
+          if actual != lock["schema_hash"]:
+              raise SystemExit(f"{path}: SHA-256 does not match codex.lock")
+          PY
 
       - name: Validate JSONL evidence timeline
         run: |
@@ -36,13 +48,9 @@ jobs:
                       )
           PY
 
-      - name: Rust checks (only if a crate exists yet)
+      - name: Rust checks
         run: |
           set -euo pipefail
-          if [ -f Cargo.toml ]; then
-            cargo fmt --all -- --check
-            cargo clippy --all-targets -- -D warnings
-            cargo test --locked
-          else
-            echo "No Cargo.toml present yet; skipping Rust checks."
-          fi
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-targets --all-features
