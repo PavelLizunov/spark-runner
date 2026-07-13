@@ -6,8 +6,8 @@
   "state": "active",
   "completed_checkpoints": ["CP1"],
   "blocker": null,
-  "updated_at": "2026-07-12T23:00:00Z",
-  "next_command": "Implement the minimal Rust binary crate (single crate, no workspace) that spawns `codex app-server --listen stdio://`, performs initialize/account/model/rate-limit reads over JSONL, and drives one thread/start + turn/start to a terminal turn/completed event, per ADR-001..ADR-005.",
+  "updated_at": "2026-07-13T02:05:00Z",
+  "next_command": "Run deterministic local checks, commit CP2, push cp2-minimal-runner, open PR #2, wait for green CI, squash merge, confirm main, clean branches/worktree, then begin CP3.",
   "checkpoints": {
     "CP1": {
       "name": "Phase 0 bootstrap: raw app-server + Python SDK oracle",
@@ -37,8 +37,8 @@
     },
     "CP2": {
       "name": "Minimal Rust runner: app-server client + one full turn",
-      "state": "pending",
-      "started_at": null,
+      "state": "active",
+      "started_at": "2026-07-12T23:45:00Z",
       "completed_at": null,
       "evidence_file": "docs/evidence/cp/CP2.md"
     },
