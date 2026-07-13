@@ -12,7 +12,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::client::{ApprovalPolicy, ClientError, CodexClient, REQUIRED_MODEL};
+use crate::client::{
+    journal_rate_limit_snapshot, ApprovalPolicy, ApprovalReceipt, ClientError, CodexClient,
+    REQUIRED_MODEL,
+};
 use crate::config::{self, CodexLock, ConfigError, DEFAULT_CODEX_LOCK};
 use crate::journal::{
     project_recovery, ApprovalTerminalDecision, ExecutionTerminalStatus, JournalConfig,
@@ -129,6 +132,29 @@ async fn spawn_client(
     Ok((client, cwd))
 }
 
+/// Install the durable receipt at the only point that knows both the active
+/// execution id and its single journal writer.  The client appends it before
+/// the pending request can become visible to an HTTP/SSE authority.
+fn with_approval_receipt(
+    policy: ApprovalPolicy,
+    journal: Option<&JournalWriter>,
+    execution_id: &str,
+) -> ApprovalPolicy {
+    match policy {
+        ApprovalPolicy::External {
+            pending, timeout, ..
+        } => ApprovalPolicy::External {
+            pending,
+            timeout,
+            receipt: journal.map(|journal| ApprovalReceipt {
+                journal: journal.clone(),
+                execution_id: execution_id.to_string(),
+            }),
+        },
+        policy => policy,
+    }
+}
+
 fn mode_label(live: bool) -> &'static str {
     if live {
         "live"
@@ -153,7 +179,7 @@ async fn run_flow_body(
                 journal,
                 JournalEvent::RateLimitSnapshot {
                     execution_id: execution_id.to_string(),
-                    snapshot: rate_limits,
+                    snapshot: journal_rate_limit_snapshot(&rate_limits),
                 },
             )
             .await?;
@@ -210,7 +236,7 @@ async fn run_flow_body(
                 journal,
                 JournalEvent::RateLimitSnapshot {
                     execution_id: execution_id.to_string(),
-                    snapshot: rate_limits,
+                    snapshot: journal_rate_limit_snapshot(&rate_limits),
                 },
             )
             .await?;
@@ -279,6 +305,7 @@ async fn execute_flow_once(
         },
     )
     .await?;
+    let approval_policy = with_approval_receipt(approval_policy, journal, &execution_id);
     let (mut client, cwd) = spawn_client(live, fake_server_args, approval_policy).await?;
     let outcome = run_flow_body(&mut client, &cwd, flow, live, journal, &execution_id).await;
     append_internal_events(journal, &execution_id, client.internal_events()).await?;
@@ -412,20 +439,10 @@ async fn append_internal_events(
 ) -> Result<(), AppError> {
     for event in events {
         match &event.kind {
-            InternalEventKind::ApprovalRequested {
-                request_key,
-                method,
-            } => {
-                append_journal(
-                    journal,
-                    JournalEvent::ApprovalRequested {
-                        execution_id: execution_id.to_string(),
-                        request_key: request_key.clone(),
-                        method: method.clone(),
-                    },
-                )
-                .await?;
-            }
+            // ApprovalRequested is appended synchronously at protocol
+            // receipt, before it is exposed to an external authority.  Do
+            // not replay it here after the whole flow has terminalised.
+            InternalEventKind::ApprovalRequested { .. } => {}
             InternalEventKind::ApprovalDecided {
                 request_key,
                 method,
@@ -520,6 +537,7 @@ pub async fn run_turn_with_approval_policy_controlled(
     // Offline is an injected deterministic runtime, but it traverses the
     // exact same owner/client/protocol path as live execution.
     let fake_args = (!live).then(|| vec!["--approval-mode".to_string(), "command".to_string()]);
+    let approval_policy = with_approval_receipt(approval_policy, journal.as_ref(), &execution_id);
     let (mut client, cwd) =
         spawn_client(live, fake_args.as_deref().unwrap_or(&[]), approval_policy).await?;
     let result = 'flow: {
@@ -536,7 +554,7 @@ pub async fn run_turn_with_approval_policy_controlled(
             journal.as_ref(),
             JournalEvent::RateLimitSnapshot {
                 execution_id: execution_id.clone(),
-                snapshot: rate_limits,
+                snapshot: journal_rate_limit_snapshot(&rate_limits),
             },
         )
         .await?;
@@ -578,7 +596,8 @@ pub async fn run_turn_with_approval_policy_controlled(
                             turn_id,
                             status: TurnTerminalStatus::Interrupted,
                         },
-                    ).await?;
+                    )
+                    .await?;
                     Ok((Some(ack), "interrupted".to_string()))
                 }
                 None => Err(AppError::Client(ClientError::TurnDeadlineExceeded)),

@@ -745,6 +745,7 @@ async fn run_runtime_owner_turn(
         let policy = ApprovalPolicy::External {
             pending: pending_tx,
             timeout,
+            receipt: None,
         };
         run_turn_with_approval_policy_controlled(
             prompt,
@@ -1275,12 +1276,12 @@ fn close_pending_approvals(state: &AppState, turn_id: &str, authority: &'static 
     {
         let mut data = state.inner.owner.data.lock().expect("owner mutex poisoned");
         for approval in data.approvals.values_mut() {
-            if approval.turn_id == turn_id
-                && matches!(
-                    approval.status,
-                    ApprovalStatus::Pending | ApprovalStatus::Delivering
-                )
-            {
+            // A decision that has claimed the one-shot sender is the atomic
+            // winner.  Do not overwrite Delivering here: doing so used to
+            // emit a synthetic denial followed by the acknowledged allow.
+            // Pending requests still fail closed by transferring their sender
+            // exactly once to the protocol owner below.
+            if approval.turn_id == turn_id && approval.status == ApprovalStatus::Pending {
                 approval.status = ApprovalStatus::Denied;
                 if let Some(sender) = approval.decision.take() {
                     let (delivered, _ack) = oneshot::channel();

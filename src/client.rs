@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::journal::{JournalEvent, JournalWriter};
 use crate::jsonl::{JsonlClient, JsonlError};
 use crate::process::ChildProcess;
 use crate::state::{ApprovalDecision, ApprovalSource, InternalEvent, SessionState, StateError};
@@ -93,6 +94,18 @@ fn fallback_model(class: &'static str, observed: &str) -> ClientError {
     }
 }
 
+/// Remote quota responses are diagnostics, not audit payloads.  Keep only
+/// the admission fact and a fixed-width correlation hash so arbitrary child
+/// fields (including canaries under innocent keys) never cross into SQLite.
+pub fn journal_rate_limit_snapshot(snapshot: &Value) -> Value {
+    let encoded = serde_json::to_string(snapshot).unwrap_or_default();
+    json!({
+        "class": "rate_limit_snapshot",
+        "quota_available": quota_available(snapshot),
+        "hash": remote_value_hash(&encoded),
+    })
+}
+
 #[derive(Debug, Clone)]
 pub enum ApprovalPolicy {
     Deny,
@@ -103,7 +116,18 @@ pub enum ApprovalPolicy {
     External {
         pending: mpsc::Sender<PendingApproval>,
         timeout: Duration,
+        /// Receipt is installed only by the runtime owner.  Recording here,
+        /// before the request is handed to HTTP, makes a crash at the pending
+        /// boundary recoverable instead of relying on end-of-flow event
+        /// projection.
+        receipt: Option<ApprovalReceipt>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovalReceipt {
+    pub journal: JournalWriter,
+    pub execution_id: String,
 }
 
 /// The protocol owner may relay a refresh request to an authenticated
@@ -515,13 +539,28 @@ impl CodexClient {
         let (decision, delivered_by_command) = match approval_policy {
             ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, false),
             ApprovalPolicy::Deny => (ApprovalDecision::Deny, false),
-            ApprovalPolicy::External { pending, timeout } => {
+            ApprovalPolicy::External {
+                pending,
+                timeout,
+                receipt,
+            } => {
                 let (decision_tx, decision_rx) = oneshot::channel();
                 let pending_approval = PendingApproval {
                     request_key: request_key.clone(),
                     method: method.to_string(),
                     decision: decision_tx,
                 };
+                if let Some(receipt) = receipt {
+                    receipt
+                        .journal
+                        .append(JournalEvent::ApprovalRequested {
+                            execution_id: receipt.execution_id.clone(),
+                            request_key: request_key.clone(),
+                            method: method.to_string(),
+                        })
+                        .await
+                        .map_err(|_| ClientError::SessionPoisoned)?;
+                }
                 if pending.send(pending_approval).await.is_err() {
                     (ApprovalDecision::Deny, false)
                 } else {
@@ -599,29 +638,53 @@ impl CodexClient {
         let (decision, delivered_by_command) = match approval_policy {
             ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, false),
             ApprovalPolicy::Deny => (ApprovalDecision::Deny, false),
-            ApprovalPolicy::External { pending, timeout } => {
+            ApprovalPolicy::External {
+                pending,
+                timeout,
+                receipt,
+            } => {
                 let (decision_tx, decision_rx) = oneshot::channel();
-                pending
+                if let Some(receipt) = receipt {
+                    receipt
+                        .journal
+                        .append(JournalEvent::ApprovalRequested {
+                            execution_id: receipt.execution_id.clone(),
+                            request_key: request_key.clone(),
+                            method: method.to_string(),
+                        })
+                        .await
+                        .map_err(|_| ClientError::SessionPoisoned)?;
+                }
+                if pending
                     .send(PendingApproval {
                         request_key: request_key.clone(),
                         method: method.to_string(),
                         decision: decision_tx,
                     })
                     .await
-                    .map_err(|_| ClientError::AuthTokensRefreshUnavailable)?;
-                match tokio::time::timeout(*timeout, decision_rx).await {
-                    Ok(Ok(command)) => {
-                        let delivered = rpc
-                            .respond(id.clone(), approval_response(method, command.decision))
-                            .await
-                            .is_ok();
-                        let _ = command.delivered.send(delivered);
-                        if !delivered {
-                            return Err(ClientError::SessionPoisoned);
+                    .is_err()
+                {
+                    // This branch is reachable while an ordinary RPC is
+                    // outstanding.  It is still a genuine server request,
+                    // so fail closed *on the original id* rather than
+                    // returning an internal hand-off error without a wire
+                    // response.
+                    (ApprovalDecision::Timeout, false)
+                } else {
+                    match tokio::time::timeout(*timeout, decision_rx).await {
+                        Ok(Ok(command)) => {
+                            let delivered = rpc
+                                .respond(id.clone(), approval_response(method, command.decision))
+                                .await
+                                .is_ok();
+                            let _ = command.delivered.send(delivered);
+                            if !delivered {
+                                return Err(ClientError::SessionPoisoned);
+                            }
+                            (command.decision, true)
                         }
-                        (command.decision, true)
+                        Ok(Err(_)) | Err(_) => (ApprovalDecision::Timeout, false),
                     }
-                    Ok(Err(_)) | Err(_) => (ApprovalDecision::Timeout, false),
                 }
             }
         };
@@ -896,5 +959,25 @@ mod tests {
         assert!(!rendered.contains(canary));
         assert!(rendered.contains("class=model_rerouted"));
         assert!(rendered.contains("hash="));
+    }
+
+    /// T07/T10 diagnostic canary: child-controlled quota fields are reduced
+    /// to allowlisted admission metadata before journal persistence.
+    #[test]
+    fn rate_limit_journal_snapshot_drops_untrusted_canary_fields() {
+        let canary = "REMOTE_RATE_LIMIT_CANARY_do_not_persist";
+        let snapshot = json!({
+            "rateLimits": { "primary": { "usedPercent": 0 }, "credits": null },
+            "rateLimitsByLimitId": null,
+            "innocentLookingDiagnostic": canary,
+        });
+        let sanitized = journal_rate_limit_snapshot(&snapshot);
+        let encoded = serde_json::to_string(&sanitized).unwrap();
+        assert!(!encoded.contains(canary));
+        assert_eq!(sanitized["class"], "rate_limit_snapshot");
+        assert!(sanitized["hash"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 16));
+        assert_eq!(sanitized["quota_available"], true);
     }
 }
