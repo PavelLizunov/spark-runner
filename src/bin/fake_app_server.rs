@@ -55,6 +55,13 @@ fn maybe_apply_fault(
             stdout.flush()?;
             Ok(true)
         }
+        "oversized_no_newline" => {
+            // Exercise the pre-allocation frame limit: keep stdout open after
+            // writing an unterminated payload.
+            stdout.write_all(&vec![b'x'; MAX_FRAME_LEN + 1])?;
+            stdout.flush()?;
+            Ok(true)
+        }
         "malformed_frame" => {
             stdout.write_all(b"not-a-valid-jsonl-frame\n")?;
             stdout.flush()?;
@@ -91,11 +98,35 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
+struct ApprovalFixture<'a> {
+    mode: &'a str,
+    approval_key: &'a str,
+    approval_method: &'a str,
+    wire_marker: Option<&'a Path>,
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let fake_mode = arg_value(&args, "--fake-mode");
     let fail_marker = arg_value(&args, "--fail-marker").map(PathBuf::from);
     let approval_mode = arg_value(&args, "--approval-mode");
+    let approval_key =
+        arg_value(&args, "--approval-id").unwrap_or_else(|| "approval-1".to_string());
+    let approval_method = arg_value(&args, "--approval-method")
+        .unwrap_or_else(|| "item/commandExecution/requestApproval".to_string());
+    let barrier_phase = arg_value(&args, "--barrier-phase");
+    let barrier_marker = arg_value(&args, "--barrier-marker").map(PathBuf::from);
+    let codex_home_marker = arg_value(&args, "--codex-home-marker").map(PathBuf::from);
+    if let Some(marker) = arg_value(&args, "--pid-marker") {
+        std::fs::write(marker, std::process::id().to_string())?;
+    }
+    if let Some(marker) = codex_home_marker {
+        let home = std::env::var_os("CODEX_HOME").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "fixture CODEX_HOME is unavailable")
+        })?;
+        std::fs::write(marker, home.to_string_lossy().as_bytes())?;
+    }
+    let wire_marker = arg_value(&args, "--wire-marker").map(PathBuf::from);
     if approval_mode.is_some() {
         if let Some(marker) = fail_marker.as_ref() {
             let _ = record_attempt(marker)?;
@@ -108,6 +139,7 @@ fn main() -> io::Result<()> {
     let mut thread_counter: u64 = 0;
     let mut turn_counter: u64 = 0;
     let mut fault_pending = fake_mode.is_some();
+    let mut awaiting_initialized = false;
 
     while let Some(line) = lines.next() {
         let line = line?;
@@ -123,6 +155,29 @@ fn main() -> io::Result<()> {
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let params = request.get("params").cloned().unwrap_or(Value::Null);
 
+        // Deterministic cancellation split point: the parent has already
+        // flushed this request, but this fixture deliberately withholds the
+        // response until the parent either cancels or releases stdin. Tests
+        // synchronize on the marker rather than sleeping.
+        if barrier_phase.as_deref() == Some(method) {
+            if let Some(marker) = barrier_marker.as_ref() {
+                std::fs::write(marker, method)?;
+            }
+            let _ = read_server_message(&mut lines)?;
+            continue;
+        }
+
+        if awaiting_initialized {
+            if method != "initialized" || request.get("id").is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "strict fixture expected initialized notification",
+                ));
+            }
+            awaiting_initialized = false;
+            continue;
+        }
+
         if fault_pending {
             fault_pending = false;
             if maybe_apply_fault(fake_mode.as_deref(), fail_marker.as_ref(), &mut stdout, id)? {
@@ -131,33 +186,70 @@ fn main() -> io::Result<()> {
         }
 
         match method {
-            "initialize" => send(
-                &mut stdout,
-                &json!({
+            "initialize" => {
+                send(
+                    &mut stdout,
+                    &json!({
                     "id": id,
                     "result": {
-                        "serverInfo": { "name": "fake-codex-app-server", "version": "0.142.0" }
+                        "serverInfo": { "name": "fake-codex-app-server", "version": "0.144.3" }
                     }
-                }),
-            )?,
-            "account/read" => send(
-                &mut stdout,
-                &json!({
+                    }),
+                )?;
+                awaiting_initialized = fake_mode.as_deref() == Some("strict_initialize");
+            }
+            "account/read" => {
+                // T11 fixture: a conforming server may need an owner answer
+                // before releasing an unrelated RPC response.
+                if fake_mode.as_deref() == Some("approval_during_account") {
+                    send_approval_request(
+                        &mut stdout,
+                        -9001,
+                        "bootstrap-thread",
+                        "bootstrap-turn",
+                        "bootstrap-approval",
+                        "item/commandExecution/requestApproval",
+                    )?;
+                    let response = read_server_message(&mut lines)?;
+                    let decision = response
+                        .as_ref()
+                        .and_then(|value| value.pointer("/result/decision"))
+                        .and_then(Value::as_str);
+                    if decision != Some("accept") {
+                        return Ok(());
+                    }
+                }
+                send(
+                    &mut stdout,
+                    &json!({
                     "id": id,
                     "result": {
-                        "planType": "pro",
-                        "accountType": "chatgpt",
-                        "requiresOpenaiAuth": true
+                        "account": {
+                            "type": "chatgpt",
+                            "email": "offline@example.invalid",
+                            "planType": "pro"
+                        },
+                        "requiresOpenaiAuth": false
                     }
-                }),
-            )?,
+                    }),
+                )?
+            }
             "model/list" => send(
                 &mut stdout,
                 &json!({
                     "id": id,
                     "result": {
                         "data": [
-                            { "id": REQUIRED_MODEL, "provider": "openai" }
+                            {
+                                "id": REQUIRED_MODEL,
+                                "model": REQUIRED_MODEL,
+                                "displayName": "Spark",
+                                "description": "deterministic offline fixture",
+                                "hidden": false,
+                                "isDefault": true,
+                                "defaultReasoningEffort": "medium",
+                                "supportedReasoningEfforts": []
+                            }
                         ]
                     }
                 }),
@@ -167,9 +259,28 @@ fn main() -> io::Result<()> {
                 &json!({
                     "id": id,
                     "result": {
-                        "limits": [
-                            { "id": "spark-primary", "remaining": 100 }
-                        ]
+                        "rateLimits": {
+                            "limitId": "codex",
+                            "limitName": "Codex",
+                            "planType": "pro",
+                            "primary": { "usedPercent": if fake_mode.as_deref() == Some("quota_exhausted") { 100 } else { 0 }, "resetsAt": null, "windowDurationMins": null },
+                            "secondary": null,
+                            "credits": null,
+                            "individualLimit": null,
+                            "rateLimitReachedType": null
+                        },
+                        "rateLimitsByLimitId": {
+                            "codex": {
+                                "limitId": "codex",
+                                "limitName": "Codex",
+                                "planType": "pro",
+                                "primary": { "usedPercent": if fake_mode.as_deref() == Some("quota_exhausted") { 100 } else { 0 }, "resetsAt": null, "windowDurationMins": null },
+                                "secondary": null,
+                                "credits": null,
+                                "individualLimit": null,
+                                "rateLimitReachedType": null
+                            }
+                        }
                     }
                 }),
             )?,
@@ -186,12 +297,26 @@ fn main() -> io::Result<()> {
                     &json!({
                         "id": id,
                         "result": {
-                            "thread": { "id": thread_id },
-                            "threadId": thread_id,
+                            "thread": {
+                                "id": thread_id,
+                                "cliVersion": "0.144.3",
+                                "createdAt": 1,
+                                "updatedAt": 1,
+                                "cwd": "/tmp",
+                                "ephemeral": true,
+                                "modelProvider": "openai",
+                                "preview": "",
+                                "sessionId": "offline-session",
+                                "source": "appServer",
+                                "status": { "type": "idle" },
+                                "turns": []
+                            },
                             "model": model,
                             "modelProvider": "openai",
                             "approvalPolicy": "on-request",
-                            "status": "idle"
+                            "approvalsReviewer": "user",
+                            "cwd": "/tmp",
+                            "sandbox": "read-only"
                         }
                     }),
                 )?;
@@ -200,8 +325,20 @@ fn main() -> io::Result<()> {
                     &json!({
                         "method": "thread/started",
                         "params": {
-                            "thread": { "id": thread_id },
-                            "threadId": thread_id
+                            "thread": {
+                                "id": thread_id,
+                                "cliVersion": "0.144.3",
+                                "createdAt": 1,
+                                "updatedAt": 1,
+                                "cwd": "/tmp",
+                                "ephemeral": true,
+                                "modelProvider": "openai",
+                                "preview": "",
+                                "sessionId": "offline-session",
+                                "source": "appServer",
+                                "status": { "type": "idle" },
+                                "turns": []
+                            }
                         }
                     }),
                 )?;
@@ -218,18 +355,44 @@ fn main() -> io::Result<()> {
                     &mut stdout,
                     &json!({
                         "id": id,
-                        "result": { "turnId": turn_id, "status": "started" }
+                        "result": { "turn": { "id": turn_id, "status": "inProgress", "items": [] } }
                     }),
                 )?;
+                if fake_mode.as_deref() == Some("desync_after_turn_start") {
+                    stdout.write_all(b"not-a-valid-jsonl-frame\n")?;
+                    stdout.flush()?;
+                    continue;
+                }
+                if fake_mode.as_deref() == Some("model_rerouted") {
+                    send(
+                        &mut stdout,
+                        &json!({
+                            "method": "model/rerouted",
+                            "params": { "model": "gpt-unpinned-reroute" }
+                        }),
+                    )?;
+                    continue;
+                }
                 send(
                     &mut stdout,
                     &json!({
-                        "method": "turn/started",
-                        "params": { "threadId": thread_id, "turnId": turn_id }
-                    }),
+                                "method": "turn/started",
+                    "params": { "threadId": thread_id, "turn": { "id": turn_id, "status": "inProgress", "items": [] } }
+                            }),
                 )?;
                 if let Some(mode) = approval_mode.as_deref() {
-                    handle_approval_mode(&mut lines, &mut stdout, mode, &thread_id, &turn_id)?;
+                    handle_approval_mode(
+                        &mut lines,
+                        &mut stdout,
+                        &thread_id,
+                        &turn_id,
+                        ApprovalFixture {
+                            mode,
+                            approval_key: &approval_key,
+                            approval_method: &approval_method,
+                            wire_marker: wire_marker.as_deref(),
+                        },
+                    )?;
                 } else {
                     send_turn_completed(&mut stdout, &thread_id, &turn_id, "completed")?;
                 }
@@ -254,29 +417,97 @@ fn main() -> io::Result<()> {
 fn handle_approval_mode(
     lines: &mut impl Iterator<Item = io::Result<String>>,
     stdout: &mut impl Write,
-    mode: &str,
     thread_id: &str,
     turn_id: &str,
+    fixture: ApprovalFixture<'_>,
 ) -> io::Result<()> {
     let approval_id = 9001;
-    send_approval_request(stdout, approval_id, thread_id, turn_id)?;
+    send_approval_request(
+        stdout,
+        approval_id,
+        thread_id,
+        turn_id,
+        fixture.approval_key,
+        fixture.approval_method,
+    )?;
 
-    if mode == "timeout" {
+    if fixture.mode == "timeout" {
         std::process::exit(0);
     }
 
-    let first_decision = read_decision(lines)?.unwrap_or_else(|| "missing".to_string());
-    match mode {
+    let first = read_server_message(lines)?;
+    record_wire(fixture.wire_marker, first.as_ref())?;
+    if first
+        .as_ref()
+        .and_then(|value| value.get("method"))
+        .and_then(Value::as_str)
+        == Some("turn/interrupt")
+    {
+        let id = first.as_ref().and_then(|value| value.get("id")).cloned();
+        send(stdout, &json!({ "id": id, "result": {} }))?;
+        send_turn_completed(stdout, thread_id, turn_id, "failed")?;
+        return Ok(());
+    }
+    let first_decision = first
+        .as_ref()
+        .and_then(|value| value.get("result"))
+        .and_then(|result| result.get("decision"))
+        .and_then(Value::as_str)
+        .unwrap_or("missing");
+    match fixture.mode {
+        "wait_interrupt" => {
+            let second = read_server_message(lines)?;
+            record_wire(fixture.wire_marker, second.as_ref())?;
+            if second
+                .as_ref()
+                .and_then(|value| value.get("method"))
+                .and_then(Value::as_str)
+                == Some("turn/interrupt")
+            {
+                let id = second.as_ref().and_then(|value| value.get("id")).cloned();
+                send(stdout, &json!({ "id": id, "result": {} }))?;
+                send_turn_completed(stdout, thread_id, turn_id, "failed")?;
+            }
+        }
+        "interrupt_timeout" => {
+            let second = read_server_message(lines)?;
+            record_wire(fixture.wire_marker, second.as_ref())?;
+            if second
+                .as_ref()
+                .and_then(|value| value.get("method"))
+                .and_then(Value::as_str)
+                == Some("turn/interrupt")
+            {
+                // The marker above proves the owner completed the interrupt
+                // write. Keep the protocol peer alive without a response so
+                // the owner's bounded wait crosses the after-write timeout
+                // boundary deterministically.
+                std::thread::park();
+            }
+        }
         "duplicate" => {
-            send_approval_request(stdout, approval_id, thread_id, turn_id)?;
-            let _ = read_decision(lines)?;
+            send_approval_request(
+                stdout,
+                approval_id,
+                thread_id,
+                turn_id,
+                fixture.approval_key,
+                fixture.approval_method,
+            )?;
+            let duplicate = read_server_message(lines)?;
+            record_wire(fixture.wire_marker, duplicate.as_ref())?;
         }
         "restart_unresolved" => {
             stdout.write_all(b"not-a-valid-jsonl-frame\n")?;
             stdout.flush()?;
         }
         _ => {
-            let status = if first_decision == "accept" {
+            let permissions_granted = first
+                .as_ref()
+                .and_then(|value| value.pointer("/result/permissions/network/enabled"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            let status = if first_decision == "accept" || permissions_granted {
                 "completed"
             } else {
                 "failed"
@@ -287,32 +518,107 @@ fn handle_approval_mode(
     Ok(())
 }
 
+fn record_wire(marker: Option<&Path>, value: Option<&Value>) -> io::Result<()> {
+    let Some(marker) = marker else {
+        return Ok(());
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(marker)?;
+    if let Some(value) = value {
+        writeln!(file, "{}", serde_json::to_string(value)?)?;
+    }
+    Ok(())
+}
+
 fn send_approval_request(
     stdout: &mut impl Write,
-    id: u64,
+    id: i64,
     thread_id: &str,
     turn_id: &str,
+    approval_key: &str,
+    approval_method: &str,
 ) -> io::Result<()> {
+    let params = match approval_method {
+        "item/fileChange/requestApproval" => json!({
+            "grantRoot": "/tmp/fake-write-root",
+            "reason": "deterministic fake file change",
+            "itemId": "item-1",
+            "startedAtMs": 1,
+            "threadId": thread_id,
+            "turnId": turn_id,
+        }),
+        "item/permissions/requestApproval" => json!({
+            "cwd": "/tmp/fake-cwd",
+            "reason": "deterministic fake permission request",
+            "permissions": {
+                "fileSystem": { "entries": [
+                    {
+                        "access": "write",
+                        "path": {
+                            "type": "special",
+                            "value": { "kind": "project_roots", "subpath": "generated" }
+                        }
+                    },
+                    {
+                        "access": "read",
+                        "path": {
+                            "type": "special",
+                            "value": {
+                                "kind": "unknown",
+                                "path": "/tmp/fake-external-root",
+                                "subpath": "inputs"
+                            }
+                        }
+                    }
+                ] },
+                "network": { "enabled": true }
+            },
+            "itemId": "item-1",
+            "startedAtMs": 1,
+            "threadId": thread_id,
+            "turnId": turn_id,
+        }),
+        "execCommandApproval" => json!({
+            "approvalId": approval_key,
+            "callId": "call-1",
+            "command": ["echo", "deterministic-fake-approval"],
+            "conversationId": thread_id,
+            "cwd": "/tmp/fake-cwd",
+            "parsedCmd": [],
+            "reason": "deterministic fake command",
+        }),
+        "applyPatchApproval" => json!({
+            "callId": "call-1",
+            "conversationId": thread_id,
+            "fileChanges": { "/tmp/fake-file": { "type": "update", "unified_diff": "@@ -0,0 +1 @@\n+deterministic fake patch\n" } },
+            "reason": "deterministic fake patch",
+        }),
+        _ => json!({
+            "approvalId": approval_key,
+            "command": "echo deterministic-fake-approval",
+            "cwd": "/tmp/fake-cwd",
+            "reason": "deterministic fake command",
+            "itemId": "item-1",
+            "startedAtMs": 1,
+            "threadId": thread_id,
+            "turnId": turn_id
+        }),
+    };
     send(
         stdout,
         &json!({
             "id": id,
-            "method": "item/commandExecution/requestApproval",
-            "params": {
-                "approvalId": "approval-1",
-                "command": "echo deterministic-fake-approval",
-                "itemId": "item-1",
-                "startedAtMs": 1,
-                "threadId": thread_id,
-                "turnId": turn_id
-            }
+            "method": approval_method,
+            "params": params,
         }),
     )
 }
 
-fn read_decision(
+fn read_server_message(
     lines: &mut impl Iterator<Item = io::Result<String>>,
-) -> io::Result<Option<String>> {
+) -> io::Result<Option<Value>> {
     let Some(line) = lines.next() else {
         return Ok(None);
     };
@@ -321,11 +627,7 @@ fn read_decision(
         Ok(value) => value,
         Err(_) => return Ok(None),
     };
-    Ok(value
-        .get("result")
-        .and_then(|result| result.get("decision"))
-        .and_then(Value::as_str)
-        .map(str::to_string))
+    Ok(Some(value))
 }
 
 fn send_turn_completed(
@@ -338,7 +640,7 @@ fn send_turn_completed(
         stdout,
         &json!({
             "method": "turn/completed",
-            "params": { "threadId": thread_id, "turnId": turn_id, "status": status }
+            "params": { "threadId": thread_id, "turn": { "id": turn_id, "status": status, "items": [] } }
         }),
     )
 }

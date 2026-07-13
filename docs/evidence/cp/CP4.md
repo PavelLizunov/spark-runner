@@ -1,6 +1,6 @@
 # CP4 - Stage 3 lifecycle and approvals
 
-Status: **green**
+Status: **partial**. Follow-up CP6 work is required for externally brokered approval and interrupt authority.
 
 Completed at: `2026-07-13T04:10:18Z`
 

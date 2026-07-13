@@ -12,12 +12,14 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-const STDERR_TAIL_LINES: usize = 200;
+use crate::config::VerifiedSubscriptionAuth;
+
+pub const STDERR_TAIL_BYTES: usize = 16 * 1024;
 /// Upper bound on kill/wait and stderr-task join during shutdown, so cleanup
 /// can never hang even if a process-group kill somehow fails to land.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -53,6 +55,62 @@ mod unix {
     }
 }
 
+#[derive(Debug, Default)]
+struct StderrTail {
+    bytes: VecDeque<u8>,
+    total_seen: usize,
+}
+
+impl StderrTail {
+    fn push(&mut self, chunk: &[u8]) {
+        self.total_seen = self.total_seen.saturating_add(chunk.len());
+        for byte in chunk {
+            if self.bytes.len() == STDERR_TAIL_BYTES {
+                self.bytes.pop_front();
+            }
+            self.bytes.push_back(*byte);
+        }
+    }
+
+    fn snapshot(&self) -> String {
+        // Child stderr is untrusted. Do not render it into logs, journals, or
+        // public errors; retain only bounded diagnostic metadata.
+        format!("stderr_bytes_seen={}", self.total_seen)
+    }
+}
+
+fn configure_environment(
+    command: &mut Command,
+    cwd: Option<&Path>,
+    subscription_auth: Option<&mut VerifiedSubscriptionAuth>,
+) -> Result<(), ProcessError> {
+    command.env_clear();
+    for name in ["LANG", "LC_ALL", "TZ"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    if let Some(dir) = cwd {
+        let codex_home = dir.join("codex-home");
+        std::fs::create_dir_all(&codex_home).map_err(ProcessError::CodexHome)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o700))
+                .map_err(ProcessError::CodexHome)?;
+        }
+        if let Some(subscription_auth) = subscription_auth {
+            subscription_auth
+                .provision_into(&codex_home.join("auth.json"))
+                .map_err(ProcessError::SubscriptionAuth)?;
+        }
+        command.env("CODEX_HOME", codex_home);
+    } else if subscription_auth.is_some() {
+        return Err(ProcessError::MissingCodexHome);
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessError {
     #[error("failed to spawn {program}: {source}")]
@@ -61,26 +119,14 @@ pub enum ProcessError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to prepare private CODEX_HOME: {0}")]
+    CodexHome(std::io::Error),
+    #[error("failed to provision selected subscription auth file: {0}")]
+    SubscriptionAuth(crate::config::ConfigError),
+    #[error("selected subscription auth requires a private CODEX_HOME")]
+    MissingCodexHome,
     #[error("child process did not expose a piped {0} handle")]
     MissingHandle(&'static str),
-}
-
-#[derive(Debug, Default)]
-struct StderrTail {
-    lines: VecDeque<String>,
-}
-
-impl StderrTail {
-    fn push(&mut self, line: String) {
-        if self.lines.len() >= STDERR_TAIL_LINES {
-            self.lines.pop_front();
-        }
-        self.lines.push_back(line);
-    }
-
-    fn snapshot(&self) -> String {
-        self.lines.iter().cloned().collect::<Vec<_>>().join("\n")
-    }
 }
 
 pub struct SpawnedChild {
@@ -105,11 +151,24 @@ impl ChildProcess {
         args: &[String],
         cwd: Option<&Path>,
     ) -> Result<SpawnedChild, ProcessError> {
+        Self::spawn_with_subscription_auth(program, args, cwd, None)
+    }
+
+    /// Spawn using only the caller-selected, already-validated subscription
+    /// credential. The source path is never passed to the child and no
+    /// ambient Codex configuration is inherited.
+    pub fn spawn_with_subscription_auth(
+        program: &str,
+        args: &[String],
+        cwd: Option<&Path>,
+        subscription_auth: Option<&mut VerifiedSubscriptionAuth>,
+    ) -> Result<SpawnedChild, ProcessError> {
         let mut command = Command::new(program);
         command.args(args);
         if let Some(dir) = cwd {
             command.current_dir(dir);
         }
+        configure_environment(&mut command, cwd, subscription_auth)?;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -142,9 +201,13 @@ impl ChildProcess {
         let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
         let tail_for_task = Arc::clone(&stderr_tail);
         let stderr_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tail_for_task.lock().await.push(line);
+            let mut stderr = BufReader::new(stderr);
+            let mut chunk = [0_u8; 1024];
+            while let Ok(read) = stderr.read(&mut chunk).await {
+                if read == 0 {
+                    break;
+                }
+                tail_for_task.lock().await.push(&chunk[..read]);
             }
         });
 
@@ -164,6 +227,12 @@ impl ChildProcess {
     /// Sanitized-by-construction snapshot of the last stderr lines (no stdout/protocol content).
     pub async fn stderr_tail(&self) -> String {
         self.stderr_tail.lock().await.snapshot()
+    }
+
+    /// Testable bounded-retention metric. The bytes themselves are never
+    /// rendered into errors, journals, or logs.
+    pub async fn stderr_tail_len(&self) -> usize {
+        self.stderr_tail.lock().await.bytes.len()
     }
 
     /// Kill the whole process group (so native descendants die too), wait for

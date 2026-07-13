@@ -14,11 +14,13 @@
 //! by a timeout, so a stalled app-server fails fast with a sanitized error
 //! instead of hanging forever.
 
+use std::future::Future;
 use std::time::Duration;
 
 use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 /// Default bound for a single response/notification wait. Generous enough for
@@ -31,6 +33,32 @@ const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// against an unbounded or corrupted frame instead of buffering it
 /// indefinitely; the frame content itself is never logged.
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
+const MAX_PENDING_MESSAGES: usize = 128;
+const MAX_PENDING_BYTES: usize = 2 * MAX_FRAME_LEN;
+
+/// Shared with the runtime owner around a non-idempotent request. Once the
+/// transport has begun attempting the request write, cancellation cannot
+/// safely assume the request was not delivered even if the newline, flush, or
+/// response was not observed. This is intentionally conservative: a dropped
+/// future at that boundary must become Unknown rather than replayable work.
+#[derive(Clone, Default)]
+pub struct RequestDelivery {
+    possibly_written: Arc<AtomicBool>,
+}
+
+impl RequestDelivery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn may_have_been_written(&self) -> bool {
+        self.possibly_written.load(Ordering::SeqCst)
+    }
+
+    fn mark_write_started(&self) {
+        self.possibly_written.store(true, Ordering::SeqCst);
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum JsonlError {
@@ -40,8 +68,10 @@ pub enum JsonlError {
     Serde(#[from] serde_json::Error),
     #[error("app-server stdout closed while waiting for a response or notification")]
     StreamClosed,
-    #[error("app-server returned an error for id {id}: {message}")]
-    Remote { id: u64, message: String },
+    #[error(
+        "app-server returned a remote error for request id {id} (diagnostic payload suppressed)"
+    )]
+    Remote { id: u64 },
     #[error("timed out after {0:?} waiting for an app-server response or notification")]
     Timeout(Duration),
     #[error(
@@ -50,6 +80,8 @@ pub enum JsonlError {
     OversizedFrame { limit: usize },
     #[error("app-server sent a malformed protocol frame; session poisoned")]
     MalformedFrame,
+    #[error("app-server sent a server request while an RPC response was awaited; request was rejected and session poisoned")]
+    ServerRequestDuringCall,
     #[error(
         "app-server response id {actual} did not match the expected id {expected} \
          (protocol desync); session poisoned"
@@ -65,6 +97,7 @@ impl JsonlError {
             self,
             JsonlError::OversizedFrame { .. }
                 | JsonlError::MalformedFrame
+                | JsonlError::ServerRequestDuringCall
                 | JsonlError::UnexpectedResponseId { .. }
         )
     }
@@ -74,7 +107,13 @@ impl JsonlError {
 /// Kept behind one lock so a message is never "in flight" between the two.
 struct ReaderState {
     stdout: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+    // A read may be cancelled when the runtime owner receives a higher
+    // priority cancellation command.  Keeping an incomplete frame with the
+    // reader, rather than in the cancelled future's stack, means the next
+    // protocol operation resumes at the exact byte boundary.
+    frame: Vec<u8>,
     pending: Vec<Value>,
+    pending_bytes: usize,
 }
 
 pub struct JsonlClient {
@@ -101,7 +140,9 @@ impl JsonlClient {
             stdin: Mutex::new(Box::new(stdin)),
             reader: Mutex::new(ReaderState {
                 stdout: BufReader::new(Box::new(stdout)),
+                frame: Vec::with_capacity(1024),
                 pending: Vec::new(),
+                pending_bytes: 0,
             }),
             next_id: AtomicU64::new(1),
             wait_timeout,
@@ -113,6 +154,57 @@ impl JsonlClient {
     /// buffer forever (ADR-004: poison-on-desync); unrelated notifications
     /// are still tolerated.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, JsonlError> {
+        self.call_with_server_request_handler(method, params, |request| async move {
+            // This convenience entry point has no owner to delegate to.  It
+            // still gives the peer a schema-valid JSON-RPC error before
+            // failing closed; production callers use the handler variant.
+            let id = request
+                .get("id")
+                .cloned()
+                .ok_or(JsonlError::MalformedFrame)?;
+            if id.as_str().is_none() && id.as_i64().is_none() {
+                return Err(JsonlError::MalformedFrame);
+            }
+            self.respond_error(id, -32601, "method not found").await
+        })
+        .await
+    }
+
+    /// Like [`Self::call`], but gives the single protocol owner each
+    /// server-initiated request while an ordinary RPC is outstanding.  This
+    /// avoids a request/response deadlock without assigning approval or auth
+    /// authority to the transport layer.
+    pub async fn call_with_server_request_handler<F, Fut>(
+        &self,
+        method: &str,
+        params: Value,
+        handler: F,
+    ) -> Result<Value, JsonlError>
+    where
+        F: FnMut(Value) -> Fut,
+        Fut: Future<Output = Result<(), JsonlError>>,
+    {
+        self.call_with_server_request_handler_and_delivery(method, params, None, handler)
+            .await
+    }
+
+    /// As [`Self::call_with_server_request_handler`], while exposing the
+    /// irreversible write boundary to the runtime owner for non-idempotent
+    /// cancellation classification.
+    pub async fn call_with_server_request_handler_and_delivery<F, Fut>(
+        &self,
+        method: &str,
+        params: Value,
+        delivery: Option<&RequestDelivery>,
+        mut handler: F,
+    ) -> Result<Value, JsonlError>
+    where
+        F: FnMut(Value) -> Fut,
+        Fut: Future<Output = Result<(), JsonlError>>,
+    {
+        // Server requests are dispatched while this ordinary request is
+        // pending. A conforming app-server may wait for that response before
+        // returning ours; buffering it would deadlock both peers.
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let request = serde_json::json!({
             "id": id,
@@ -123,20 +215,92 @@ impl JsonlClient {
 
         {
             let mut stdin = self.stdin.lock().await;
+            // Set the irreversible boundary immediately before the first
+            // write attempt, not after newline+flush. An AsyncWrite can
+            // report cancellation after accepting a prefix (or all) of this
+            // buffer; no later observation can prove it was pre-write.
+            if let Some(delivery) = delivery {
+                delivery.mark_write_started();
+            }
             stdin.write_all(line.as_bytes()).await?;
             stdin.write_all(b"\n").await?;
             stdin.flush().await?;
         }
 
-        let response = self.wait_for(WaitTarget::ResponseId(id)).await?;
+        let response = tokio::time::timeout(
+            self.wait_timeout,
+            self.read_response_dispatching_requests(id, &mut handler),
+        )
+        .await
+        .map_err(|_| JsonlError::Timeout(self.wait_timeout))??;
 
         if let Some(error) = response.get("error") {
-            return Err(JsonlError::Remote {
-                id,
-                message: error.to_string(),
-            });
+            let _ = error;
+            return Err(JsonlError::Remote { id });
         }
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    async fn read_response_dispatching_requests<F, Fut>(
+        &self,
+        expected: u64,
+        handler: &mut F,
+    ) -> Result<Value, JsonlError>
+    where
+        F: FnMut(Value) -> Fut,
+        Fut: Future<Output = Result<(), JsonlError>>,
+    {
+        loop {
+            let next = {
+                let mut reader = self.reader.lock().await;
+                if let Some(pos) = reader
+                    .pending
+                    .iter()
+                    .position(|value| WaitTarget::ResponseId(expected).matches(value))
+                {
+                    Some(Ok::<Value, JsonlError>(remove_pending(&mut reader, pos)))
+                } else {
+                    reader
+                        .pending
+                        .iter()
+                        .position(is_server_request)
+                        .map(|pos| Ok::<Value, JsonlError>(remove_pending(&mut reader, pos)))
+                }
+            };
+
+            let value = match next {
+                Some(value) => value?,
+                None => self.read_raw_message().await?,
+            };
+            if WaitTarget::ResponseId(expected).matches(&value) {
+                return Ok(value);
+            }
+            if is_server_request(&value) {
+                handler(value).await?;
+                continue;
+            }
+            if value.get("method").is_none() {
+                if let Some(actual) = value.get("id").and_then(Value::as_u64) {
+                    return Err(JsonlError::UnexpectedResponseId { expected, actual });
+                }
+            }
+            let mut reader = self.reader.lock().await;
+            push_pending(&mut reader, value)?;
+        }
+    }
+
+    async fn read_raw_message(&self) -> Result<Value, JsonlError> {
+        let mut reader = self.reader.lock().await;
+        loop {
+            let Some(line) = read_bounded_frame(&mut reader).await? else {
+                return Err(JsonlError::StreamClosed);
+            };
+            let trimmed = trim_ascii(&line);
+            if trimmed.is_empty() {
+                continue;
+            }
+            return serde_json::from_slice(trimmed).map_err(|_| JsonlError::MalformedFrame);
+        }
     }
 
     /// Wait for the next notification (no `id`) matching `method`, tolerating
@@ -151,7 +315,7 @@ impl JsonlClient {
     }
 
     /// Send a JSON-RPC response to a request initiated by the app-server.
-    pub async fn respond(&self, id: u64, result: Value) -> Result<(), JsonlError> {
+    pub async fn respond(&self, id: Value, result: Value) -> Result<(), JsonlError> {
         let response = serde_json::json!({ "id": id, "result": result });
         let line = serde_json::to_string(&response)?;
         let mut stdin = self.stdin.lock().await;
@@ -162,6 +326,39 @@ impl JsonlClient {
 ",
             )
             .await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    /// Reply to a server-initiated request before failing the session. The
+    /// request id is echoed unchanged because the stable protocol accepts
+    /// both strings and signed integers.
+    pub async fn respond_error(
+        &self,
+        id: Value,
+        code: i64,
+        message: &str,
+    ) -> Result<(), JsonlError> {
+        let response =
+            serde_json::json!({ "id": id, "error": { "code": code, "message": message } });
+        let line = serde_json::to_string(&response)?;
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    /// Send a JSON-RPC notification. The stable protocol requires this
+    /// immediately after a successful initialize response.
+    pub async fn notify(&self, method: &str, params: Value) -> Result<(), JsonlError> {
+        let line = serde_json::to_string(&serde_json::json!({
+            "method": method,
+            "params": params,
+        }))?;
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
         stdin.flush().await?;
         Ok(())
     }
@@ -190,26 +387,19 @@ impl JsonlClient {
             .iter()
             .position(|value| target.matches(value))
         {
-            return Ok(reader.pending.remove(pos));
+            return Ok(remove_pending(&mut reader, pos));
         }
 
         loop {
-            let mut line = String::new();
-            let bytes_read = reader.stdout.read_line(&mut line).await?;
-            if bytes_read == 0 {
+            let Some(line) = read_bounded_frame(&mut reader).await? else {
                 return Err(JsonlError::StreamClosed);
-            }
-            if bytes_read > MAX_FRAME_LEN {
-                return Err(JsonlError::OversizedFrame {
-                    limit: MAX_FRAME_LEN,
-                });
-            }
-            let trimmed = line.trim();
+            };
+            let trimmed = trim_ascii(&line);
             if trimmed.is_empty() {
                 continue;
             }
             let value: Value =
-                serde_json::from_str(trimmed).map_err(|_| JsonlError::MalformedFrame)?;
+                serde_json::from_slice(trimmed).map_err(|_| JsonlError::MalformedFrame)?;
 
             if target.matches(&value) {
                 return Ok(value);
@@ -232,39 +422,108 @@ impl JsonlClient {
                 }
             }
 
+            // Both method and id are child-controlled.  Diagnostic output
+            // exposes only a bounded message class.
             tracing::debug!(
-                method = ?value.get("method"),
+                class = "unrelated_protocol_message",
                 has_id = value.get("id").is_some(),
-                "buffering unrelated message while waiting"
+                "buffering protocol message while waiting"
             );
-            reader.pending.push(value);
+            push_pending(&mut reader, value)?;
         }
     }
 
     async fn read_next_message(&self) -> Result<Value, JsonlError> {
         let mut reader = self.reader.lock().await;
         if !reader.pending.is_empty() {
-            return Ok(reader.pending.remove(0));
+            return Ok(remove_pending(&mut reader, 0));
         }
 
         loop {
-            let mut line = String::new();
-            let bytes_read = reader.stdout.read_line(&mut line).await?;
-            if bytes_read == 0 {
+            let Some(line) = read_bounded_frame(&mut reader).await? else {
                 return Err(JsonlError::StreamClosed);
+            };
+            let trimmed = trim_ascii(&line);
+            if trimmed.is_empty() {
+                continue;
             }
-            if bytes_read > MAX_FRAME_LEN {
+            return serde_json::from_slice(trimmed).map_err(|_| JsonlError::MalformedFrame);
+        }
+    }
+}
+
+fn is_server_request(value: &Value) -> bool {
+    value.get("id").is_some() && value.get("method").is_some()
+}
+
+fn remove_pending(reader: &mut ReaderState, index: usize) -> Value {
+    let value = reader.pending.remove(index);
+    // Serialize exactly as `push_pending` did. This makes the accounting
+    // represent retained bytes rather than cumulative traffic.
+    let bytes = serde_json::to_vec(&value).map_or(0, |bytes| bytes.len());
+    reader.pending_bytes = reader.pending_bytes.saturating_sub(bytes);
+    value
+}
+
+async fn read_bounded_frame(reader: &mut ReaderState) -> Result<Option<Vec<u8>>, JsonlError> {
+    loop {
+        let mut byte = [0_u8; 1];
+        let read = reader.stdout.read(&mut byte).await?;
+        if read == 0 {
+            // An unterminated frame at the limit cannot be safely accepted.
+            // In particular, a writer of MAX_FRAME_LEN+1 bytes can observe a
+            // broken pipe after the reader consumes the bounded prefix, so
+            // EOF at this boundary remains the same fail-closed oversized
+            // frame classification rather than a timing-dependent close.
+            if reader.frame.len() == MAX_FRAME_LEN {
+                reader.frame.clear();
                 return Err(JsonlError::OversizedFrame {
                     limit: MAX_FRAME_LEN,
                 });
             }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            return serde_json::from_str(trimmed).map_err(|_| JsonlError::MalformedFrame);
+            return if reader.frame.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(std::mem::take(&mut reader.frame)))
+            };
+        }
+        if reader.frame.len() == MAX_FRAME_LEN {
+            reader.frame.clear();
+            return Err(JsonlError::OversizedFrame {
+                limit: MAX_FRAME_LEN,
+            });
+        }
+        reader.frame.push(byte[0]);
+        if byte[0] == b'\n' {
+            return Ok(Some(std::mem::take(&mut reader.frame)));
         }
     }
+}
+
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &bytes[start..end]
+}
+
+fn push_pending(reader: &mut ReaderState, value: Value) -> Result<(), JsonlError> {
+    let bytes = serde_json::to_vec(&value)?.len();
+    if reader.pending.len() == MAX_PENDING_MESSAGES
+        || reader.pending_bytes.saturating_add(bytes) > MAX_PENDING_BYTES
+    {
+        return Err(JsonlError::OversizedFrame {
+            limit: MAX_PENDING_BYTES,
+        });
+    }
+    reader.pending_bytes += bytes;
+    reader.pending.push(value);
+    Ok(())
 }
 
 /// What a given wait is looking for: a response with a specific id, or a
@@ -293,6 +552,50 @@ impl WaitTarget<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::pin::Pin;
+    use std::task::Poll;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::oneshot;
+
+    /// A deterministic partial-write split. It announces that `poll_write`
+    /// was entered, then remains pending until the test releases it. Dropping
+    /// the RPC future at that point models cancellation after a write attempt
+    /// but before newline/flush/response without relying on wall-clock sleeps.
+    struct SplitWrite {
+        entered: Option<oneshot::Sender<()>>,
+        release: oneshot::Receiver<()>,
+    }
+
+    impl AsyncWrite for SplitWrite {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.as_mut().get_mut();
+            if let Some(entered) = this.entered.take() {
+                let _ = entered.send(());
+            }
+            match Pin::new(&mut this.release).poll(cx) {
+                Poll::Ready(_) => Poll::Ready(Ok(buffer.len())),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     fn client_with_canned_stdout(lines: &[Value], wait_timeout: Duration) -> JsonlClient {
         let (mut server_write, client_read) = tokio::io::duplex(64 * 1024);
@@ -309,6 +612,38 @@ mod tests {
             std::future::pending::<()>().await;
         });
         JsonlClient::with_timeout(tokio::io::sink(), client_read, wait_timeout)
+    }
+
+    #[tokio::test]
+    async fn delivery_is_ambiguous_as_soon_as_a_non_idempotent_write_is_attempted() {
+        let (entered_tx, mut entered_rx) = oneshot::channel();
+        let (_release_tx, release_rx) = oneshot::channel();
+        let (_server_stdout, client_stdout) = tokio::io::duplex(1024);
+        let client = JsonlClient::with_timeout(
+            SplitWrite {
+                entered: Some(entered_tx),
+                release: release_rx,
+            },
+            client_stdout,
+            Duration::from_secs(1),
+        );
+        let delivery = RequestDelivery::new();
+        let mut call = Box::pin(client.call_with_server_request_handler_and_delivery(
+            "turn/start",
+            json!({}),
+            Some(&delivery),
+            |_| async { Ok(()) },
+        ));
+
+        tokio::select! {
+            _ = &mut call => panic!("split writer must not finish before release"),
+            received = &mut entered_rx => received.expect("write-attempt barrier"),
+        }
+        assert!(
+            delivery.may_have_been_written(),
+            "cancellation after poll_write begins is delivery-ambiguous"
+        );
+        drop(call);
     }
 
     /// The terminal `turn/completed` notification is emitted (and thus read)
@@ -470,5 +805,48 @@ mod tests {
             }
             other => panic!("expected OversizedFrame, got {other:?}"),
         }
+    }
+
+    /// T11: a server request can precede the response to an ordinary RPC.
+    /// The no-owner convenience entry point returns `-32601` with the
+    /// original string id and then fails closed rather than inventing
+    /// approval authority.
+    #[tokio::test]
+    async fn dispatches_server_requests_while_an_rpc_response_is_awaited() {
+        let (client_write, server_read) = tokio::io::duplex(16 * 1024);
+        let (server_write, client_read) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let mut reader = BufReader::new(server_read);
+            let mut writer = server_write;
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).unwrap()["method"],
+                "account/read"
+            );
+
+            writer
+                .write_all(
+                    serde_json::to_string(&json!({
+                        "id": "server-unknown",
+                        "method": "extension/unknown",
+                        "params": {}
+                    }))
+                    .unwrap()
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            writer.flush().await.unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let unknown = serde_json::from_str::<Value>(&line).unwrap();
+            assert_eq!(unknown["id"], "server-unknown");
+            assert_eq!(unknown["error"]["code"], -32601);
+        });
+        let client = JsonlClient::with_timeout(client_write, client_read, Duration::from_secs(1));
+        assert!(client.call("account/read", json!({})).await.is_err());
+        server.await.unwrap();
     }
 }

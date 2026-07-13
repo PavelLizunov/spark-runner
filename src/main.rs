@@ -2,6 +2,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+use spark_runner::api::{serve, ApiConfig};
 use spark_runner::config::{Cli, Command};
 use spark_runner::orchestrator::{run_doctor, run_turn};
 
@@ -12,6 +13,13 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Command::Doctor { live } => run_doctor(live).await,
         Command::Run { prompt, live } => run_turn(prompt, live).await,
+        Command::Serve { live } => match ApiConfig::from_env(live) {
+            Ok(config) => serve(config)
+                .await
+                .map(|addr| format!("serve: listening on {addr}"))
+                .map_err(Into::into),
+            Err(err) => Err(err.into()),
+        },
     };
     match result {
         Ok(summary) => {
@@ -19,10 +27,25 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(err) => {
-            tracing::error!(error = %err, "spark-runner failed");
-            eprintln!("spark-runner: error: {err}");
+            // AppError can wrap child-controlled or local filesystem text.
+            // The CLI is a trust boundary just like HTTP and must not render
+            // arbitrary diagnostics verbatim.
+            let class = error_class(&err);
+            tracing::error!(class, "spark-runner failed");
+            eprintln!("spark-runner: error: {class}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn error_class(error: &spark_runner::orchestrator::AppError) -> &'static str {
+    match error {
+        spark_runner::orchestrator::AppError::Config(_) => "configuration_failure",
+        spark_runner::orchestrator::AppError::Process(_) => "process_failure",
+        spark_runner::orchestrator::AppError::Client(_) => "protocol_failure",
+        spark_runner::orchestrator::AppError::Journal(_) => "journal_failure",
+        spark_runner::orchestrator::AppError::Api(_) => "api_failure",
+        spark_runner::orchestrator::AppError::EphemeralCleanup(_) => "cleanup_failure",
     }
 }
 

@@ -12,6 +12,7 @@ use spark_runner::journal::{
     project_recovery, ApprovalRecoveryState, ApprovalTerminalDecision, ExecutionRecoveryState,
     ExecutionTerminalStatus, JournalConfig, JournalEvent, JournalWriter,
 };
+use spark_runner::orchestrator::recover_journal_before_readiness;
 
 fn unique_journal(label: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -87,6 +88,51 @@ async fn restart_projection_marks_unknown_and_denied_without_replay() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+}
+
+/// T12: recovery is part of the actual owner startup boundary. It writes one
+/// durable terminal decision before admission and is idempotent on restart.
+#[tokio::test]
+async fn t12_startup_recovery_is_durable_and_idempotent() {
+    let path = unique_journal("startup-recovery");
+    let writer = JournalWriter::open(JournalConfig::new(&path)).unwrap();
+    writer
+        .append(JournalEvent::ExecutionStarted {
+            execution_id: "exec-unresolved".to_string(),
+        })
+        .await
+        .unwrap();
+    writer
+        .append(JournalEvent::ApprovalRequested {
+            execution_id: "exec-unresolved".to_string(),
+            request_key: "approval-unresolved".to_string(),
+            method: "item/commandExecution/requestApproval".to_string(),
+        })
+        .await
+        .unwrap();
+    writer.shutdown().await.unwrap();
+
+    recover_journal_before_readiness(&path).await.unwrap();
+    recover_journal_before_readiness(&path).await.unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let recovered: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM journal_events WHERE payload_json LIKE '%Recovery%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recovered, 2, "one execution and one approval decision only");
+    let projection = project_recovery(&path).unwrap();
+    assert_eq!(
+        projection.executions["exec-unresolved"],
+        ExecutionRecoveryState::UnknownAfterRestart
+    );
+    assert_eq!(
+        projection.approvals["approval-unresolved"],
+        ApprovalRecoveryState::DeniedOnRestart
+    );
+    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -176,8 +222,10 @@ async fn redacts_before_persistence_and_raw_capture_requires_ttl_opt_in() {
 async fn opt_in_capture_is_redacted_and_pruned_by_ttl() {
     let path = unique_journal("ttl");
     let mut config = JournalConfig::new(&path);
-    config.terminal_output_ttl = Some(Duration::from_millis(1));
-    config.raw_capture_ttl = Some(Duration::from_millis(1));
+    // Zero TTL is deterministic: the capture is expired at insertion time and
+    // lets this retention test avoid time-based sleeps.
+    config.terminal_output_ttl = Some(Duration::ZERO);
+    config.raw_capture_ttl = Some(Duration::ZERO);
     let writer = JournalWriter::open(config).expect("open journal");
     writer
         .append_with_capture(
@@ -193,21 +241,72 @@ async fn opt_in_capture_is_redacted_and_pruned_by_ttl() {
         .unwrap();
 
     let connection = Connection::open(&path).unwrap();
-    let (terminal_output, raw_capture): (Option<String>, Option<String>) = connection
+    let terminal_output: String = connection
         .query_row(
-            "SELECT terminal_output, raw_capture_json FROM journal_events LIMIT 1",
+            "SELECT data FROM journal_captures WHERE kind = 'terminal_output'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
         .unwrap();
-    let terminal_output = terminal_output.expect("terminal output persisted by opt-in TTL");
-    let raw_capture = raw_capture.expect("raw capture persisted by opt-in TTL");
+    let raw_capture: String = connection
+        .query_row(
+            "SELECT data FROM journal_captures WHERE kind = 'raw_capture'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(!terminal_output.contains("sk-terminal-secret"));
     assert!(!raw_capture.contains("sk-raw-secret"));
 
-    tokio::time::sleep(Duration::from_millis(5)).await;
     let pruned = writer.prune_expired().await.unwrap();
-    assert_eq!(pruned, 1);
+    assert_eq!(pruned, 2);
+    let remaining_events: i64 = connection
+        .query_row("SELECT COUNT(*) FROM journal_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        remaining_events, 1,
+        "core audit event must remain append-only"
+    );
+    writer.shutdown().await.unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn legacy_event_capture_is_migrated_without_deleting_audit_event() {
+    let path = unique_journal("legacy-capture");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE journal_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_ms INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                execution_id TEXT,
+                turn_id TEXT,
+                approval_key TEXT,
+                payload_json TEXT NOT NULL,
+                terminal_output TEXT,
+                raw_capture_json TEXT,
+                expires_at_ms INTEGER
+            );
+            INSERT INTO journal_events VALUES (1, 0, 'incident', NULL, NULL, NULL, '{}', 'legacy output', '{\"safe\":true}', 1);",
+        )
+        .unwrap();
+    drop(connection);
+
+    let writer = JournalWriter::open(JournalConfig::new(&path)).unwrap();
+    let migrated = Connection::open(&path).unwrap();
+    let captures: i64 = migrated
+        .query_row("SELECT COUNT(*) FROM journal_captures", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(captures, 2);
+    writer.prune_expired().await.unwrap();
+    let events: i64 = migrated
+        .query_row("SELECT COUNT(*) FROM journal_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(events, 1);
     writer.shutdown().await.unwrap();
     let _ = std::fs::remove_file(&path);
 }
