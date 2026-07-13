@@ -366,10 +366,12 @@ impl JsonlClient {
                 }
             }
 
+            // Both method and id are child-controlled.  Diagnostic output
+            // exposes only a bounded message class.
             tracing::debug!(
-                method = ?value.get("method"),
+                class = "unrelated_protocol_message",
                 has_id = value.get("id").is_some(),
-                "buffering unrelated message while waiting"
+                "buffering protocol message while waiting"
             );
             push_pending(&mut reader, value)?;
         }

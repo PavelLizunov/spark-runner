@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -36,8 +37,8 @@ pub enum ClientError {
     SessionPoisoned,
     #[error("server approval request missing a string or signed-integer id")]
     MissingServerRequestId,
-    #[error("unknown server request method {method:?}; session poisoned")]
-    UnknownServerRequest { method: String },
+    #[error("unknown server request class; session poisoned")]
+    UnknownServerRequest,
     #[error("duplicate approval request {request_key}; session poisoned")]
     DuplicateApproval { request_key: String },
     #[error("unexpected response while waiting for terminal turn notification")]
@@ -80,6 +81,18 @@ pub enum ApprovalPolicy {
     },
 }
 
+/// The protocol owner may relay a refresh request to an authenticated
+/// authority, but it never obtains credentials from the environment or logs
+/// them.  The default is deliberately unavailable and therefore fail-closed.
+#[derive(Debug, Clone)]
+pub enum AuthRefreshPolicy {
+    Unavailable,
+    External {
+        pending: mpsc::Sender<PendingAuthRefresh>,
+        timeout: Duration,
+    },
+}
+
 /// A decision channel for one real app-server request.  It is deliberately
 /// one-shot: duplicate HTTP decisions, disconnects and owner shutdown cannot
 /// result in two JSON-RPC responses for the same request id.
@@ -87,7 +100,32 @@ pub enum ApprovalPolicy {
 pub struct PendingApproval {
     pub request_key: String,
     pub method: String,
-    pub decision: oneshot::Sender<ApprovalDecision>,
+    pub decision: oneshot::Sender<ApprovalCommand>,
+}
+
+/// An approval is not considered decided by the HTTP adapter until the owner
+/// has flushed the original JSON-RPC response.  This acknowledgement crosses
+/// only the local owner boundary; no response payload is retained.
+#[derive(Debug)]
+pub struct ApprovalCommand {
+    pub decision: ApprovalDecision,
+    pub delivered: oneshot::Sender<bool>,
+}
+
+/// Schema-shaped token-refresh hand-off.  Values are intentionally opaque to
+/// every layer except the authenticated provider and JSON-RPC writer.
+#[derive(Debug)]
+pub struct PendingAuthRefresh {
+    pub reason: String,
+    pub previous_account_id: Option<String>,
+    pub response: oneshot::Sender<AuthRefreshResponse>,
+}
+
+#[derive(Debug)]
+pub struct AuthRefreshResponse {
+    pub access_token: String,
+    pub chatgpt_account_id: String,
+    pub chatgpt_plan_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,7 +144,10 @@ pub struct CodexClient {
     process: ChildProcess,
     state: SessionState,
     approval_policy: ApprovalPolicy,
-    seen_approvals: HashSet<String>,
+    auth_refresh_policy: AuthRefreshPolicy,
+    /// Requests can arrive while any ordinary RPC is awaited.  Keep this
+    /// shared with that dispatch path so an id can never receive two answers.
+    seen_approvals: Arc<Mutex<HashSet<String>>>,
 }
 
 impl CodexClient {
@@ -129,8 +170,14 @@ impl CodexClient {
             process,
             state: SessionState::new(),
             approval_policy,
-            seen_approvals: HashSet::new(),
+            auth_refresh_policy: AuthRefreshPolicy::Unavailable,
+            seen_approvals: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    pub fn with_auth_refresh_policy(mut self, policy: AuthRefreshPolicy) -> Self {
+        self.auth_refresh_policy = policy;
+        self
     }
 
     /// Send an RPC call and poison the session if the app-server response
@@ -144,13 +191,23 @@ impl CodexClient {
         // never transport-side approval authority.
         let rpc = &self.rpc;
         let approval_policy = self.approval_policy.clone();
+        let auth_refresh_policy = self.auth_refresh_policy.clone();
+        let seen_approvals = Arc::clone(&self.seen_approvals);
         match rpc
             .call_with_server_request_handler(method, params, move |message| {
                 let approval_policy = approval_policy.clone();
+                let auth_refresh_policy = auth_refresh_policy.clone();
+                let seen_approvals = Arc::clone(&seen_approvals);
                 async move {
-                    Self::dispatch_server_request_during_call(rpc, &approval_policy, message)
-                        .await
-                        .map_err(|_| JsonlError::ServerRequestDuringCall)
+                    Self::dispatch_server_request_during_call(
+                        rpc,
+                        &approval_policy,
+                        &auth_refresh_policy,
+                        &seen_approvals,
+                        message,
+                    )
+                    .await
+                    .map_err(|_| JsonlError::ServerRequestDuringCall)
                 }
             })
             .await
@@ -295,7 +352,12 @@ impl CodexClient {
                 Err(error) => {
                     if error.is_desync() {
                         self.state.poison();
-                        if !self.seen_approvals.is_empty() {
+                        if !self
+                            .seen_approvals
+                            .lock()
+                            .expect("approval id mutex poisoned")
+                            .is_empty()
+                        {
                             return Err(ClientError::UnresolvedApprovalRestart);
                         }
                     }
@@ -330,7 +392,12 @@ impl CodexClient {
                         required: REQUIRED_MODEL,
                     });
                 }
-                tracing::debug!(method, "ignoring non-terminal app-server notification");
+                // Notification names originate at the child.  Preserve only a
+                // bounded class in diagnostics, never child-controlled text.
+                tracing::debug!(
+                    class = "non_terminal_notification",
+                    "ignoring app-server notification"
+                );
                 continue;
             }
 
@@ -363,7 +430,8 @@ impl CodexClient {
             &self.rpc,
             &mut self.state,
             &self.approval_policy,
-            &mut self.seen_approvals,
+            &self.auth_refresh_policy,
+            &self.seen_approvals,
             message,
         )
         .await
@@ -373,7 +441,8 @@ impl CodexClient {
         rpc: &JsonlClient,
         state: &mut SessionState,
         approval_policy: &ApprovalPolicy,
-        seen_approvals: &mut HashSet<String>,
+        auth_refresh_policy: &AuthRefreshPolicy,
+        seen_approvals: &Arc<Mutex<HashSet<String>>>,
         message: &Value,
     ) -> Result<(), ClientError> {
         let method = message
@@ -386,26 +455,21 @@ impl CodexClient {
             .cloned()
             .ok_or(ClientError::MissingServerRequestId)?;
         if method == "account/chatgptAuthTokens/refresh" {
-            // Tokens are deliberately not read from the environment or
-            // persisted.  A live owner may install a bounded provider in a
-            // later authenticated integration; absent one must fail closed
-            // after replying, never silently continue.
-            rpc.respond_error(id, -32000, "authentication refresh unavailable")
-                .await?;
-            state.poison();
-            return Err(ClientError::AuthTokensRefreshUnavailable);
+            return Self::handle_auth_refresh(rpc, state, auth_refresh_policy, id, message).await;
         }
         if !is_known_approval_method(method) {
             rpc.respond_error(id, -32601, "method not found").await?;
             state.poison();
-            return Err(ClientError::UnknownServerRequest {
-                method: method.to_string(),
-            });
+            return Err(ClientError::UnknownServerRequest);
         }
 
         let params = message.get("params").unwrap_or(&Value::Null);
         let request_key = approval_request_key(method, &id, params);
-        if !seen_approvals.insert(request_key.clone()) {
+        if !seen_approvals
+            .lock()
+            .expect("approval id mutex poisoned")
+            .insert(request_key.clone())
+        {
             rpc.respond(
                 id.clone(),
                 approval_response(method, ApprovalDecision::Deny),
@@ -430,25 +494,42 @@ impl CodexClient {
                     ApprovalDecision::Deny
                 } else {
                     match tokio::time::timeout(*timeout, decision_rx).await {
-                        Ok(Ok(decision)) => decision,
+                        Ok(Ok(command)) => {
+                            let delivered = rpc
+                                .respond(id.clone(), approval_response(method, command.decision))
+                                .await
+                                .is_ok();
+                            let _ = command.delivered.send(delivered);
+                            if !delivered {
+                                return Err(ClientError::SessionPoisoned);
+                            }
+                            command.decision
+                        }
                         Ok(Err(_)) | Err(_) => ApprovalDecision::Timeout,
                     }
                 }
             }
         };
+        // An external command writes above and explicitly acknowledges the
+        // flush. All other policies write here. State/journal projection is
+        // only advanced after that delivery boundary succeeds.
+        if !matches!(approval_policy, ApprovalPolicy::External { .. }) {
+            rpc.respond(id, approval_response(method, decision)).await?;
+        }
         state.on_approval_decided(
             request_key,
             method.to_string(),
             decision,
             ApprovalSource::Owner,
         )?;
-        rpc.respond(id, approval_response(method, decision)).await?;
         Ok(())
     }
 
     async fn dispatch_server_request_during_call(
         rpc: &JsonlClient,
         approval_policy: &ApprovalPolicy,
+        auth_refresh_policy: &AuthRefreshPolicy,
+        seen_approvals: &Arc<Mutex<HashSet<String>>>,
         message: Value,
     ) -> Result<(), ClientError> {
         let id = message
@@ -461,18 +542,25 @@ impl CodexClient {
             .and_then(Value::as_str)
             .unwrap_or_default();
         if method == "account/chatgptAuthTokens/refresh" {
-            rpc.respond_error(id, -32000, "authentication refresh unavailable")
-                .await?;
-            return Err(ClientError::AuthTokensRefreshUnavailable);
+            let mut state = SessionState::new();
+            return Self::handle_auth_refresh(rpc, &mut state, auth_refresh_policy, id, &message)
+                .await;
         }
         if !is_known_approval_method(method) {
             rpc.respond_error(id, -32601, "method not found").await?;
-            return Err(ClientError::UnknownServerRequest {
-                method: method.to_string(),
-            });
+            return Err(ClientError::UnknownServerRequest);
         }
         let params = message.get("params").unwrap_or(&Value::Null);
         let request_key = approval_request_key(method, &id, params);
+        if !seen_approvals
+            .lock()
+            .expect("approval id mutex poisoned")
+            .insert(request_key.clone())
+        {
+            rpc.respond(id, approval_response(method, ApprovalDecision::Deny))
+                .await?;
+            return Err(ClientError::DuplicateApproval { request_key });
+        }
         let decision = match approval_policy {
             ApprovalPolicy::AllowForTests => ApprovalDecision::Allow,
             ApprovalPolicy::Deny => ApprovalDecision::Deny,
@@ -480,20 +568,91 @@ impl CodexClient {
                 let (decision_tx, decision_rx) = oneshot::channel();
                 pending
                     .send(PendingApproval {
-                        request_key,
+                        request_key: request_key.clone(),
                         method: method.to_string(),
                         decision: decision_tx,
                     })
                     .await
                     .map_err(|_| ClientError::AuthTokensRefreshUnavailable)?;
                 match tokio::time::timeout(*timeout, decision_rx).await {
-                    Ok(Ok(decision)) => decision,
+                    Ok(Ok(command)) => {
+                        let delivered = rpc
+                            .respond(id.clone(), approval_response(method, command.decision))
+                            .await
+                            .is_ok();
+                        let _ = command.delivered.send(delivered);
+                        if !delivered {
+                            return Err(ClientError::SessionPoisoned);
+                        }
+                        command.decision
+                    }
                     Ok(Err(_)) | Err(_) => ApprovalDecision::Timeout,
                 }
             }
         };
-        rpc.respond(id, approval_response(method, decision)).await?;
+        if !matches!(approval_policy, ApprovalPolicy::External { .. }) {
+            rpc.respond(id, approval_response(method, decision)).await?;
+        }
         Ok(())
+    }
+
+    async fn handle_auth_refresh(
+        rpc: &JsonlClient,
+        state: &mut SessionState,
+        policy: &AuthRefreshPolicy,
+        id: Value,
+        message: &Value,
+    ) -> Result<(), ClientError> {
+        let params = message.get("params").unwrap_or(&Value::Null);
+        let reason = params
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if reason != "unauthorized" {
+            rpc.respond_error(id, -32602, "invalid refresh request")
+                .await?;
+            state.poison();
+            return Err(ClientError::AuthTokensRefreshUnavailable);
+        }
+        let response = match policy {
+            AuthRefreshPolicy::Unavailable => None,
+            AuthRefreshPolicy::External { pending, timeout } => {
+                let (tx, rx) = oneshot::channel();
+                let request = PendingAuthRefresh {
+                    reason: reason.to_string(),
+                    previous_account_id: params
+                        .get("previousAccountId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    response: tx,
+                };
+                if pending.send(request).await.is_err() {
+                    None
+                } else {
+                    tokio::time::timeout(*timeout, rx)
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                }
+            }
+        };
+        if let Some(response) = response {
+            rpc.respond(
+                id,
+                json!({
+                    "accessToken": response.access_token,
+                    "chatgptAccountId": response.chatgpt_account_id,
+                    "chatgptPlanType": response.chatgpt_plan_type,
+                }),
+            )
+            .await?;
+            Ok(())
+        } else {
+            rpc.respond_error(id, -32000, "authentication refresh unavailable")
+                .await?;
+            state.poison();
+            Err(ClientError::AuthTokensRefreshUnavailable)
+        }
     }
 
     /// Bounded, drained stderr tail from the child app-server process — for

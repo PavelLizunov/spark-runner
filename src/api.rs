@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
-use crate::client::{ApprovalPolicy, PendingApproval, REQUIRED_MODEL};
+use crate::client::{ApprovalCommand, ApprovalPolicy, PendingApproval, REQUIRED_MODEL};
 use crate::orchestrator::{
     recover_before_readiness, run_turn_with_approval_policy_controlled, RuntimeControl,
 };
@@ -247,7 +247,7 @@ struct ApprovalRecord {
     id: String,
     turn_id: String,
     status: ApprovalStatus,
-    decision: Option<oneshot::Sender<ApprovalDecision>>,
+    decision: Option<oneshot::Sender<ApprovalCommand>>,
 }
 
 #[derive(Clone, Copy, Serialize, PartialEq, Eq)]
@@ -926,14 +926,14 @@ async fn approve(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ApprovalResponse>, ApiRejection> {
-    decide_approval(&state, &id, ApprovalStatus::Approved)
+    decide_approval(&state, &id, ApprovalStatus::Approved).await
 }
 
 async fn deny(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ApprovalResponse>, ApiRejection> {
-    decide_approval(&state, &id, ApprovalStatus::Denied)
+    decide_approval(&state, &id, ApprovalStatus::Denied).await
 }
 
 fn reject_payload_token(value: Option<&str>) -> Result<(), ApiRejection> {
@@ -979,7 +979,11 @@ fn register_runtime_approval(
         prune_terminal_records(&mut data);
     }
     if data.approvals.len() >= MAX_APPROVALS {
-        let _ = pending.decision.send(ApprovalDecision::Deny);
+        let (delivered, _ack) = oneshot::channel();
+        let _ = pending.decision.send(ApprovalCommand {
+            decision: ApprovalDecision::Deny,
+            delivered,
+        });
         return Err(rejection(
             StatusCode::TOO_MANY_REQUESTS,
             "APPROVAL_CAPACITY",
@@ -992,7 +996,11 @@ fn register_runtime_approval(
         .get(turn_id)
         .ok_or_else(|| rejection(StatusCode::NOT_FOUND, "NOT_FOUND", "turn not found", false))?;
     if is_terminal(turn.status) {
-        let _ = pending.decision.send(ApprovalDecision::Deny);
+        let (delivered, _ack) = oneshot::channel();
+        let _ = pending.decision.send(ApprovalCommand {
+            decision: ApprovalDecision::Deny,
+            delivered,
+        });
         return Err(rejection(
             StatusCode::BAD_REQUEST,
             "TURN_TERMINAL",
@@ -1027,12 +1035,12 @@ fn register_runtime_approval(
     Ok(())
 }
 
-fn decide_approval(
+async fn decide_approval(
     state: &AppState,
     id: &str,
     decision: ApprovalStatus,
 ) -> Result<Json<ApprovalResponse>, ApiRejection> {
-    let (approval_id, turn_id, status, sender) = {
+    let (approval_id, turn_id, sender) = {
         let mut data = state.inner.owner.data.lock().expect("owner mutex poisoned");
         let approval = data.approvals.get_mut(id).ok_or_else(|| {
             rejection(
@@ -1050,20 +1058,25 @@ fn decide_approval(
                 false,
             ));
         }
-        approval.status = decision;
         (
             approval.id.clone(),
             approval.turn_id.clone(),
-            approval.status,
             approval.decision.take(),
         )
     };
     if let Some(sender) = sender {
-        let protocol_decision = match status {
+        let protocol_decision = match decision {
             ApprovalStatus::Approved => ApprovalDecision::Allow,
             ApprovalStatus::Denied | ApprovalStatus::Pending => ApprovalDecision::Deny,
         };
-        if sender.send(protocol_decision).is_err() {
+        let (delivered_tx, delivered_rx) = oneshot::channel();
+        if sender
+            .send(ApprovalCommand {
+                decision: protocol_decision,
+                delivered: delivered_tx,
+            })
+            .is_err()
+        {
             if let Some(approval) = state
                 .inner
                 .owner
@@ -1082,7 +1095,44 @@ fn decide_approval(
                 false,
             ));
         }
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(6), delivered_rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false);
+        if !delivered {
+            if let Some(approval) = state
+                .inner
+                .owner
+                .data
+                .lock()
+                .expect("owner mutex poisoned")
+                .approvals
+                .get_mut(id)
+            {
+                approval.status = ApprovalStatus::Denied;
+            }
+            return Err(rejection(
+                StatusCode::CONFLICT,
+                "APPROVAL_DELIVERY_FAILED",
+                "runtime could not deliver the approval decision",
+                true,
+            ));
+        }
     }
+    let status = {
+        let mut data = state.inner.owner.data.lock().expect("owner mutex poisoned");
+        let approval = data.approvals.get_mut(id).ok_or_else(|| {
+            rejection(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                "approval not found",
+                false,
+            )
+        })?;
+        approval.status = decision;
+        approval.status
+    };
     push_event(
         state,
         &turn_id,
@@ -1144,7 +1194,11 @@ fn close_pending_approvals(state: &AppState, turn_id: &str, authority: &'static 
             if approval.turn_id == turn_id && approval.status == ApprovalStatus::Pending {
                 approval.status = ApprovalStatus::Denied;
                 if let Some(sender) = approval.decision.take() {
-                    let _ = sender.send(ApprovalDecision::Deny);
+                    let (delivered, _ack) = oneshot::channel();
+                    let _ = sender.send(ApprovalCommand {
+                        decision: ApprovalDecision::Deny,
+                        delivered,
+                    });
                 }
                 closed.push(approval.id.clone());
             }
