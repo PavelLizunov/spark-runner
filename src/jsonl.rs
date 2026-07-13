@@ -82,6 +82,11 @@ impl JsonlError {
 /// Kept behind one lock so a message is never "in flight" between the two.
 struct ReaderState {
     stdout: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+    // A read may be cancelled when the runtime owner receives a higher
+    // priority cancellation command.  Keeping an incomplete frame with the
+    // reader, rather than in the cancelled future's stack, means the next
+    // protocol operation resumes at the exact byte boundary.
+    frame: Vec<u8>,
     pending: Vec<Value>,
     pending_bytes: usize,
 }
@@ -110,6 +115,7 @@ impl JsonlClient {
             stdin: Mutex::new(Box::new(stdin)),
             reader: Mutex::new(ReaderState {
                 stdout: BufReader::new(Box::new(stdout)),
+                frame: Vec::with_capacity(1024),
                 pending: Vec::new(),
                 pending_bytes: 0,
             }),
@@ -236,7 +242,7 @@ impl JsonlClient {
     async fn read_raw_message(&self) -> Result<Value, JsonlError> {
         let mut reader = self.reader.lock().await;
         loop {
-            let Some(line) = read_bounded_frame(&mut reader.stdout).await? else {
+            let Some(line) = read_bounded_frame(&mut reader).await? else {
                 return Err(JsonlError::StreamClosed);
             };
             let trimmed = trim_ascii(&line);
@@ -335,7 +341,7 @@ impl JsonlClient {
         }
 
         loop {
-            let Some(line) = read_bounded_frame(&mut reader.stdout).await? else {
+            let Some(line) = read_bounded_frame(&mut reader).await? else {
                 return Err(JsonlError::StreamClosed);
             };
             let trimmed = trim_ascii(&line);
@@ -384,7 +390,7 @@ impl JsonlClient {
         }
 
         loop {
-            let Some(line) = read_bounded_frame(&mut reader.stdout).await? else {
+            let Some(line) = read_bounded_frame(&mut reader).await? else {
                 return Err(JsonlError::StreamClosed);
             };
             let trimmed = trim_ascii(&line);
@@ -409,28 +415,26 @@ fn remove_pending(reader: &mut ReaderState, index: usize) -> Value {
     value
 }
 
-async fn read_bounded_frame(
-    reader: &mut BufReader<Box<dyn AsyncRead + Unpin + Send>>,
-) -> Result<Option<Vec<u8>>, JsonlError> {
-    let mut frame = Vec::with_capacity(1024);
+async fn read_bounded_frame(reader: &mut ReaderState) -> Result<Option<Vec<u8>>, JsonlError> {
     loop {
         let mut byte = [0_u8; 1];
-        let read = reader.read(&mut byte).await?;
+        let read = reader.stdout.read(&mut byte).await?;
         if read == 0 {
-            return if frame.is_empty() {
+            return if reader.frame.is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(frame))
+                Ok(Some(std::mem::take(&mut reader.frame)))
             };
         }
-        if frame.len() == MAX_FRAME_LEN {
+        if reader.frame.len() == MAX_FRAME_LEN {
+            reader.frame.clear();
             return Err(JsonlError::OversizedFrame {
                 limit: MAX_FRAME_LEN,
             });
         }
-        frame.push(byte[0]);
+        reader.frame.push(byte[0]);
         if byte[0] == b'\n' {
-            return Ok(Some(frame));
+            return Ok(Some(std::mem::take(&mut reader.frame)));
         }
     }
 }

@@ -26,10 +26,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
-use crate::client::{ApprovalCommand, ApprovalPolicy, PendingApproval, REQUIRED_MODEL};
+use crate::client::{
+    journal_rate_limit_snapshot, ApprovalCommand, ApprovalPolicy, PendingApproval, REQUIRED_MODEL,
+};
+use crate::journal::{JournalConfig, JournalEvent, JournalWriter};
 use crate::orchestrator::{
-    bootstrap_runtime, recover_before_readiness, run_turn_with_launcher_controlled, RuntimeControl,
-    RuntimeLauncher,
+    bootstrap_runtime, recover_before_readiness, run_turn_with_launcher_controlled_with_journal,
+    RuntimeControl, RuntimeLauncher,
 };
 use crate::state::ApprovalDecision;
 
@@ -196,6 +199,9 @@ struct ApprovalRecord {
 
 struct OwnerState {
     snapshot: RuntimeSnapshot,
+    // Opened once by the owner and cloned only into its active execution.
+    // HTTP adapters never open, write, or shut down a journal.
+    journal: Option<JournalWriter>,
     next_thread: u64,
     next_turn: u64,
     next_event: u64,
@@ -217,6 +223,7 @@ impl OwnerState {
                 model: (!live).then_some(REQUIRED_MODEL),
                 quota_available: !live,
             },
+            journal: None,
             next_thread: 1,
             next_turn: 1,
             next_event: 1,
@@ -269,6 +276,13 @@ enum OwnerCommand {
     Pending {
         turn_id: String,
         pending: PendingApproval,
+    },
+    ApprovalDeadline {
+        turn_id: String,
+        approval_id: String,
+    },
+    TurnDeadline {
+        turn_id: String,
     },
     Finished {
         turn_id: String,
@@ -345,7 +359,14 @@ impl RuntimeOwner {
     }
 
     fn controller_dropped(&self, turn_id: String) {
-        let _ = self.tx.try_send(OwnerCommand::ControllerDrop { turn_id });
+        // `Drop` cannot await, but a full best-effort queue is not a valid
+        // reason to keep a controller-owned turn running.  Schedule the
+        // exact same ordered owner command and let backpressure delay, never
+        // discard, cancellation.
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(OwnerCommand::ControllerDrop { turn_id }).await;
+        });
     }
 }
 
@@ -362,12 +383,27 @@ async fn owner_loop(
                 // Only `serve` and explicitly injected test owners invoke
                 // this. `app(live=true)` remains inert/fail-closed, avoiding
                 // accidental real authentication attempts in unit tests.
-                let ready =
+                let admitted = if ensure_owner_journal(&mut state).await.is_ok() {
                     tokio::time::timeout(OWNER_DEADLINE, bootstrap_runtime(launcher.clone()))
                         .await
                         .ok()
                         .and_then(Result::ok)
-                        .is_some();
+                } else {
+                    None
+                };
+                let ready = match admitted {
+                    Some(rate_limits) => match state.journal.as_ref() {
+                        Some(journal) => journal
+                            .append(JournalEvent::RateLimitSnapshot {
+                                execution_id: "bootstrap".to_string(),
+                                snapshot: journal_rate_limit_snapshot(&rate_limits),
+                            })
+                            .await
+                            .is_ok(),
+                        None => true,
+                    },
+                    None => false,
+                };
                 state.snapshot.ready = ready;
                 state.snapshot.model = ready.then_some(REQUIRED_MODEL);
                 state.snapshot.quota_available = ready;
@@ -388,8 +424,19 @@ async fn owner_loop(
                 timeout,
                 reply,
             } => {
-                let result =
-                    owner_create_turn(&mut state, &tx, launcher.clone(), thread_id, input, timeout);
+                let result = if ensure_owner_journal(&mut state).await.is_ok() {
+                    owner_create_turn(&mut state, &tx, launcher.clone(), thread_id, input, timeout)
+                } else {
+                    state.snapshot.ready = false;
+                    state.snapshot.model = None;
+                    state.snapshot.quota_available = false;
+                    Err(rejection(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "JOURNAL_UNAVAILABLE",
+                        "runtime journal is unavailable",
+                        true,
+                    ))
+                };
                 let _ = reply.send(result);
             }
             OwnerCommand::GetTurn { id, reply } => {
@@ -429,7 +476,21 @@ async fn owner_loop(
                 }
             }
             OwnerCommand::Pending { turn_id, pending } => {
-                let _ = owner_register_pending(&mut state, &turn_id, pending).await;
+                let _ = owner_register_pending(&mut state, &tx, &turn_id, pending).await;
+            }
+            OwnerCommand::ApprovalDeadline {
+                turn_id,
+                approval_id,
+            } => {
+                let pending = state.approvals.get(&approval_id).is_some_and(|approval| {
+                    approval.turn_id == turn_id && approval.status == ApprovalStatus::Pending
+                });
+                if pending {
+                    let _ = owner_interrupt(&mut state, &turn_id, "approval_timeout").await;
+                }
+            }
+            OwnerCommand::TurnDeadline { turn_id } => {
+                let _ = owner_interrupt(&mut state, &turn_id, "turn_deadline").await;
             }
             OwnerCommand::Finished { turn_id, result } => {
                 owner_finished(&mut state, &turn_id, result);
@@ -439,11 +500,27 @@ async fn owner_loop(
                 for id in ids {
                     let _ = owner_interrupt(&mut state, &id, "shutdown").await;
                 }
+                if let Some(journal) = state.journal.take() {
+                    let _ = journal.shutdown().await;
+                }
                 let _ = reply.send(());
                 break;
             }
         }
     }
+}
+
+/// The journal writer belongs to the owner lifecycle. Recovery is completed
+/// before this writer is exposed to either bootstrap or a turn, and every
+/// active client receives only a clone of this single serialized writer.
+async fn ensure_owner_journal(state: &mut OwnerState) -> Result<(), crate::orchestrator::AppError> {
+    if state.journal.is_none() {
+        if let Some(config) = JournalConfig::from_env() {
+            recover_before_readiness().await?;
+            state.journal = Some(JournalWriter::open(config)?);
+        }
+    }
+    Ok(())
 }
 
 fn owner_create_thread(
@@ -553,6 +630,7 @@ fn owner_create_turn(
     );
 
     let (pending_tx, mut pending_rx) = mpsc::channel(1);
+    let journal = state.journal.clone();
     let pending_owner_tx = owner_tx.clone();
     let pending_turn_id = turn_id.clone();
     tokio::spawn(async move {
@@ -569,10 +647,20 @@ fn owner_create_turn(
             }
         }
     });
+    let deadline_owner_tx = owner_tx.clone();
+    let deadline_turn_id = turn_id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        let _ = deadline_owner_tx
+            .send(OwnerCommand::TurnDeadline {
+                turn_id: deadline_turn_id,
+            })
+            .await;
+    });
     let finished_owner_tx = owner_tx.clone();
     let finished_turn_id = turn_id.clone();
     tokio::spawn(async move {
-        let result = run_turn_with_launcher_controlled(
+        let result = run_turn_with_launcher_controlled_with_journal(
             input,
             launcher,
             ApprovalPolicy::External {
@@ -580,8 +668,12 @@ fn owner_create_turn(
                 timeout,
                 receipt: None,
             },
-            timeout,
+            // The owner timer is authoritative.  The client keeps only a
+            // small grace period so its fallback cannot race ahead of the
+            // durable deny -> interrupt cancellation sequence.
+            timeout.saturating_add(OWNER_DEADLINE),
             &mut control_rx,
+            journal,
         )
         .await;
         let _ = finished_owner_tx
@@ -631,9 +723,16 @@ fn owner_subscribe(
 
 async fn owner_register_pending(
     state: &mut OwnerState,
+    owner_tx: &mpsc::Sender<OwnerCommand>,
     turn_id: &str,
     pending: PendingApproval,
 ) -> Result<(), ApiRejection> {
+    let PendingApproval {
+        request_key,
+        method,
+        deadline,
+        decision,
+    } = pending;
     let terminal = state
         .turns
         .get(turn_id)
@@ -641,8 +740,7 @@ async fn owner_register_pending(
         .unwrap_or(true);
     if state.approvals.len() >= MAX_APPROVALS || terminal {
         let (delivered, response) = oneshot::channel();
-        let sent = pending
-            .decision
+        let sent = decision
             .send(ApprovalCommand {
                 decision: ApprovalDecision::Deny,
                 delivered,
@@ -666,7 +764,7 @@ async fn owner_register_pending(
             id: id.clone(),
             turn_id: turn_id.to_string(),
             status: ApprovalStatus::Pending,
-            decision: Some(pending.decision),
+            decision: Some(decision),
         },
     );
     if let Some(turn) = state.turns.get_mut(turn_id) {
@@ -676,9 +774,21 @@ async fn owner_register_pending(
         state,
         turn_id,
         "approval.requested",
-        serde_json::json!({ "approval_id": id, "request_key": pending.request_key, "method": pending.method }),
+        serde_json::json!({ "approval_id": id, "request_key": request_key, "method": method }),
         false,
     );
+    let timeout_tx = owner_tx.clone();
+    let timeout_turn_id = turn_id.to_string();
+    let timeout_approval_id = id;
+    tokio::spawn(async move {
+        tokio::time::sleep(deadline).await;
+        let _ = timeout_tx
+            .send(OwnerCommand::ApprovalDeadline {
+                turn_id: timeout_turn_id,
+                approval_id: timeout_approval_id,
+            })
+            .await;
+    });
     Ok(())
 }
 
@@ -774,6 +884,7 @@ async fn owner_interrupt(
             ));
         }
     }
+    let (terminal_status, terminal_kind) = cancellation_terminal(authority);
     let control = state
         .turns
         .get(turn_id)
@@ -796,9 +907,9 @@ async fn owner_interrupt(
         terminalize(
             state,
             turn_id,
-            TurnStatus::Interrupted,
-            "turn.interrupted",
-            serde_json::json!({ "status": "interrupted" }),
+            terminal_status,
+            terminal_kind,
+            serde_json::json!({ "status": terminal_status }),
         );
         return turn_response(state, turn_id);
     }
@@ -812,9 +923,9 @@ async fn owner_interrupt(
             terminalize(
                 state,
                 turn_id,
-                TurnStatus::Interrupted,
-                "turn.interrupted",
-                serde_json::json!({ "status": "interrupted" }),
+                terminal_status,
+                terminal_kind,
+                serde_json::json!({ "status": terminal_status }),
             );
             return turn_response(state, turn_id);
         }
@@ -829,14 +940,23 @@ async fn owner_interrupt(
     }
     // The protocol task sends this acknowledgement only after the interrupt
     // RPC, terminal notification, journal record, and process-group cleanup.
+    // A deadline is still a fail-closed runtime failure for API/SSE purposes;
+    // a human/API interrupt remains explicitly interrupted.
     terminalize(
         state,
         turn_id,
-        TurnStatus::Interrupted,
-        "turn.interrupted",
-        serde_json::json!({ "status": "interrupted" }),
+        terminal_status,
+        terminal_kind,
+        serde_json::json!({ "status": terminal_status }),
     );
     turn_response(state, turn_id)
+}
+
+fn cancellation_terminal(authority: &str) -> (TurnStatus, &'static str) {
+    match authority {
+        "approval_timeout" | "turn_deadline" => (TurnStatus::Failed, "turn.failed"),
+        _ => (TurnStatus::Interrupted, "turn.interrupted"),
+    }
 }
 
 fn claim_approval(
@@ -903,6 +1023,14 @@ fn owner_finished(
     turn_id: &str,
     result: Result<String, crate::orchestrator::AppError>,
 ) {
+    // Admission is an owner snapshot, not an optimistic startup bit.  Any
+    // live execution failure can no longer truthfully advertise an admitted
+    // model/quota until a later bounded bootstrap succeeds.
+    if result.is_err() {
+        state.snapshot.ready = false;
+        state.snapshot.model = None;
+        state.snapshot.quota_available = false;
+    }
     let (status, kind, payload) = match result {
         Ok(summary) if summary.contains("turn_status=completed") => (
             TurnStatus::Completed,
@@ -1034,7 +1162,7 @@ struct ModelInfo<'a> {
 
 #[derive(Serialize)]
 struct RateLimitsResponse {
-    requests_per_minute: u32,
+    quota_available: bool,
     concurrent_turns: usize,
     max_body_bytes: usize,
     max_input_chars: usize,
@@ -1271,7 +1399,7 @@ async fn rate_limits(State(state): State<AppState>) -> Json<RateLimitsResponse> 
             quota_available: false,
         });
     Json(RateLimitsResponse {
-        requests_per_minute: u32::from(snapshot.quota_available) * 60,
+        quota_available: snapshot.quota_available,
         concurrent_turns: MAX_CONCURRENT_TURNS,
         max_body_bytes: MAX_BODY_BYTES,
         max_input_chars: MAX_INPUT_CHARS,

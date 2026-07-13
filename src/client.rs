@@ -179,6 +179,10 @@ pub enum AuthRefreshPolicy {
 pub struct PendingApproval {
     pub request_key: String,
     pub method: String,
+    /// The owner, not a detached client future, owns expiry.  This lets the
+    /// same cancellation command deny, interrupt, await terminal completion,
+    /// and reap the process group in one ordered path.
+    pub deadline: Duration,
     pub decision: oneshot::Sender<ApprovalCommand>,
 }
 
@@ -558,7 +562,7 @@ impl CodexClient {
         if !seen {
             rpc.respond(
                 id.clone(),
-                approval_response(method, ApprovalDecision::Deny),
+                approval_response(method, ApprovalDecision::Deny, Some(params)),
             )
             .await?;
             state.poison();
@@ -566,9 +570,9 @@ impl CodexClient {
         }
 
         state.on_approval_requested(request_key.clone(), method.to_string())?;
-        let (decision, delivered_by_command, acknowledgement) = match approval_policy {
-            ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, false, None),
-            ApprovalPolicy::Deny => (ApprovalDecision::Deny, false, None),
+        let (decision, acknowledgement) = match approval_policy {
+            ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, None),
+            ApprovalPolicy::Deny => (ApprovalDecision::Deny, None),
             ApprovalPolicy::External {
                 pending,
                 timeout,
@@ -578,6 +582,7 @@ impl CodexClient {
                 let pending_approval = PendingApproval {
                     request_key: request_key.clone(),
                     method: method.to_string(),
+                    deadline: *timeout,
                     decision: decision_tx,
                 };
                 if let Some(receipt) = receipt {
@@ -592,33 +597,40 @@ impl CodexClient {
                         .map_err(|_| ClientError::SessionPoisoned)?;
                 }
                 if pending.send(pending_approval).await.is_err() {
-                    (ApprovalDecision::Deny, false, None)
+                    (ApprovalDecision::Deny, None)
                 } else {
-                    match tokio::time::timeout(*timeout, decision_rx).await {
-                        Ok(Ok(command)) => {
-                            if rpc
-                                .respond(id.clone(), approval_response(method, command.decision))
-                                .await
-                                .is_err()
-                            {
-                                let _ = command.delivered.send(false);
-                                return Err(ClientError::SessionPoisoned);
-                            }
-                            (command.decision, true, Some(command.delivered))
-                        }
+                    // The owner schedules this same deadline.  Leave a
+                    // narrow transport grace here solely to avoid retaining a
+                    // request if the owner task itself has disappeared; the
+                    // normal timeout always enters owner cancellation first.
+                    match tokio::time::timeout(
+                        timeout.saturating_add(Duration::from_secs(1)),
+                        decision_rx,
+                    )
+                    .await
+                    {
+                        Ok(Ok(command)) => (command.decision, Some(command.delivered)),
                         // A closed local authority or deadline must still
                         // receive one schema-valid fail-closed response on the
                         // original JSON-RPC request id.
-                        Ok(Err(_)) | Err(_) => (ApprovalDecision::Timeout, false, None),
+                        Ok(Err(_)) | Err(_) => (ApprovalDecision::Timeout, None),
                     }
                 }
             }
         };
-        // An external command writes above and explicitly acknowledges the
-        // flush. All other policies write here. State/journal projection is
-        // only advanced after that delivery boundary succeeds.
-        if !delivered_by_command {
-            rpc.respond(id, approval_response(method, decision)).await?;
+        // Persist the decision before placing an Allow on the wire.  A
+        // journal failure can therefore never leave an unrecorded grant in
+        // the child, while a later wire failure remains a durable incident
+        // that recovery can classify conservatively.
+        append_external_approval_decision(approval_policy, &request_key, method, decision).await?;
+        if let Err(error) = rpc
+            .respond(id, approval_response(method, decision, Some(params)))
+            .await
+        {
+            if let Some(acknowledgement) = acknowledgement {
+                let _ = acknowledgement.send(false);
+            }
+            return Err(error.into());
         }
         state.on_approval_decided(
             request_key.clone(),
@@ -626,7 +638,6 @@ impl CodexClient {
             decision,
             ApprovalSource::Owner,
         )?;
-        append_external_approval_decision(approval_policy, &request_key, method, decision).await?;
         if let Some(acknowledgement) = acknowledgement {
             let _ = acknowledgement.send(true);
             tokio::task::yield_now().await;
@@ -666,13 +677,16 @@ impl CodexClient {
             .expect("approval id mutex poisoned")
             .insert(request_key.clone())?;
         if !seen {
-            rpc.respond(id, approval_response(method, ApprovalDecision::Deny))
-                .await?;
+            rpc.respond(
+                id,
+                approval_response(method, ApprovalDecision::Deny, Some(params)),
+            )
+            .await?;
             return Err(ClientError::DuplicateApproval { request_key });
         }
-        let (decision, delivered_by_command, acknowledgement) = match approval_policy {
-            ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, false, None),
-            ApprovalPolicy::Deny => (ApprovalDecision::Deny, false, None),
+        let (decision, acknowledgement) = match approval_policy {
+            ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, None),
+            ApprovalPolicy::Deny => (ApprovalDecision::Deny, None),
             ApprovalPolicy::External {
                 pending,
                 timeout,
@@ -694,6 +708,7 @@ impl CodexClient {
                     .send(PendingApproval {
                         request_key: request_key.clone(),
                         method: method.to_string(),
+                        deadline: *timeout,
                         decision: decision_tx,
                     })
                     .await
@@ -704,29 +719,30 @@ impl CodexClient {
                     // so fail closed *on the original id* rather than
                     // returning an internal hand-off error without a wire
                     // response.
-                    (ApprovalDecision::Timeout, false, None)
+                    (ApprovalDecision::Timeout, None)
                 } else {
-                    match tokio::time::timeout(*timeout, decision_rx).await {
-                        Ok(Ok(command)) => {
-                            if rpc
-                                .respond(id.clone(), approval_response(method, command.decision))
-                                .await
-                                .is_err()
-                            {
-                                let _ = command.delivered.send(false);
-                                return Err(ClientError::SessionPoisoned);
-                            }
-                            (command.decision, true, Some(command.delivered))
-                        }
-                        Ok(Err(_)) | Err(_) => (ApprovalDecision::Timeout, false, None),
+                    match tokio::time::timeout(
+                        timeout.saturating_add(Duration::from_secs(1)),
+                        decision_rx,
+                    )
+                    .await
+                    {
+                        Ok(Ok(command)) => (command.decision, Some(command.delivered)),
+                        Ok(Err(_)) | Err(_) => (ApprovalDecision::Timeout, None),
                     }
                 }
             }
         };
-        if !delivered_by_command {
-            rpc.respond(id, approval_response(method, decision)).await?;
-        }
         append_external_approval_decision(approval_policy, &request_key, method, decision).await?;
+        if let Err(error) = rpc
+            .respond(id, approval_response(method, decision, Some(params)))
+            .await
+        {
+            if let Some(acknowledgement) = acknowledgement {
+                let _ = acknowledgement.send(false);
+            }
+            return Err(error.into());
+        }
         if let Some(acknowledgement) = acknowledgement {
             let _ = acknowledgement.send(true);
             tokio::task::yield_now().await;
@@ -967,7 +983,7 @@ fn approval_request_key(method: &str, id: &Value, params: &Value) -> String {
     })
 }
 
-fn approval_response(method: &str, decision: ApprovalDecision) -> Value {
+fn approval_response(method: &str, decision: ApprovalDecision, params: Option<&Value>) -> Value {
     match method {
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
             let value = match decision {
@@ -985,16 +1001,34 @@ fn approval_response(method: &str, decision: ApprovalDecision) -> Value {
             };
             json!({ "decision": value })
         }
-        "item/permissions/requestApproval" => json!({
-            "permissions": {
-                "fileSystem": { "entries": [] },
-                "network": { "enabled": false }
-            },
-            "scope": "turn",
-            "strictAutoReview": true
-        }),
+        "item/permissions/requestApproval" => {
+            // 0.144.3 requires a GrantedPermissionProfile rather than a
+            // decision enum. An explicit owner Allow grants the exact
+            // profile requested on this one original request; Deny/timeout
+            // use an empty profile. The child-controlled profile is never
+            // persisted or exposed through SSE.
+            let permissions = match decision {
+                ApprovalDecision::Allow => params
+                    .and_then(|params| params.get("permissions"))
+                    .cloned()
+                    .unwrap_or_else(empty_permission_profile),
+                ApprovalDecision::Deny | ApprovalDecision::Timeout => empty_permission_profile(),
+            };
+            json!({
+                "permissions": permissions,
+                "scope": "turn",
+                "strictAutoReview": true
+            })
+        }
         _ => json!({ "decision": "cancel" }),
     }
+}
+
+fn empty_permission_profile() -> Value {
+    json!({
+        "fileSystem": { "entries": [] },
+        "network": { "enabled": false }
+    })
 }
 
 #[cfg(test)]
@@ -1083,5 +1117,31 @@ mod tests {
             seen.insert("approval:bounded:overflow".to_string()),
             Err(ClientError::SessionPoisoned)
         ));
+    }
+
+    /// The generated 0.144.3 permissions response has no decision enum.
+    /// Allow must therefore preserve the requested bounded-in-flight profile,
+    /// while deny remains an empty fail-closed profile.
+    #[test]
+    fn permissions_allow_and_deny_have_distinct_schema_valid_profiles() {
+        let params = json!({
+            "permissions": {
+                "fileSystem": { "entries": [{ "access": "read", "path": { "type": "special", "value": { "kind": "project_roots" } } }] },
+                "network": { "enabled": true }
+            }
+        });
+        let allowed = approval_response(
+            "item/permissions/requestApproval",
+            ApprovalDecision::Allow,
+            Some(&params),
+        );
+        let denied = approval_response(
+            "item/permissions/requestApproval",
+            ApprovalDecision::Deny,
+            Some(&params),
+        );
+        assert_eq!(allowed["permissions"], params["permissions"]);
+        assert_eq!(denied["permissions"]["network"]["enabled"], false);
+        assert_ne!(allowed, denied);
     }
 }

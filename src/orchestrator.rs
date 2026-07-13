@@ -177,13 +177,14 @@ async fn spawn_client_with_launcher(
 
 /// Bounded owner bootstrap. It validates the launcher path by spawning only
 /// the selected capability, performs the protocol initialize/auth/model/quota
-/// admission sequence, and then always reaps that process before reporting.
-pub async fn bootstrap_runtime(launcher: RuntimeLauncher) -> Result<(), AppError> {
+/// admission sequence, returns the admitted quota snapshot for the owner's
+/// durable record, and always reaps that process before reporting.
+pub async fn bootstrap_runtime(launcher: RuntimeLauncher) -> Result<serde_json::Value, AppError> {
     let (mut client, cwd) = spawn_client_with_launcher(&launcher, ApprovalPolicy::Deny).await?;
     let result = async {
         client.initialize().await?;
-        let _ = client.admit_live_turn().await?;
-        Ok::<(), AppError>(())
+        let rate_limits = client.admit_live_turn().await?;
+        Ok::<serde_json::Value, AppError>(rate_limits)
     }
     .await;
     let _ = client.shutdown().await;
@@ -617,15 +618,41 @@ pub async fn run_turn_with_launcher_controlled(
     turn_timeout: std::time::Duration,
     controls: &mut mpsc::Receiver<RuntimeControl>,
 ) -> Result<String, AppError> {
+    run_turn_with_launcher_controlled_with_journal(
+        prompt,
+        launcher,
+        approval_policy,
+        turn_timeout,
+        controls,
+        None,
+    )
+    .await
+}
+
+/// Owner-only variant of the controlled path.  `shared_journal` is opened
+/// during owner bootstrap and cloned into the active protocol execution, so
+/// startup recovery, approval receipts, terminal records, and shutdown all
+/// share one lifecycle root instead of opening per-turn writers.
+pub async fn run_turn_with_launcher_controlled_with_journal(
+    prompt: String,
+    launcher: RuntimeLauncher,
+    approval_policy: ApprovalPolicy,
+    turn_timeout: std::time::Duration,
+    controls: &mut mpsc::Receiver<RuntimeControl>,
+    shared_journal: Option<JournalWriter>,
+) -> Result<String, AppError> {
     let live = launcher.is_live();
-    let journal = match JournalConfig::from_env() {
-        Some(config) => {
-            let projection = project_recovery(&config.path)?;
-            let writer = JournalWriter::open(config)?;
-            persist_recovery(&writer, projection).await?;
-            Some(writer)
-        }
-        None => None,
+    let (journal, owns_journal) = match shared_journal {
+        Some(writer) => (Some(writer), false),
+        None => match JournalConfig::from_env() {
+            Some(config) => {
+                let projection = project_recovery(&config.path)?;
+                let writer = JournalWriter::open(config)?;
+                persist_recovery(&writer, projection).await?;
+                (Some(writer), true)
+            }
+            None => (None, false),
+        },
     };
     let execution_id = next_execution_id();
     append_journal(
@@ -768,8 +795,10 @@ pub async fn run_turn_with_launcher_controlled(
         // the owned result after process-group cleanup has completed.
         let _ = ack;
     }
-    if let Some(journal) = journal {
-        journal.shutdown().await?;
+    if owns_journal {
+        if let Some(journal) = journal {
+            journal.shutdown().await?;
+        }
     }
     match result {
         Ok((Some(ack), status)) => {
