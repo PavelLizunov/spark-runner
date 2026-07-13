@@ -1,0 +1,9 @@
+{
+  "binary_path": "/home/uap/.local/bin/codex",
+  "version": "0.142.0",
+  "sha256": "d3be844c45c4fd89392536e56e1010963f94785592596b50cd0c45bb8a341406",
+  "transport": "stdio",
+  "required_model": "gpt-5.3-codex-spark",
+  "schema_path": "protocol/0.142.0/stable.schema.json",
+  "schema_hash": "efdc3e4ef848db9543c29d7f150820fe80e970720cc887e17e6f3c196bc37259"
+}
