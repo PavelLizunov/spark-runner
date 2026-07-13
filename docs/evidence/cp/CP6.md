@@ -27,3 +27,19 @@ Code SHA evidence: `8aa051f9f2214883ad22ac7c2490090f08d69c3a` (`fix(cp6): harden
 ## Residual non-gating risk
 
 The live bootstrap is intentionally not exercised against real credentials or a real model in this repository. The selected-file provisioning path was tested only with fake canary data; operational deployment still needs a separately authorized live-account smoke test. The injected fixture cannot select the production live executable path. A forced process-group kill after a protocol acknowledgement/terminal timeout is deliberately treated as a conservative failed/unknown operational boundary, never as a successful model result.
+
+## Cycle 14 offline correction timeline
+
+Code SHA: `a337d10450bb767a621003c61f4a7d91591c4781` (`fix(cp6): close auth approval and cancellation gaps`). This section records deterministic local verification only; no OAuth credential value, account request, network request, or model turn was performed.
+
+- The live launcher still accepts only the explicit owner-only `SPARK_RUNNER_SUBSCRIPTION_AUTH_FILE` capability and provisions it opaquely into the fresh `0700` `CODEX_HOME` as `auth.json` with `0600` permissions. Every spawned-flow epilogue now reaps the process, explicitly unlinks that child auth copy, removes the private home, and closes an owned journal before replying. Fake-canary tests cover provisioning, unsafe-source rejection, and cleanup; they do not read a real auth file.
+- Approval descriptors now mark unreviewable requests as deny-only instead of silently abbreviating grant scope. They carry bounded command, cwd, reason, file-change path/type, and schema-shaped permission detail; `project_roots.subpath` and `unknown.path`/`subpath` are exposed when valid. A permission Allow returns only the same bounded, validated in-flight profile; Deny and Timeout keep their distinct fail-closed responses.
+- The non-idempotent delivery boundary is set immediately before the first JSONL write attempt. A deterministic pending-writer test covers cancellation after that attempt but before newline/flush/response. Initialize, admission, thread-start, and turn-start controls all return through one cleanup epilogue; post-write control records `delivery_ambiguous` and Unknown, while protocol interrupt is attempted only after accepted real thread and turn identifiers exist. The phase fixtures use markers/channels rather than sleeps and assert private-home removal.
+- Cancellation approval delivery is held at its wire acknowledgement until the owner has queued the real-ID control request. A closed or ambiguous control acknowledgement is represented as a failed unknown boundary, not as a fabricated interrupt or completed execution.
+
+## Cycle 14 serial gates (code SHA above)
+
+- `cargo fmt --all -- --check` — exit 0; wall duration 0.04s.
+- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-14 CARGO_NET_OFFLINE=true cargo test --locked --all-targets --all-features` — exit 0; wall duration 25.73s; 70 tests.
+- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-14 CARGO_NET_OFFLINE=true cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0; wall duration under 0.01s (cached target; Cargo reported 0.08s).
+- `git diff --check` — exit 0; wall duration under 0.01s.
