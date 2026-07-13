@@ -1,7 +1,7 @@
 //! CLI definition, pinned `codex.lock` loading, and small filesystem helpers.
 
 use std::env;
-use std::io;
+use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,6 +15,56 @@ const EXPECTED_CODEX_VERSION: &str = "0.144.3";
 const EXPECTED_CODEX_SCHEMA_PATH: &str =
     "protocol/0.144.3/codex_app_server_protocol.v2.schemas.json";
 const PLACEHOLDER_SCHEMA_HASH: &str = "generated-after-implementation";
+
+/// A verified live executable kept open from byte verification through spawn.
+/// On Linux the launcher executes `/proc/self/fd/N`, which names this exact
+/// inode in the child rather than reopening the mutable pathname.
+pub struct VerifiedExecutable {
+    path: PathBuf,
+    #[cfg(target_os = "linux")]
+    file: std::fs::File,
+}
+
+impl VerifiedExecutable {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn program(&self) -> String {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            format!("/proc/self/fd/{}", self.file.as_raw_fd())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.path.to_string_lossy().to_string()
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn make_fd_inheritable(file: &std::fs::File) -> Result<(), ConfigError> {
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    const F_GETFD: i32 = 1;
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+    // SAFETY: fcntl reads only the supplied file descriptor and flags. The
+    // descriptor is owned by `file` for this call and errors are propagated.
+    let flags = unsafe { fcntl(file.as_raw_fd(), F_GETFD) };
+    if flags < 0 {
+        return Err(ConfigError::VerifiedHandle(io::Error::last_os_error()));
+    }
+    // SAFETY: same argument constraints as F_GETFD above.
+    if unsafe { fcntl(file.as_raw_fd(), F_SETFD, flags & !FD_CLOEXEC) } < 0 {
+        return Err(ConfigError::VerifiedHandle(io::Error::last_os_error()));
+    }
+    Ok(())
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "spark-runner", about = "Minimal Codex app-server runner")]
@@ -99,6 +149,8 @@ pub enum ConfigError {
     VersionMismatch { expected: String },
     #[error("failed to execute locked runtime for version verification: {0}")]
     VersionCheck(io::Error),
+    #[error("failed to retain verified runtime handle: {0}")]
+    VerifiedHandle(io::Error),
 }
 
 impl CodexLock {
@@ -134,6 +186,13 @@ impl CodexLock {
     /// launcher. `codex.lock` is an assertion about bytes on disk, not merely
     /// metadata parsed at startup.
     pub fn verify_for_spawn(&self) -> Result<PathBuf, ConfigError> {
+        Ok(self.verified_for_spawn()?.path)
+    }
+
+    /// Verify the open executable inode and retain its handle until the
+    /// caller spawns it. This closes the check-then-reopen replacement race
+    /// even when the package manager keeps the pinned file owner-writable.
+    pub fn verified_for_spawn(&self) -> Result<VerifiedExecutable, ConfigError> {
         self.validate()?;
         let host = format!("{}-{}", env::consts::OS, env::consts::ARCH);
         if self.platform != host {
@@ -157,7 +216,10 @@ impl CodexLock {
         }
         let native = std::fs::canonicalize(native)
             .map_err(|_| ConfigError::InvalidExecutable(self.native_path.clone()))?;
-        let native_metadata = std::fs::metadata(&native)
+        let mut file = std::fs::File::open(&native)
+            .map_err(|_| ConfigError::InvalidExecutable(native.display().to_string()))?;
+        let native_metadata = file
+            .metadata()
             .map_err(|_| ConfigError::InvalidExecutable(native.display().to_string()))?;
         if !native_metadata.is_file() || !is_executable(&native_metadata) {
             return Err(ConfigError::InvalidExecutable(native.display().to_string()));
@@ -168,7 +230,9 @@ impl CodexLock {
         if !native.components().any(|part| part.as_os_str() == "vendor") {
             return Err(ConfigError::InvalidExecutable(native.display().to_string()));
         }
-        verify_hash("native runtime", &native, &self.native_sha256)?;
+        verify_hash_file("native runtime", &mut file, &self.native_sha256)?;
+        #[cfg(target_os = "linux")]
+        make_fd_inheritable(&file)?;
 
         let schema = Path::new(&self.schema_path);
         if std::fs::symlink_metadata(schema)
@@ -195,7 +259,14 @@ impl CodexLock {
         }
         verify_hash("schema", &schema, &self.schema_hash)?;
 
-        let output = ProcessCommand::new(&native)
+        #[cfg(target_os = "linux")]
+        let version_program = {
+            use std::os::fd::AsRawFd;
+            format!("/proc/self/fd/{}", file.as_raw_fd())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let version_program = native.to_string_lossy().to_string();
+        let output = ProcessCommand::new(version_program)
             .arg("--version")
             .output()
             .map_err(ConfigError::VersionCheck)?;
@@ -206,7 +277,32 @@ impl CodexLock {
                 expected: self.version.clone(),
             });
         }
-        Ok(native)
+        Ok(VerifiedExecutable { path: native, file })
+    }
+}
+
+fn verify_hash_file(
+    kind: &'static str,
+    file: &mut std::fs::File,
+    expected: &str,
+) -> Result<(), ConfigError> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|_| ConfigError::HashMismatch {
+            kind,
+            expected: expected.to_string(),
+            actual: "unreadable".to_string(),
+        })?;
+    file.rewind().map_err(ConfigError::VerifiedHandle)?;
+    let actual = sha256_hex(&bytes);
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ConfigError::HashMismatch {
+            kind,
+            expected: expected.to_string(),
+            actual,
+        })
     }
 }
 
@@ -489,5 +585,52 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// T09: verification retains an executable inode, not a pathname. This
+    /// closes the deterministic replacement race between hashing and launch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_handle_executes_pinned_inode_after_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("spark-runner-race-{unique}"));
+        let vendor = root.join("vendor/test/bin");
+        fs::create_dir_all(&vendor).expect("vendor");
+        let native = vendor.join("codex");
+        let original = b"#!/bin/sh\necho codex-cli 0.144.3\n";
+        fs::write(&native, original).expect("original executable");
+        let mut permissions = fs::metadata(&native).expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&native, permissions).expect("chmod");
+
+        let mut lock =
+            CodexLock::load(std::path::Path::new(super::DEFAULT_CODEX_LOCK)).expect("checked lock");
+        lock.native_path = native.display().to_string();
+        lock.native_sha256 = sha256_hex(original);
+        let verified = lock.verified_for_spawn().expect("verify original inode");
+
+        let replacement = vendor.join("replacement");
+        fs::write(&replacement, b"#!/bin/sh\necho replaced\n").expect("replacement");
+        let mut replacement_permissions = fs::metadata(&replacement)
+            .expect("replacement metadata")
+            .permissions();
+        replacement_permissions.set_mode(0o700);
+        fs::set_permissions(&replacement, replacement_permissions).expect("replacement chmod");
+        fs::rename(&replacement, &native).expect("atomic replacement");
+
+        let output = std::process::Command::new(verified.program())
+            .output()
+            .expect("execute retained inode");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "codex-cli 0.144.3"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -45,6 +45,17 @@ pub enum RuntimeControl {
     Interrupt(oneshot::Sender<()>),
 }
 
+fn interrupted_by_control(
+    control: Option<RuntimeControl>,
+) -> Result<(Option<oneshot::Sender<()>>, String), AppError> {
+    match control {
+        Some(RuntimeControl::Interrupt(ack)) => Ok((Some(ack), "interrupted".to_string())),
+        // Losing the command authority is fail-closed. The final cleanup
+        // below still owns the child process and releases admission once.
+        None => Err(AppError::Client(ClientError::TurnDeadlineExceeded)),
+    }
+}
+
 impl AppError {
     fn is_recoverable_desync(&self) -> bool {
         matches!(self, AppError::Client(error) if error.is_recoverable_desync())
@@ -56,20 +67,45 @@ enum Flow {
     Run(String),
 }
 
-fn launch_spec(live: bool, fake_server_args: &[String]) -> Result<(String, Vec<String>), AppError> {
+enum LaunchSpec {
+    Live {
+        executable: crate::config::VerifiedExecutable,
+        args: Vec<String>,
+    },
+    Fake {
+        program: String,
+        args: Vec<String>,
+    },
+}
+
+impl LaunchSpec {
+    fn program(&self) -> String {
+        match self {
+            Self::Live { executable, .. } => executable.program(),
+            Self::Fake { program, .. } => program.clone(),
+        }
+    }
+
+    fn args(&self) -> &[String] {
+        match self {
+            Self::Live { args, .. } | Self::Fake { args, .. } => args,
+        }
+    }
+}
+
+fn launch_spec(live: bool, fake_server_args: &[String]) -> Result<LaunchSpec, AppError> {
     if live {
         let lock = CodexLock::load(Path::new(DEFAULT_CODEX_LOCK))?;
-        let verified = lock.verify_for_spawn()?;
-        Ok((
-            verified.to_string_lossy().to_string(),
-            LIVE_ARGS.iter().map(|arg| arg.to_string()).collect(),
-        ))
+        Ok(LaunchSpec::Live {
+            executable: lock.verified_for_spawn()?,
+            args: LIVE_ARGS.iter().map(|arg| arg.to_string()).collect(),
+        })
     } else {
         let path = config::fake_app_server_path()?;
-        Ok((
-            path.to_string_lossy().to_string(),
-            fake_server_args.to_vec(),
-        ))
+        Ok(LaunchSpec::Fake {
+            program: path.to_string_lossy().to_string(),
+            args: fake_server_args.to_vec(),
+        })
     }
 }
 
@@ -78,9 +114,12 @@ async fn spawn_client(
     fake_server_args: &[String],
     approval_policy: ApprovalPolicy,
 ) -> Result<(CodexClient, PathBuf), AppError> {
-    let (program, args) = launch_spec(live, fake_server_args)?;
+    let launch = launch_spec(live, fake_server_args)?;
     let cwd = config::ephemeral_cwd()?;
-    let spawned = ChildProcess::spawn(&program, &args, Some(&cwd))?;
+    // `launch` stays alive across spawn. On Linux its program is an inherited
+    // `/proc/self/fd/N` handle to the inode whose bytes were just verified.
+    let program = launch.program();
+    let spawned = ChildProcess::spawn(&program, launch.args(), Some(&cwd))?;
     let client = CodexClient::with_approval_policy(
         spawned.process,
         spawned.stdin,
@@ -483,9 +522,16 @@ pub async fn run_turn_with_approval_policy_controlled(
     let fake_args = (!live).then(|| vec!["--approval-mode".to_string(), "command".to_string()]);
     let (mut client, cwd) =
         spawn_client(live, fake_args.as_deref().unwrap_or(&[]), approval_policy).await?;
-    let result = async {
-        client.initialize().await?;
-        let rate_limits = client.admit_live_turn().await?;
+    let result = 'flow: {
+        let initialized = tokio::select! {
+            result = client.initialize() => result,
+            control = controls.recv() => break 'flow interrupted_by_control(control),
+        };
+        initialized?;
+        let rate_limits = tokio::select! {
+            result = client.admit_live_turn() => result,
+            control = controls.recv() => break 'flow interrupted_by_control(control),
+        }?;
         append_journal(
             journal.as_ref(),
             JournalEvent::RateLimitSnapshot {
@@ -494,14 +540,14 @@ pub async fn run_turn_with_approval_policy_controlled(
             },
         )
         .await?;
-        let thread = client
-            .thread_start(&cwd)
-            .await
-            .map_err(non_idempotent("thread/start"))?;
-        let turn_id = client
-            .turn_start(&thread.thread_id, &prompt)
-            .await
-            .map_err(non_idempotent("turn/start"))?;
+        let thread = tokio::select! {
+            result = client.thread_start(&cwd) => result.map_err(non_idempotent("thread/start")),
+            control = controls.recv() => break 'flow interrupted_by_control(control),
+        }?;
+        let turn_id = tokio::select! {
+            result = client.turn_start(&thread.thread_id, &prompt) => result.map_err(non_idempotent("turn/start")),
+            control = controls.recv() => break 'flow interrupted_by_control(control),
+        }?;
         append_journal(
             journal.as_ref(),
             JournalEvent::TurnStarted {
@@ -551,8 +597,7 @@ pub async fn run_turn_with_approval_policy_controlled(
             },
             _ = &mut deadline => Err(AppError::Client(ClientError::TurnDeadlineExceeded)),
         }
-    }
-    .await;
+    };
     append_internal_events(journal.as_ref(), &execution_id, client.internal_events()).await?;
     let ambiguous_delivery = matches!(
         &result,
