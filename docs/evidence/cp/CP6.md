@@ -58,3 +58,30 @@ These durations are outer measurements from this exact serial run, rounded to mi
 - `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-15 CARGO_NET_OFFLINE=true cargo test --locked --all-targets --all-features` — exit 0; duration 26.703s; 73 tests.
 - `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-15 CARGO_NET_OFFLINE=true cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0; duration 0.149s.
 - `git diff --check` — exit 0; duration 0.000013s.
+
+## Cycle 16 offline approval remediation and exact measurement
+
+This record is limited to the local offline run described below; it does not
+assert live app-server, account, credential, network, or model verification.
+
+- `applyPatchApproval` descriptors now expose an update's exact `move_path`.
+  A destination that would be redacted, truncated, or whitespace-normalized
+  is deny-only.
+- The runtime owner computes the complete `approval.requested` SSE event
+  before adding its decision sender to the actionable approval map. If that
+  exact event exceeds the replay-event limit, it sends an original-ID Deny
+  and creates no invisible approvable record. The deterministic multibyte
+  argv regression covers the whole-event boundary.
+- Existing deterministic queued-control and after-write interrupt regressions
+  also passed in this run; they retain pre-write control priority and durable
+  `delivery_ambiguous` classification respectively.
+
+## Cycle 16 serial gate measurements
+
+Durations are command-runner wall measurements from this exact serial run,
+rounded to one decimal second. The final diff check is reported in the cycle
+handoff JSON after it completes.
+
+- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-16 cargo fmt --all -- --check` — exit 0; duration 0.2s.
+- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-16 CARGO_NET_OFFLINE=true cargo test --locked --all-targets --all-features` — exit 0; duration 27.4s; 74 tests.
+- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-16 CARGO_NET_OFFLINE=true cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0; duration 2.7s.

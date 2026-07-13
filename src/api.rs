@@ -742,17 +742,7 @@ async fn owner_register_pending(
         .map(|turn| is_terminal(turn.status))
         .unwrap_or(true);
     if state.approvals.len() >= MAX_APPROVALS || terminal {
-        let (delivered, response) = oneshot::channel();
-        let sent = decision
-            .send(ApprovalCommand {
-                decision: ApprovalDecision::Deny,
-                delivered,
-                resume: None,
-            })
-            .is_ok();
-        if sent {
-            let _ = tokio::time::timeout(OWNER_DEADLINE, response).await;
-        }
+        deny_pending_approval(decision).await;
         return Err(rejection(
             StatusCode::TOO_MANY_REQUESTS,
             "APPROVAL_CAPACITY",
@@ -761,6 +751,16 @@ async fn owner_register_pending(
         ));
     }
     let id = format!("approval_{}", state.next_approval);
+    let payload = approval_requested_payload(&id, request_key, method, descriptor);
+    // `push_event` intentionally drops arbitrary oversized events to keep
+    // replay bounded. An approval cannot use that generic behavior: if its
+    // exact descriptor would not reach the authority, retaining its sender
+    // would create a grantable invisible approval. Deny on the original
+    // request before creating any local approval record instead.
+    if !event_fits(state, turn_id, "approval.requested", &payload, false) {
+        deny_pending_approval(decision).await;
+        return Ok(());
+    }
     state.next_approval += 1;
     state.approvals.insert(
         id.clone(),
@@ -775,18 +775,7 @@ async fn owner_register_pending(
     if let Some(turn) = state.turns.get_mut(turn_id) {
         turn.status = TurnStatus::WaitingApproval;
     }
-    push_event(
-        state,
-        turn_id,
-        "approval.requested",
-        serde_json::json!({
-            "approval_id": id,
-            "request_key": request_key,
-            "method": method,
-            "descriptor": descriptor,
-        }),
-        false,
-    );
+    push_event(state, turn_id, "approval.requested", payload, false);
     let timeout_tx = owner_tx.clone();
     let timeout_turn_id = turn_id.to_string();
     let timeout_approval_id = id;
@@ -800,6 +789,34 @@ async fn owner_register_pending(
             .await;
     });
     Ok(())
+}
+
+async fn deny_pending_approval(decision: oneshot::Sender<ApprovalCommand>) {
+    let (delivered, response) = oneshot::channel();
+    if decision
+        .send(ApprovalCommand {
+            decision: ApprovalDecision::Deny,
+            delivered,
+            resume: None,
+        })
+        .is_ok()
+    {
+        let _ = tokio::time::timeout(OWNER_DEADLINE, response).await;
+    }
+}
+
+fn approval_requested_payload(
+    id: &str,
+    request_key: String,
+    method: String,
+    descriptor: crate::client::ApprovalDescriptor,
+) -> serde_json::Value {
+    serde_json::json!({
+        "approval_id": id,
+        "request_key": request_key,
+        "method": method,
+        "descriptor": descriptor,
+    })
 }
 
 async fn owner_decide(
@@ -1186,6 +1203,27 @@ struct TurnEvent {
     turn_id: String,
     payload: serde_json::Value,
     terminal: bool,
+}
+
+/// Unlike ordinary diagnostic events, approval requests must be visible in
+/// their entirety before they can become actionable. Keep the size check at
+/// the owner boundary, where the final SSE envelope and exact event id are
+/// both known.
+fn event_fits(
+    state: &OwnerState,
+    turn_id: &str,
+    kind: &str,
+    payload: &serde_json::Value,
+    terminal: bool,
+) -> bool {
+    serde_json::to_vec(&TurnEvent {
+        id: state.next_event,
+        kind: kind.to_string(),
+        turn_id: turn_id.to_string(),
+        payload: payload.clone(),
+        terminal,
+    })
+    .is_ok_and(|encoded| encoded.len() <= MAX_EVENT_BYTES)
 }
 
 #[derive(Serialize)]
@@ -1885,4 +1923,91 @@ pub async fn serve(config: ApiConfig) -> Result<SocketAddr, ApiError> {
         .await
         .map_err(ApiError::Serve)?;
     Ok(addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::ApprovalDescriptor;
+
+    #[tokio::test]
+    async fn oversized_approval_descriptor_is_denied_before_becoming_actionable() {
+        let mut state = OwnerState::new(false);
+        let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        state.turns.insert(
+            "turn_1".to_string(),
+            TurnRecord {
+                id: "turn_1".to_string(),
+                thread_id: "thread_1".to_string(),
+                workspace_alias: "repo".to_string(),
+                status: TurnStatus::Running,
+                events: Vec::new(),
+                event_bytes: 0,
+                sender: events,
+                control: None,
+                controlling_sse_active: false,
+            },
+        );
+        let descriptor = ApprovalDescriptor {
+            kind: "command",
+            reviewable: true,
+            command: None,
+            // The existing schema allows this many arguments, and each is
+            // reviewable text. Their UTF-8 bytes nevertheless exceed the
+            // complete SSE event ceiling, which must make the request
+            // deny-only rather than silently invisible.
+            command_arguments: Some(vec!["界".repeat(512); 16]),
+            cwd: None,
+            reason: None,
+            file_changes: Vec::new(),
+            requested_permissions: None,
+            requested_permission_profile: None,
+        };
+        let payload = approval_requested_payload(
+            "approval_1",
+            "approval:test".to_string(),
+            "execCommandApproval".to_string(),
+            descriptor.clone(),
+        );
+        assert!(
+            !event_fits(&state, "turn_1", "approval.requested", &payload, false),
+            "fixture must exercise the whole-event, not per-field, limit"
+        );
+
+        let (decision, received) = oneshot::channel::<ApprovalCommand>();
+        let acknowledgement = tokio::spawn(async move {
+            let command = received.await.expect("owner must make a decision");
+            assert_eq!(command.decision, ApprovalDecision::Deny);
+            command
+                .delivered
+                .send(true)
+                .expect("owner is still waiting for delivery");
+        });
+        let (owner_tx, _owner_rx) = mpsc::channel(1);
+        let registered = owner_register_pending(
+            &mut state,
+            &owner_tx,
+            "turn_1",
+            PendingApproval {
+                request_key: "approval:test".to_string(),
+                method: "execCommandApproval".to_string(),
+                descriptor,
+                allow_permitted: true,
+                deadline: Duration::from_secs(1),
+                decision,
+            },
+        )
+        .await;
+        assert!(
+            registered.is_ok(),
+            "an invisible approval is denied, not registered as an owner failure"
+        );
+        acknowledgement
+            .await
+            .expect("decision acknowledgement task");
+
+        assert!(state.approvals.is_empty());
+        assert!(state.turns["turn_1"].events.is_empty());
+        assert!(matches!(state.turns["turn_1"].status, TurnStatus::Running));
+    }
 }

@@ -227,6 +227,11 @@ pub struct ApprovalDescriptor {
 pub struct ApprovalFileChange {
     pub path: String,
     pub operation: String,
+    /// An update can move the source map key to a different destination. The
+    /// destination is part of the approved write scope, so it must be shown
+    /// verbatim (or the request is deny-only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub move_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -322,6 +327,7 @@ impl ApprovalDescriptor {
                     descriptor.file_changes.push(ApprovalFileChange {
                         path: root,
                         operation: "grant_root".to_string(),
+                        move_path: None,
                     });
                 }
                 descriptor.reviewable &= params
@@ -338,6 +344,7 @@ impl ApprovalDescriptor {
                     descriptor.file_changes.push(ApprovalFileChange {
                         path: root,
                         operation: "grant_root".to_string(),
+                        move_path: None,
                     });
                 }
                 let Some(changes) = params.get("fileChanges").and_then(Value::as_object) else {
@@ -354,9 +361,34 @@ impl ApprovalDescriptor {
                         .filter(|kind| matches!(*kind, "add" | "update" | "delete"));
                     descriptor.reviewable &=
                         operation.is_some() && approval_text_is_reviewable(path, MAX_APPROVAL_TEXT);
+                    let move_path = match operation {
+                        Some("update") => match change.get("move_path") {
+                            None | Some(Value::Null) => None,
+                            Some(Value::String(move_path)) => {
+                                descriptor.reviewable &=
+                                    approval_text_is_reviewable(move_path, MAX_APPROVAL_TEXT);
+                                Some(sanitize_approval_text(move_path, MAX_APPROVAL_TEXT))
+                            }
+                            Some(_) => {
+                                descriptor.reviewable = false;
+                                None
+                            }
+                        },
+                        Some("add" | "delete") => {
+                            // `move_path` is valid only for update changes.
+                            // Do not permit an unshown extension of the
+                            // source-path operation to become approvable.
+                            if change.get("move_path").is_some() {
+                                descriptor.reviewable = false;
+                            }
+                            None
+                        }
+                        _ => None,
+                    };
                     descriptor.file_changes.push(ApprovalFileChange {
                         path: sanitize_approval_text(path, MAX_APPROVAL_TEXT),
                         operation: operation.unwrap_or("unknown").to_string(),
+                        move_path,
                     });
                 }
             }
@@ -1821,6 +1853,48 @@ mod tests {
         assert!(!allowed);
         assert!(!truncated.reviewable);
         assert_eq!(truncated.file_changes.len(), MAX_APPROVAL_LIST_ITEMS);
+
+        let (moved, allowed) = ApprovalDescriptor::from_request(
+            "applyPatchApproval",
+            &json!({
+                "callId": "call-1",
+                "conversationId": "thread-1",
+                "fileChanges": {
+                    "/repo/source.rs": {
+                        "type": "update",
+                        "unified_diff": "[suppressed fixture diff]",
+                        "move_path": "/repo/destination.rs"
+                    }
+                }
+            }),
+        );
+        assert!(allowed);
+        assert!(moved.reviewable);
+        assert_eq!(moved.file_changes.len(), 1);
+        assert_eq!(moved.file_changes[0].path, "/repo/source.rs");
+        assert_eq!(moved.file_changes[0].operation, "update");
+        assert_eq!(
+            moved.file_changes[0].move_path.as_deref(),
+            Some("/repo/destination.rs"),
+            "an Allow must not hide the move destination"
+        );
+
+        let (unreviewable_move, allowed) = ApprovalDescriptor::from_request(
+            "applyPatchApproval",
+            &json!({
+                "callId": "call-1",
+                "conversationId": "thread-1",
+                "fileChanges": {
+                    "/repo/source.rs": {
+                        "type": "update",
+                        "unified_diff": "[suppressed fixture diff]",
+                        "move_path": "/repo/two  spaces.rs"
+                    }
+                }
+            }),
+        );
+        assert!(!allowed);
+        assert!(!unreviewable_move.reviewable);
     }
 
     #[test]
@@ -1875,6 +1949,19 @@ mod tests {
         assert_eq!(
             argv.command_arguments,
             Some(vec!["printf".to_string(), "two spaces".to_string()])
+        );
+
+        let (large_argv, allowed) = ApprovalDescriptor::from_request(
+            "execCommandApproval",
+            &json!({ "command": vec!["界".repeat(512); MAX_APPROVAL_LIST_ITEMS] }),
+        );
+        assert!(
+            allowed && large_argv.reviewable,
+            "each exact argv element is valid even when their combined event is too large"
+        );
+        assert_eq!(
+            large_argv.command_arguments,
+            Some(vec!["界".repeat(512); MAX_APPROVAL_LIST_ITEMS])
         );
     }
 
