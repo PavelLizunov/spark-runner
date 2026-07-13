@@ -56,8 +56,8 @@ async fn approval_disconnect_fails_closed_without_hanging() {
 
     let message = error.to_string();
     assert!(
-        message.contains("io error") || message.contains("stdout closed"),
-        "error: {message}"
+        message.contains("automatic replay denied"),
+        "stream close after turn/start is an ambiguous non-idempotent boundary: {message}"
     );
 }
 

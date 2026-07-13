@@ -10,7 +10,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::client::{ApprovalPolicy, ClientError, CodexClient};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::client::{ApprovalPolicy, ClientError, CodexClient, REQUIRED_MODEL};
 use crate::config::{self, CodexLock, ConfigError, DEFAULT_CODEX_LOCK};
 use crate::journal::{
     project_recovery, ApprovalTerminalDecision, ExecutionTerminalStatus, JournalConfig,
@@ -34,6 +36,13 @@ pub enum AppError {
     Journal(#[from] crate::journal::JournalError),
     #[error(transparent)]
     Api(#[from] crate::api::ApiError),
+}
+
+/// Commands accepted by the one active runtime execution.  The HTTP adapter
+/// never aborts a task: it asks this owner to deliver protocol cancellation,
+/// journal the terminal transition, and reap the process group first.
+pub enum RuntimeControl {
+    Interrupt(oneshot::Sender<()>),
 }
 
 impl AppError {
@@ -266,12 +275,13 @@ async fn execute_flow_once(
 }
 
 fn non_idempotent(method: &'static str) -> impl FnOnce(ClientError) -> AppError {
-    move |error| {
-        if error.is_recoverable_desync() {
+    move |error| match error {
+        // After delivery, all transport ambiguity classes (including timeout
+        // and stream close) are durable unknown execution, not a retry cue.
+        ClientError::Jsonl(_) | ClientError::UnexpectedResponseWhileWaiting => {
             AppError::Client(ClientError::AmbiguousNonIdempotent { method })
-        } else {
-            AppError::Client(error)
         }
+        other => AppError::Client(other),
     }
 }
 
@@ -439,6 +449,145 @@ pub async fn run_turn_with_approval_policy(
     approval_policy: ApprovalPolicy,
 ) -> Result<String, AppError> {
     run_with_restart(Flow::Run(prompt), live, &[], approval_policy).await
+}
+
+/// The controlled runtime-owner path used by HTTP.  It intentionally has no
+/// retry after `thread/start`/`turn/start`: delivery ambiguity is an operator
+/// recovery condition, never permission to replay a model turn.
+pub async fn run_turn_with_approval_policy_controlled(
+    prompt: String,
+    live: bool,
+    approval_policy: ApprovalPolicy,
+    turn_timeout: std::time::Duration,
+    controls: &mut mpsc::Receiver<RuntimeControl>,
+) -> Result<String, AppError> {
+    let journal = match JournalConfig::from_env() {
+        Some(config) => {
+            let projection = project_recovery(&config.path)?;
+            let writer = JournalWriter::open(config)?;
+            persist_recovery(&writer, projection).await?;
+            Some(writer)
+        }
+        None => None,
+    };
+    let execution_id = next_execution_id();
+    append_journal(
+        journal.as_ref(),
+        JournalEvent::ExecutionStarted {
+            execution_id: execution_id.clone(),
+        },
+    )
+    .await?;
+    // Offline is an injected deterministic runtime, but it traverses the
+    // exact same owner/client/protocol path as live execution.
+    let fake_args = (!live).then(|| vec!["--approval-mode".to_string(), "command".to_string()]);
+    let (mut client, cwd) =
+        spawn_client(live, fake_args.as_deref().unwrap_or(&[]), approval_policy).await?;
+    let result = async {
+        client.initialize().await?;
+        let rate_limits = client.admit_live_turn().await?;
+        append_journal(
+            journal.as_ref(),
+            JournalEvent::RateLimitSnapshot {
+                execution_id: execution_id.clone(),
+                snapshot: rate_limits,
+            },
+        )
+        .await?;
+        let thread = client
+            .thread_start(&cwd)
+            .await
+            .map_err(non_idempotent("thread/start"))?;
+        let turn_id = client
+            .turn_start(&thread.thread_id, &prompt)
+            .await
+            .map_err(non_idempotent("turn/start"))?;
+        append_journal(
+            journal.as_ref(),
+            JournalEvent::TurnStarted {
+                execution_id: execution_id.clone(),
+                turn_id: turn_id.clone(),
+            },
+        )
+        .await?;
+
+        let deadline = tokio::time::sleep(turn_timeout);
+        tokio::pin!(deadline);
+        tokio::select! {
+            biased;
+            control = controls.recv() => match control {
+                Some(RuntimeControl::Interrupt(ack)) => {
+                    // Both ids come from accepted 0.144.3 responses; do not
+                    // synthesize an interrupt for an unknown execution.
+                    let _ = client.turn_interrupt(&thread.thread_id, &turn_id).await;
+                    append_journal(
+                        journal.as_ref(),
+                        JournalEvent::TurnCompleted {
+                            execution_id: execution_id.clone(),
+                            turn_id,
+                            status: TurnTerminalStatus::Interrupted,
+                        },
+                    ).await?;
+                    Ok((Some(ack), "interrupted".to_string()))
+                }
+                None => Err(AppError::Client(ClientError::TurnDeadlineExceeded)),
+            },
+            completed = client.wait_turn_completed() => {
+                let turn = completed.map_err(non_idempotent("turn/completed"))?;
+                append_journal(
+                    journal.as_ref(),
+                    JournalEvent::TurnCompleted {
+                        execution_id: execution_id.clone(),
+                        turn_id,
+                        status: turn_status(&turn.status),
+                    },
+                ).await?;
+                Ok((None, turn.status))
+            },
+            _ = &mut deadline => Err(AppError::Client(ClientError::TurnDeadlineExceeded)),
+        }
+    }
+    .await;
+    append_internal_events(journal.as_ref(), &execution_id, client.internal_events()).await?;
+    append_journal(
+        journal.as_ref(),
+        JournalEvent::ExecutionCompleted {
+            execution_id: execution_id.clone(),
+            status: if result.is_ok() {
+                ExecutionTerminalStatus::Completed
+            } else {
+                ExecutionTerminalStatus::Failed
+            },
+        },
+    )
+    .await?;
+    let interrupt_ack = result.as_ref().ok().and_then(|(ack, _)| ack.as_ref());
+    client.shutdown().await?;
+    let _ = std::fs::remove_dir_all(&cwd);
+    if let Some(ack) = interrupt_ack {
+        // `ack` is borrowed only to show the ordering; it is sent below from
+        // the owned result after process-group cleanup has completed.
+        let _ = ack;
+    }
+    if let Some(journal) = journal {
+        journal.shutdown().await?;
+    }
+    match result {
+        Ok((Some(ack), status)) => {
+            let _ = ack.send(());
+            Ok(format!(
+                "run: mode={} model={} turn_status={status}",
+                mode_label(live),
+                REQUIRED_MODEL
+            ))
+        }
+        Ok((None, status)) => Ok(format!(
+            "run: mode={} model={} turn_status={status}",
+            mode_label(live),
+            REQUIRED_MODEL
+        )),
+        Err(error) => Err(error),
+    }
 }
 
 /// Perform durable restart projection before an HTTP listener becomes ready.

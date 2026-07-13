@@ -159,6 +159,7 @@ pub enum ExecutionTerminalStatus {
 pub enum TurnTerminalStatus {
     Completed,
     Failed,
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

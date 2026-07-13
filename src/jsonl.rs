@@ -54,6 +54,8 @@ pub enum JsonlError {
     OversizedFrame { limit: usize },
     #[error("app-server sent a malformed protocol frame; session poisoned")]
     MalformedFrame,
+    #[error("app-server sent a server request while an RPC response was awaited; request was rejected and session poisoned")]
+    ServerRequestDuringCall,
     #[error(
         "app-server response id {actual} did not match the expected id {expected} \
          (protocol desync); session poisoned"
@@ -69,6 +71,7 @@ impl JsonlError {
             self,
             JsonlError::OversizedFrame { .. }
                 | JsonlError::MalformedFrame
+                | JsonlError::ServerRequestDuringCall
                 | JsonlError::UnexpectedResponseId { .. }
         )
     }
@@ -178,8 +181,14 @@ impl JsonlClient {
                 return Ok(value);
             }
             if is_server_request(&value) {
+                // A request cannot be silently decided in the transport.  In
+                // particular, an approval belongs to the RuntimeOwner, not
+                // JsonlClient.  Reply before closing the session so a strict
+                // peer is never left waiting, then force the owner to perform
+                // controlled degradation rather than continuing with a
+                // fabricated authority decision.
                 self.dispatch_pending_server_request(value).await?;
-                continue;
+                return Err(JsonlError::ServerRequestDuringCall);
             }
             if value.get("method").is_none() {
                 if let Some(actual) = value.get("id").and_then(Value::as_u64) {
@@ -203,24 +212,8 @@ impl JsonlClient {
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let result = match method {
-            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-                Some(serde_json::json!({ "decision": "cancel" }))
-            }
-            "execCommandApproval" | "applyPatchApproval" => {
-                Some(serde_json::json!({ "decision": "abort" }))
-            }
-            "item/permissions/requestApproval" => Some(serde_json::json!({
-                "permissions": { "fileSystem": { "entries": [] }, "network": { "enabled": false } },
-                "scope": "turn",
-                "strictAutoReview": true
-            })),
-            _ => None,
-        };
-        match result {
-            Some(result) => self.respond(id, result).await,
-            None => self.respond_error(id, -32601, "method not found").await,
-        }
+        let _ = method;
+        self.respond_error(id, -32601, "method not found").await
     }
 
     async fn read_raw_message(&self) -> Result<Value, JsonlError> {
@@ -656,8 +649,8 @@ mod tests {
     }
 
     /// T11: a server request can precede the response to an ordinary RPC.
-    /// The client must respond immediately, preserve both legal request-id
-    /// forms, and then complete the original call without a timing race.
+    /// The transport returns `-32601` with the original string id, then makes
+    /// the owner degrade rather than silently inventing approval authority.
     #[tokio::test]
     async fn dispatches_server_requests_while_an_rpc_response_is_awaited() {
         let (client_write, server_read) = tokio::io::duplex(16 * 1024);
@@ -691,38 +684,12 @@ mod tests {
             let unknown = serde_json::from_str::<Value>(&line).unwrap();
             assert_eq!(unknown["id"], "server-unknown");
             assert_eq!(unknown["error"]["code"], -32601);
-
-            writer
-                .write_all(
-                    serde_json::to_string(&json!({
-                        "id": -7,
-                        "method": "item/commandExecution/requestApproval",
-                        "params": { "approvalId": "a", "itemId": "i", "threadId": "t", "turnId": "u", "command": "true", "startedAtMs": 1 }
-                    }))
-                    .unwrap()
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-            writer.write_all(b"\n").await.unwrap();
-            writer.flush().await.unwrap();
-            line.clear();
-            reader.read_line(&mut line).await.unwrap();
-            let denial = serde_json::from_str::<Value>(&line).unwrap();
-            assert_eq!(denial["id"], -7);
-            assert_eq!(denial["result"]["decision"], "cancel");
-
-            writer
-                .write_all(b"{\"id\":1,\"result\":{\"ok\":true}}\n")
-                .await
-                .unwrap();
-            writer.flush().await.unwrap();
         });
         let client = JsonlClient::with_timeout(client_write, client_read, Duration::from_secs(1));
-        assert_eq!(
-            client.call("account/read", json!({})).await.unwrap()["ok"],
-            true
-        );
+        assert!(matches!(
+            client.call("account/read", json!({})).await,
+            Err(JsonlError::ServerRequestDuringCall)
+        ));
         server.await.unwrap();
     }
 }

@@ -298,14 +298,68 @@ async fn t02_deny_approval_authority_fails_closed() {
     assert!(events.iter().any(|event| event["type"] == "turn.failed"));
 }
 
+/// T03: an unanswered genuine approval reaches its owner deadline exactly
+/// once, produces a fail-closed decision event, and terminalises the turn.
+#[tokio::test]
+async fn t03_approval_timeout_denies_once() {
+    let router = app(config());
+    let (_, thread) = request_json(
+        router.clone(),
+        "POST",
+        "/v1/threads",
+        json!({ "workspace_alias": "repo" }),
+    )
+    .await;
+    let (_, turn) = request_json(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{}/turns", thread["id"].as_str().unwrap()),
+        json!({ "input": "timeout approval", "timeout_seconds": 1 }),
+    )
+    .await;
+    let turn_id = turn["id"].as_str().unwrap();
+    wait_for_sse_event(router.clone(), turn_id, "approval.requested").await;
+    let events = fetch_sse(router, &format!("/v1/turns/{turn_id}/events"), None).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "approval.decided")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["terminal"] == true)
+            .count(),
+        1
+    );
+    assert!(events.iter().any(|event| event["type"] == "turn.failed"));
+}
+
 #[tokio::test]
 async fn live_metadata_never_falls_back_to_the_fake_runner() {
     let mut live = config();
     live.live = true;
-    // Offline tests deliberately do not construct or invoke a live process:
-    // the live owner validates and admits the exact native runtime in its own
-    // process path, never via the fake fixture or external OAuth in a test.
-    assert!(live.live);
+    let router = app(live);
+    let (_, thread) = request_json(
+        router.clone(),
+        "POST",
+        "/v1/threads",
+        json!({ "workspace_alias": "repo" }),
+    )
+    .await;
+    // T04/T10: an unadmitted live owner fails closed before launch. It cannot
+    // substitute the offline fake fixture to fabricate model/quota metadata.
+    let (status, body) = request_json(
+        router,
+        "POST",
+        &format!("/v1/threads/{}/turns", thread["id"].as_str().unwrap()),
+        json!({ "input": "must not reach fake runtime" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "RUNTIME_NOT_READY");
 }
 
 async fn fetch_sse(router: axum::Router, path: &str, last_event_id: Option<u64>) -> Vec<Value> {

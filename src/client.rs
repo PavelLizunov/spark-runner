@@ -200,12 +200,12 @@ impl CodexClient {
             });
         }
         let rate_limits = self.rate_limits_read().await?;
-        let has_quota = rate_limit_windows(&rate_limits).into_iter().any(|window| {
-            window
-                .get("usedPercent")
-                .and_then(Value::as_i64)
-                .is_some_and(|used| used < 100)
-        });
+        // A secondary window being available does not override an exhausted
+        // primary bucket (nor a workspace-credit exhaustion).  The native
+        // 0.144.3 response deliberately carries both the legacy single view
+        // and the metered-by-limit view; every advertised bucket must be
+        // usable before we spend a non-idempotent turn request.
+        let has_quota = quota_available(&rate_limits);
         if !has_quota {
             return Err(ClientError::QuotaUnavailable);
         }
@@ -466,6 +466,52 @@ fn rate_limit_windows(rate_limits: &Value) -> Vec<&Value> {
     windows
 }
 
+fn credits_available(rate_limits: &Value) -> bool {
+    fn snapshot_credits_available(snapshot: &Value) -> bool {
+        snapshot.get("credits").is_none_or(|credits| {
+            credits.is_null()
+                || credits
+                    .get("unlimited")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                || credits
+                    .get("hasCredits")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        })
+    }
+    snapshot_credits_available(rate_limits.get("rateLimits").unwrap_or(&Value::Null))
+        && rate_limits
+            .get("rateLimitsByLimitId")
+            .and_then(Value::as_object)
+            .is_none_or(|by_id| by_id.values().all(snapshot_credits_available))
+}
+
+fn quota_available(rate_limits: &Value) -> bool {
+    let windows = rate_limit_windows(rate_limits);
+    rate_limits
+        .pointer("/rateLimits/rateLimitReachedType")
+        .is_none_or(Value::is_null)
+        && rate_limits
+            .get("rateLimitsByLimitId")
+            .and_then(Value::as_object)
+            .is_none_or(|by_id| {
+                by_id.values().all(|snapshot| {
+                    snapshot
+                        .get("rateLimitReachedType")
+                        .is_none_or(Value::is_null)
+                })
+            })
+        && !windows.is_empty()
+        && windows.into_iter().all(|window| {
+            window
+                .get("usedPercent")
+                .and_then(Value::as_i64)
+                .is_some_and(|used| (0..100).contains(&used))
+        })
+        && credits_available(rate_limits)
+}
+
 fn is_known_approval_method(method: &str) -> bool {
     matches!(
         method,
@@ -522,5 +568,37 @@ fn approval_response(method: &str, decision: ApprovalDecision) -> Value {
             "strictAutoReview": true
         }),
         _ => json!({ "decision": "cancel" }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T10: canonical 0.144.3 quota admission is fail-closed.  An available
+    /// secondary window never overrides an exhausted primary or an explicit
+    /// reached type, and malformed snapshots do not become capacity.
+    #[test]
+    fn canonical_rate_limit_admission_rejects_partial_or_malformed_capacity() {
+        let exhausted_primary = json!({
+            "rateLimits": {
+                "primary": { "usedPercent": 100 },
+                "secondary": { "usedPercent": 0 },
+                "rateLimitReachedType": null,
+                "credits": null
+            },
+            "rateLimitsByLimitId": null
+        });
+        assert!(!quota_available(&exhausted_primary));
+        assert!(!credits_available(
+            &json!({ "rateLimits": { "credits": { "hasCredits": false, "unlimited": false } } })
+        ));
+
+        let reached = json!({
+            "rateLimits": { "primary": { "usedPercent": 0 }, "rateLimitReachedType": "workspace_owner_credits_depleted", "credits": null },
+            "rateLimitsByLimitId": null
+        });
+        assert!(!quota_available(&reached));
+        assert!(!quota_available(&json!({ "rateLimits": {} })));
     }
 }

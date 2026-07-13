@@ -334,11 +334,28 @@ fn handle_approval_mode(
         std::process::exit(0);
     }
 
-    let first_decision = read_decision(lines)?.unwrap_or_else(|| "missing".to_string());
+    let first = read_server_message(lines)?;
+    if first
+        .as_ref()
+        .and_then(|value| value.get("method"))
+        .and_then(Value::as_str)
+        == Some("turn/interrupt")
+    {
+        let id = first.as_ref().and_then(|value| value.get("id")).cloned();
+        send(stdout, &json!({ "id": id, "result": {} }))?;
+        send_turn_completed(stdout, thread_id, turn_id, "failed")?;
+        return Ok(());
+    }
+    let first_decision = first
+        .as_ref()
+        .and_then(|value| value.get("result"))
+        .and_then(|result| result.get("decision"))
+        .and_then(Value::as_str)
+        .unwrap_or("missing");
     match mode {
         "duplicate" => {
             send_approval_request(stdout, approval_id, thread_id, turn_id)?;
-            let _ = read_decision(lines)?;
+            let _ = read_server_message(lines)?;
         }
         "restart_unresolved" => {
             stdout.write_all(b"not-a-valid-jsonl-frame\n")?;
@@ -379,9 +396,9 @@ fn send_approval_request(
     )
 }
 
-fn read_decision(
+fn read_server_message(
     lines: &mut impl Iterator<Item = io::Result<String>>,
-) -> io::Result<Option<String>> {
+) -> io::Result<Option<Value>> {
     let Some(line) = lines.next() else {
         return Ok(None);
     };
@@ -390,11 +407,7 @@ fn read_decision(
         Ok(value) => value,
         Err(_) => return Ok(None),
     };
-    Ok(value
-        .get("result")
-        .and_then(|result| result.get("decision"))
-        .and_then(Value::as_str)
-        .map(str::to_string))
+    Ok(Some(value))
 }
 
 fn send_turn_completed(
