@@ -22,9 +22,15 @@ pub enum ClientError {
     Jsonl(#[from] JsonlError),
     #[error(transparent)]
     State(#[from] StateError),
-    #[error("app-server substituted model {observed:?} instead of required {required}")]
+    #[error(
+        "app-server substituted model (class={class}, hash={hash}) instead of required {required}"
+    )]
     FallbackModel {
-        observed: String,
+        /// Remote model names are never retained.  They can contain arbitrary
+        /// child-controlled text, so diagnostics carry only a stable class and
+        /// a bounded fingerprint.
+        class: &'static str,
+        hash: String,
         required: &'static str,
     },
     #[error("thread/start response missing thread.id")]
@@ -65,6 +71,25 @@ impl ClientError {
     /// automatically retried.
     pub fn is_recoverable_desync(&self) -> bool {
         matches!(self, ClientError::Jsonl(error) if error.is_desync())
+    }
+}
+
+fn remote_value_hash(value: &str) -> String {
+    // This is a diagnostic correlation token, not a security primitive.  It
+    // deliberately hashes the complete remote value while retaining only a
+    // fixed-width hexadecimal representation at every error boundary.
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn fallback_model(class: &'static str, observed: &str) -> ClientError {
+    ClientError::FallbackModel {
+        class,
+        hash: remote_value_hash(observed),
+        required: REQUIRED_MODEL,
     }
 }
 
@@ -216,6 +241,19 @@ impl CodexClient {
             Err(error) => {
                 if error.is_desync() {
                     self.state.poison();
+                    // A server request can be interleaved with any ordinary
+                    // admission RPC.  Once its response has been attempted,
+                    // restarting that whole flow would replay an irreversible
+                    // approval boundary, so classify the later desync here
+                    // rather than only in wait_turn_completed.
+                    if !self
+                        .seen_approvals
+                        .lock()
+                        .expect("approval id mutex poisoned")
+                        .is_empty()
+                    {
+                        return Err(ClientError::UnresolvedApprovalRestart);
+                    }
                 }
                 Err(error.into())
             }
@@ -269,10 +307,10 @@ impl CodexClient {
                     .any(|model| model.get("id").and_then(Value::as_str) == Some(REQUIRED_MODEL))
             });
         if !has_required_model {
-            return Err(ClientError::FallbackModel {
-                observed: "missing-from-model-list".to_string(),
-                required: REQUIRED_MODEL,
-            });
+            return Err(fallback_model(
+                "missing_from_model_list",
+                "missing-from-model-list",
+            ));
         }
         let rate_limits = self.rate_limits_read().await?;
         // A secondary window being available does not override an exhausted
@@ -313,10 +351,7 @@ impl CodexClient {
 
         if model != REQUIRED_MODEL {
             self.state.poison();
-            return Err(ClientError::FallbackModel {
-                observed: model,
-                required: REQUIRED_MODEL,
-            });
+            return Err(fallback_model("thread_start_model", &model));
         }
 
         self.state.on_thread_started()?;
@@ -387,10 +422,7 @@ impl CodexClient {
                         .and_then(Value::as_str)
                         .unwrap_or("rerouted")
                         .to_string();
-                    return Err(ClientError::FallbackModel {
-                        observed,
-                        required: REQUIRED_MODEL,
-                    });
+                    return Err(fallback_model("model_rerouted", &observed));
                 }
                 // Notification names originate at the child.  Preserve only a
                 // bounded class in diagnostics, never child-controlled text.
@@ -480,9 +512,9 @@ impl CodexClient {
         }
 
         state.on_approval_requested(request_key.clone(), method.to_string())?;
-        let decision = match approval_policy {
-            ApprovalPolicy::AllowForTests => ApprovalDecision::Allow,
-            ApprovalPolicy::Deny => ApprovalDecision::Deny,
+        let (decision, delivered_by_command) = match approval_policy {
+            ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, false),
+            ApprovalPolicy::Deny => (ApprovalDecision::Deny, false),
             ApprovalPolicy::External { pending, timeout } => {
                 let (decision_tx, decision_rx) = oneshot::channel();
                 let pending_approval = PendingApproval {
@@ -491,7 +523,7 @@ impl CodexClient {
                     decision: decision_tx,
                 };
                 if pending.send(pending_approval).await.is_err() {
-                    ApprovalDecision::Deny
+                    (ApprovalDecision::Deny, false)
                 } else {
                     match tokio::time::timeout(*timeout, decision_rx).await {
                         Ok(Ok(command)) => {
@@ -503,9 +535,12 @@ impl CodexClient {
                             if !delivered {
                                 return Err(ClientError::SessionPoisoned);
                             }
-                            command.decision
+                            (command.decision, true)
                         }
-                        Ok(Err(_)) | Err(_) => ApprovalDecision::Timeout,
+                        // A closed local authority or deadline must still
+                        // receive one schema-valid fail-closed response on the
+                        // original JSON-RPC request id.
+                        Ok(Err(_)) | Err(_) => (ApprovalDecision::Timeout, false),
                     }
                 }
             }
@@ -513,7 +548,7 @@ impl CodexClient {
         // An external command writes above and explicitly acknowledges the
         // flush. All other policies write here. State/journal projection is
         // only advanced after that delivery boundary succeeds.
-        if !matches!(approval_policy, ApprovalPolicy::External { .. }) {
+        if !delivered_by_command {
             rpc.respond(id, approval_response(method, decision)).await?;
         }
         state.on_approval_decided(
@@ -561,9 +596,9 @@ impl CodexClient {
                 .await?;
             return Err(ClientError::DuplicateApproval { request_key });
         }
-        let decision = match approval_policy {
-            ApprovalPolicy::AllowForTests => ApprovalDecision::Allow,
-            ApprovalPolicy::Deny => ApprovalDecision::Deny,
+        let (decision, delivered_by_command) = match approval_policy {
+            ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, false),
+            ApprovalPolicy::Deny => (ApprovalDecision::Deny, false),
             ApprovalPolicy::External { pending, timeout } => {
                 let (decision_tx, decision_rx) = oneshot::channel();
                 pending
@@ -584,13 +619,13 @@ impl CodexClient {
                         if !delivered {
                             return Err(ClientError::SessionPoisoned);
                         }
-                        command.decision
+                        (command.decision, true)
                     }
-                    Ok(Err(_)) | Err(_) => ApprovalDecision::Timeout,
+                    Ok(Err(_)) | Err(_) => (ApprovalDecision::Timeout, false),
                 }
             }
         };
-        if !matches!(approval_policy, ApprovalPolicy::External { .. }) {
+        if !delivered_by_command {
             rpc.respond(id, approval_response(method, decision)).await?;
         }
         Ok(())
@@ -849,5 +884,17 @@ mod tests {
         });
         assert!(!quota_available(&reached));
         assert!(!quota_available(&json!({ "rateLimits": {} })));
+    }
+
+    /// Remote model text is never retained in an error. The canary proves a
+    /// reroute value cannot cross a Display/log boundary verbatim.
+    #[test]
+    fn reroute_diagnostic_retains_only_bounded_hash_metadata() {
+        let canary = "MODEL_CANARY_please_do_not_render";
+        let error = fallback_model("model_rerouted", canary);
+        let rendered = error.to_string();
+        assert!(!rendered.contains(canary));
+        assert!(rendered.contains("class=model_rerouted"));
+        assert!(rendered.contains("hash="));
     }
 }

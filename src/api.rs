@@ -20,6 +20,7 @@ use axum::response::{sse::Event as SseEvent, IntoResponse, Response, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream::BoxStream;
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
@@ -241,6 +242,7 @@ struct TurnRecord {
     sender: broadcast::Sender<TurnEvent>,
     task: Option<tokio::task::JoinHandle<()>>,
     control: Option<mpsc::Sender<RuntimeControl>>,
+    controlling_sse_active: bool,
 }
 
 struct ApprovalRecord {
@@ -264,6 +266,9 @@ enum TurnStatus {
 #[serde(rename_all = "snake_case")]
 enum ApprovalStatus {
     Pending,
+    /// Exactly one authority has removed the one-shot sender and is awaiting
+    /// the write acknowledgement from the process/protocol owner.
+    Delivering,
     Approved,
     Denied,
 }
@@ -675,6 +680,7 @@ async fn create_turn(
                 sender,
                 task: None,
                 control: None,
+                controlling_sse_active: false,
             },
         );
         (turn_id, workspace_alias)
@@ -821,15 +827,19 @@ async fn turn_events(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>>, ApiRejection> {
+) -> Result<Sse<ControllingSseStream>, ApiRejection> {
     let last_seen = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
-    let (replay, receiver, terminal) = {
-        let data = state.inner.owner.data.lock().expect("owner mutex poisoned");
-        let turn = data.turns.get(&id).ok_or_else(|| {
+    let observer = headers
+        .get("x-spark-runner-observer")
+        .and_then(|value| value.to_str().ok())
+        == Some("1");
+    let (replay, receiver, terminal, guard) = {
+        let mut data = state.inner.owner.data.lock().expect("owner mutex poisoned");
+        let turn = data.turns.get_mut(&id).ok_or_else(|| {
             rejection(StatusCode::NOT_FOUND, "NOT_FOUND", "turn not found", false)
         })?;
         let replay: Vec<TurnEvent> = turn
@@ -839,7 +849,19 @@ async fn turn_events(
             .cloned()
             .collect();
         let terminal = is_terminal(turn.status);
-        (replay, turn.sender.subscribe(), terminal)
+        // The first authenticated non-terminal stream is the controlling
+        // authority. Later streams are observers and must never cancel work.
+        let guard = if !observer && !terminal && !turn.controlling_sse_active {
+            turn.controlling_sse_active = true;
+            Some(ControllingSseDropGuard {
+                state: state.clone(),
+                turn_id: id.clone(),
+                control: turn.control.clone(),
+            })
+        } else {
+            None
+        };
+        (replay, turn.sender.subscribe(), terminal, guard)
     };
     let replay_stream = tokio_stream::iter(replay.into_iter().map(event_to_sse));
     let live_stream = BroadcastStream::new(receiver).filter_map(move |event| match event {
@@ -851,7 +873,59 @@ async fn turn_events(
     } else {
         Box::pin(replay_stream.chain(live_stream))
     };
-    Ok(Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new()))
+    Ok(Sse::new(ControllingSseStream {
+        stream,
+        _guard: guard,
+    })
+    .keep_alive(axum::response::sse::KeepAlive::new()))
+}
+
+/// Owns the controller lease for the lifetime of one SSE body. Axum drops the
+/// stream when the peer disconnects; Drop is deliberately synchronous and
+/// only submits bounded local commands. The process/protocol owner performs
+/// the actual wire denial, cleanup, journal terminal transition, and release.
+struct ControllingSseDropGuard {
+    state: AppState,
+    turn_id: String,
+    control: Option<mpsc::Sender<RuntimeControl>>,
+}
+
+impl Drop for ControllingSseDropGuard {
+    fn drop(&mut self) {
+        close_pending_approvals(&self.state, &self.turn_id, "controlling_sse_drop");
+        if let Some(control) = &self.control {
+            let (ack, _receiver) = oneshot::channel();
+            let _ = control.try_send(RuntimeControl::Interrupt(ack));
+        }
+        if let Some(turn) = self
+            .state
+            .inner
+            .owner
+            .data
+            .lock()
+            .expect("owner mutex poisoned")
+            .turns
+            .get_mut(&self.turn_id)
+        {
+            turn.controlling_sse_active = false;
+        }
+    }
+}
+
+struct ControllingSseStream {
+    stream: BoxStream<'static, Result<SseEvent, Infallible>>,
+    _guard: Option<ControllingSseDropGuard>,
+}
+
+impl Stream for ControllingSseStream {
+    type Item = Result<SseEvent, Infallible>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.stream.as_mut().poll_next(context)
+    }
 }
 
 async fn interrupt_turn(
@@ -1058,67 +1132,77 @@ async fn decide_approval(
                 false,
             ));
         }
+        approval.status = ApprovalStatus::Delivering;
         (
             approval.id.clone(),
             approval.turn_id.clone(),
-            approval.decision.take(),
+            approval.decision.take().ok_or_else(|| {
+                rejection(
+                    StatusCode::CONFLICT,
+                    "APPROVAL_CLOSED",
+                    "approval is no longer owned by a running turn",
+                    false,
+                )
+            })?,
         )
     };
-    if let Some(sender) = sender {
-        let protocol_decision = match decision {
-            ApprovalStatus::Approved => ApprovalDecision::Allow,
-            ApprovalStatus::Denied | ApprovalStatus::Pending => ApprovalDecision::Deny,
-        };
-        let (delivered_tx, delivered_rx) = oneshot::channel();
-        if sender
-            .send(ApprovalCommand {
-                decision: protocol_decision,
-                delivered: delivered_tx,
-            })
-            .is_err()
+    let protocol_decision = match decision {
+        ApprovalStatus::Approved => ApprovalDecision::Allow,
+        ApprovalStatus::Denied | ApprovalStatus::Pending | ApprovalStatus::Delivering => {
+            ApprovalDecision::Deny
+        }
+    };
+    let (delivered_tx, delivered_rx) = oneshot::channel();
+    if sender
+        .send(ApprovalCommand {
+            decision: protocol_decision,
+            delivered: delivered_tx,
+        })
+        .is_err()
+    {
+        if let Some(approval) = state
+            .inner
+            .owner
+            .data
+            .lock()
+            .expect("owner mutex poisoned")
+            .approvals
+            .get_mut(id)
         {
-            if let Some(approval) = state
-                .inner
-                .owner
-                .data
-                .lock()
-                .expect("owner mutex poisoned")
-                .approvals
-                .get_mut(id)
-            {
-                approval.status = ApprovalStatus::Denied;
-            }
-            return Err(rejection(
-                StatusCode::CONFLICT,
-                "APPROVAL_CLOSED",
-                "approval is no longer owned by a running turn",
-                false,
-            ));
+            approval.status = ApprovalStatus::Denied;
         }
-        let delivered = tokio::time::timeout(std::time::Duration::from_secs(6), delivered_rx)
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(false);
-        if !delivered {
-            if let Some(approval) = state
-                .inner
-                .owner
-                .data
-                .lock()
-                .expect("owner mutex poisoned")
-                .approvals
-                .get_mut(id)
-            {
-                approval.status = ApprovalStatus::Denied;
-            }
-            return Err(rejection(
-                StatusCode::CONFLICT,
-                "APPROVAL_DELIVERY_FAILED",
-                "runtime could not deliver the approval decision",
-                true,
-            ));
+        return Err(rejection(
+            StatusCode::CONFLICT,
+            "APPROVAL_CLOSED",
+            "approval is no longer owned by a running turn",
+            false,
+        ));
+    }
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(6), delivered_rx)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(false);
+    if !delivered {
+        if let Some(approval) = state
+            .inner
+            .owner
+            .data
+            .lock()
+            .expect("owner mutex poisoned")
+            .approvals
+            .get_mut(id)
+        {
+            // The API never acknowledges an undelivered allow.  The owner
+            // will clean up this turn on the same bounded failure path.
+            approval.status = ApprovalStatus::Denied;
         }
+        return Err(rejection(
+            StatusCode::CONFLICT,
+            "APPROVAL_DELIVERY_FAILED",
+            "runtime could not deliver the approval decision",
+            true,
+        ));
     }
     let status = {
         let mut data = state.inner.owner.data.lock().expect("owner mutex poisoned");
@@ -1191,7 +1275,12 @@ fn close_pending_approvals(state: &AppState, turn_id: &str, authority: &'static 
     {
         let mut data = state.inner.owner.data.lock().expect("owner mutex poisoned");
         for approval in data.approvals.values_mut() {
-            if approval.turn_id == turn_id && approval.status == ApprovalStatus::Pending {
+            if approval.turn_id == turn_id
+                && matches!(
+                    approval.status,
+                    ApprovalStatus::Pending | ApprovalStatus::Delivering
+                )
+            {
                 approval.status = ApprovalStatus::Denied;
                 if let Some(sender) = approval.decision.take() {
                     let (delivered, _ack) = oneshot::channel();
@@ -1400,6 +1489,7 @@ mod tests {
                 sender,
                 task: None,
                 control: None,
+                controlling_sse_active: false,
             },
         );
         let state = AppState {

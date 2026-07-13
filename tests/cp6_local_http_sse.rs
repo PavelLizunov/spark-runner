@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
+use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use spark_runner::api::{app, ApiConfig};
@@ -175,6 +176,7 @@ async fn fake_child_sse_resume_keeps_approval_and_terminal_events() {
     let events_request = Request::builder()
         .uri(format!("/v1/turns/{turn_id}/events"))
         .header(header::AUTHORIZATION, "Bearer test-token")
+        .header("x-spark-runner-observer", "1")
         .body(Body::empty())
         .unwrap();
     let events_response = router.clone().oneshot(events_request).await.unwrap();
@@ -240,7 +242,7 @@ async fn t01_interrupt_running_turn_is_terminal_once() {
     )
     .await;
     let turn_id = turn["id"].as_str().unwrap();
-    wait_for_sse_event(router.clone(), turn_id, "approval.requested").await;
+    let controller = wait_for_sse_event(router.clone(), turn_id, "approval.requested").await;
     let (status, interrupted) = request_json(
         router.clone(),
         "POST",
@@ -250,7 +252,12 @@ async fn t01_interrupt_running_turn_is_terminal_once() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(interrupted["status"], "interrupted");
-    let events = fetch_sse(router, &format!("/v1/turns/{turn_id}/events"), None).await;
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        fetch_sse(router, &format!("/v1/turns/{turn_id}/events"), None),
+    )
+    .await
+    .expect("terminal SSE replay");
     assert_eq!(
         events
             .iter()
@@ -259,6 +266,7 @@ async fn t01_interrupt_running_turn_is_terminal_once() {
         1
     );
     assert!(events.iter().all(|event| event["type"] != "turn.completed"));
+    drop(controller);
 }
 
 /// T02: the authenticated deny route controls the single real approval
@@ -281,7 +289,7 @@ async fn t02_deny_approval_authority_fails_closed() {
     )
     .await;
     let turn_id = turn["id"].as_str().unwrap();
-    wait_for_sse_event(router.clone(), turn_id, "approval.requested").await;
+    let controller = wait_for_sse_event(router.clone(), turn_id, "approval.requested").await;
     let (status, decision) = request_json(
         router.clone(),
         "POST",
@@ -291,11 +299,17 @@ async fn t02_deny_approval_authority_fails_closed() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(decision["status"], "denied");
-    let events = fetch_sse(router, &format!("/v1/turns/{turn_id}/events"), None).await;
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        fetch_sse(router, &format!("/v1/turns/{turn_id}/events"), None),
+    )
+    .await
+    .expect("terminal SSE replay");
     assert!(events
         .iter()
         .any(|event| event["type"] == "approval.decided"));
     assert!(events.iter().any(|event| event["type"] == "turn.failed"));
+    drop(controller);
 }
 
 /// T03: an unanswered genuine approval reaches its owner deadline exactly
@@ -318,7 +332,7 @@ async fn t03_approval_timeout_denies_once() {
     )
     .await;
     let turn_id = turn["id"].as_str().unwrap();
-    wait_for_sse_event(router.clone(), turn_id, "approval.requested").await;
+    let controller = wait_for_sse_event(router.clone(), turn_id, "approval.requested").await;
     let events = fetch_sse(router, &format!("/v1/turns/{turn_id}/events"), None).await;
     assert_eq!(
         events
@@ -335,6 +349,51 @@ async fn t03_approval_timeout_denies_once() {
         1
     );
     assert!(events.iter().any(|event| event["type"] == "turn.failed"));
+    drop(controller);
+}
+
+/// T03: only the first controlling SSE stream owns cancellation. Dropping it
+/// sends the same fail-closed denial path as a timeout; a later observer can
+/// prove that there is one terminal transition and no completed turn.
+#[tokio::test]
+async fn t03_controlling_sse_drop_denies_and_terminalizes() {
+    let router = app(config());
+    let (_, thread) = request_json(
+        router.clone(),
+        "POST",
+        "/v1/threads",
+        json!({ "workspace_alias": "repo" }),
+    )
+    .await;
+    let (_, turn) = request_json(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{}/turns", thread["id"].as_str().unwrap()),
+        json!({ "input": "controller disconnect" }),
+    )
+    .await;
+    let turn_id = turn["id"].as_str().unwrap();
+    let controller =
+        wait_for_controlling_sse_event(router.clone(), turn_id, "approval.requested").await;
+    drop(controller);
+
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        fetch_sse(router, &format!("/v1/turns/{turn_id}/events"), None),
+    )
+    .await
+    .expect("drop must terminalize through the owner");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["terminal"] == true)
+            .count(),
+        1
+    );
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "approval.decided"));
+    assert!(events.iter().all(|event| event["type"] != "turn.completed"));
 }
 
 #[tokio::test]
@@ -365,7 +424,8 @@ async fn live_metadata_never_falls_back_to_the_fake_runner() {
 async fn fetch_sse(router: axum::Router, path: &str, last_event_id: Option<u64>) -> Vec<Value> {
     let mut builder = Request::builder()
         .uri(path)
-        .header(header::AUTHORIZATION, "Bearer test-token");
+        .header(header::AUTHORIZATION, "Bearer test-token")
+        .header("x-spark-runner-observer", "1");
     if let Some(id) = last_event_id {
         builder = builder.header("Last-Event-ID", id.to_string());
     }
@@ -378,7 +438,39 @@ async fn fetch_sse(router: axum::Router, path: &str, last_event_id: Option<u64>)
     parse_sse(std::str::from_utf8(&bytes).unwrap())
 }
 
-async fn wait_for_sse_event(router: axum::Router, turn_id: &str, expected: &str) {
+async fn wait_for_sse_event(
+    router: axum::Router,
+    turn_id: &str,
+    expected: &str,
+) -> BoxStream<'static, Result<axum::body::Bytes, axum::Error>> {
+    let request = Request::builder()
+        .uri(format!("/v1/turns/{turn_id}/events"))
+        .header(header::AUTHORIZATION, "Bearer test-token")
+        .header("x-spark-runner-observer", "1")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(chunk) = stream.next().await {
+            if std::str::from_utf8(&chunk.unwrap())
+                .unwrap()
+                .contains(expected)
+            {
+                return Box::pin(stream);
+            }
+        }
+        panic!("SSE ended before {expected}");
+    })
+    .await
+    .expect("SSE event barrier")
+}
+
+async fn wait_for_controlling_sse_event(
+    router: axum::Router,
+    turn_id: &str,
+    expected: &str,
+) -> BoxStream<'static, Result<axum::body::Bytes, axum::Error>> {
     let request = Request::builder()
         .uri(format!("/v1/turns/{turn_id}/events"))
         .header(header::AUTHORIZATION, "Bearer test-token")
@@ -392,13 +484,13 @@ async fn wait_for_sse_event(router: axum::Router, turn_id: &str, expected: &str)
                 .unwrap()
                 .contains(expected)
             {
-                return;
+                return Box::pin(stream);
             }
         }
         panic!("SSE ended before {expected}");
     })
     .await
-    .expect("SSE event barrier");
+    .expect("controlling SSE event barrier")
 }
 
 fn parse_sse(raw: &str) -> Vec<Value> {
