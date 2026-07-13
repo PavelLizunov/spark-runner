@@ -880,6 +880,130 @@ async fn control_races_are_interrupted_or_unknown_at_the_correct_boundary() {
     }
 }
 
+/// A command that is already queued when the owner enters the flow has
+/// priority over every protocol phase. In particular, the initialize write
+/// must not start just because Tokio happens to poll it first.
+#[tokio::test]
+async fn queued_control_wins_before_any_protocol_write() {
+    let _environment = environment_lock().lock().await;
+    let journal = unique_path("queued-control", "sqlite3");
+    let request_marker = unique_path("queued-control-initialize", "marker");
+    std::env::set_var("SPARK_RUNNER_JOURNAL_PATH", &journal);
+    let (control_tx, mut control_rx) = mpsc::channel(1);
+    let (ack_tx, ack_rx) = oneshot::channel();
+    control_tx
+        .send(RuntimeControl::Interrupt(ack_tx))
+        .await
+        .expect("queue control before runtime start");
+
+    let result = run_turn_with_launcher_controlled_with_journal(
+        "queued control must win".to_string(),
+        RuntimeLauncher::Fake {
+            args: vec![
+                "--barrier-phase".to_string(),
+                "initialize".to_string(),
+                "--barrier-marker".to_string(),
+                request_marker.display().to_string(),
+            ],
+        },
+        ApprovalPolicy::Deny,
+        Duration::from_secs(30),
+        &mut control_rx,
+        None,
+    )
+    .await;
+
+    assert!(result
+        .expect("queued cancellation")
+        .contains("turn_status=interrupted"));
+    assert_eq!(
+        ack_rx.await.expect("queued control acknowledgement"),
+        ControlOutcome::Interrupted
+    );
+    assert!(
+        !request_marker.exists(),
+        "a queued control must prevent the initialize write, not merely win after it"
+    );
+    let rows: Vec<String> = Connection::open(&journal)
+        .expect("journal")
+        .prepare("SELECT payload_json FROM journal_events ORDER BY id")
+        .expect("statement")
+        .query_map([], |row| row.get(0))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("payloads");
+    assert!(rows.iter().all(|row| !row.contains("rate_limit_snapshot")));
+    assert!(rows.iter().all(|row| !row.contains("turn_started")));
+    assert!(rows.iter().all(|row| !row.contains("delivery_ambiguous")));
+    assert!(rows
+        .iter()
+        .any(|row| row.contains("execution_completed") && row.contains("interrupted")));
+    std::env::remove_var("SPARK_RUNNER_JOURNAL_PATH");
+    cleanup(&[journal, request_marker]);
+}
+
+/// Once `turn/interrupt` has reached its first write attempt, a missing
+/// acknowledgement is an unresolved execution. It must not be recast as the
+/// ordinary pre-write cancellation deadline outcome.
+#[tokio::test]
+async fn interrupt_timeout_after_write_is_delivery_ambiguous() {
+    let _environment = environment_lock().lock().await;
+    let journal = unique_path("interrupt-timeout", "sqlite3");
+    let wire_marker = unique_path("interrupt-timeout-wire", "jsonl");
+    std::env::set_var("SPARK_RUNNER_JOURNAL_PATH", &journal);
+    let router = app_with_launcher(
+        config(true),
+        RuntimeLauncher::Fake {
+            args: vec![
+                "--approval-mode".to_string(),
+                "interrupt_timeout".to_string(),
+                "--wire-marker".to_string(),
+                wire_marker.display().to_string(),
+            ],
+        },
+    );
+    wait_ready(router.clone()).await;
+    let thread = create_thread(router.clone()).await;
+    let turn = create_turn(router.clone(), &thread).await;
+    wait_event(router.clone(), &turn, "approval.requested").await;
+    let (status, interrupted) = request_json(
+        router,
+        "POST",
+        &format!("/v1/turns/{turn}/interrupt"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(interrupted["status"], "failed");
+
+    let wire: Vec<Value> = std::fs::read_to_string(&wire_marker)
+        .expect("fixture observed interrupt write")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("wire JSON"))
+        .collect();
+    assert!(
+        wire.iter()
+            .any(|message| message["method"] == "turn/interrupt"),
+        "the timeout test must cross the write boundary"
+    );
+    let rows: Vec<String> = Connection::open(&journal)
+        .expect("journal")
+        .prepare("SELECT payload_json FROM journal_events ORDER BY id")
+        .expect("statement")
+        .query_map([], |row| row.get(0))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("payloads");
+    assert!(rows.iter().any(|row| row.contains("delivery_ambiguous")));
+    assert!(rows.iter().all(|row| !row.contains("cancellation_timeout")));
+    assert!(
+        rows.iter().all(|row| !row.contains("execution_completed")),
+        "after-write interrupt ambiguity remains unresolved for recovery"
+    );
+    std::env::remove_var("SPARK_RUNNER_JOURNAL_PATH");
+    cleanup(&[journal, wire_marker]);
+}
+
 #[cfg(unix)]
 async fn wait_for_pid_exit(pid: i32) {
     unsafe extern "C" {

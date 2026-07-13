@@ -48,7 +48,11 @@ async fn t06_oversized_no_newline_frame_fails_closed() {
     let error = run_doctor_with_fake_server_args(&args)
         .await
         .expect_err("unterminated oversized frame must fail");
-    assert!(error.to_string().contains("oversized protocol frame"));
+    let message = error.to_string();
+    assert!(
+        message.contains("oversized protocol frame"),
+        "unterminated oversized frame changed failure class: {message}"
+    );
 }
 
 /// T05: after turn/start has succeeded, a later desync is ambiguous and must

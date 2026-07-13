@@ -469,6 +469,22 @@ fn handle_approval_mode(
                 send_turn_completed(stdout, thread_id, turn_id, "failed")?;
             }
         }
+        "interrupt_timeout" => {
+            let second = read_server_message(lines)?;
+            record_wire(fixture.wire_marker, second.as_ref())?;
+            if second
+                .as_ref()
+                .and_then(|value| value.get("method"))
+                .and_then(Value::as_str)
+                == Some("turn/interrupt")
+            {
+                // The marker above proves the owner completed the interrupt
+                // write. Keep the protocol peer alive without a response so
+                // the owner's bounded wait crosses the after-write timeout
+                // boundary deterministically.
+                std::thread::park();
+            }
+        }
         "duplicate" => {
             send_approval_request(
                 stdout,

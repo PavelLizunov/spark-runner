@@ -470,6 +470,17 @@ async fn read_bounded_frame(reader: &mut ReaderState) -> Result<Option<Vec<u8>>,
         let mut byte = [0_u8; 1];
         let read = reader.stdout.read(&mut byte).await?;
         if read == 0 {
+            // An unterminated frame at the limit cannot be safely accepted.
+            // In particular, a writer of MAX_FRAME_LEN+1 bytes can observe a
+            // broken pipe after the reader consumes the bounded prefix, so
+            // EOF at this boundary remains the same fail-closed oversized
+            // frame classification rather than a timing-dependent close.
+            if reader.frame.len() == MAX_FRAME_LEN {
+                reader.frame.clear();
+                return Err(JsonlError::OversizedFrame {
+                    limit: MAX_FRAME_LEN,
+                });
+            }
             return if reader.frame.is_empty() {
                 Ok(None)
             } else {

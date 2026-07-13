@@ -202,6 +202,11 @@ pub struct ApprovalDescriptor {
     pub reviewable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// `execCommandApproval` grants an argv-like array.  Keep it separate
+    /// from the shell-command form above: joining arguments with whitespace
+    /// would change what the local authority reviews.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_arguments: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,6 +215,12 @@ pub struct ApprovalDescriptor {
     pub file_changes: Vec<ApprovalFileChange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_permissions: Option<RequestedPermissions>,
+    /// The exact bounded profile that an Allow will return on the original
+    /// request. It is exposed only when every string is safe to show without
+    /// redaction or normalization; otherwise `reviewable` is false and no
+    /// Allow is delivered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_permission_profile: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -224,6 +235,8 @@ pub struct RequestedPermissions {
     pub file_system: Vec<RequestedFileSystemPermission>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub glob_scan_max_depth: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -252,10 +265,12 @@ impl ApprovalDescriptor {
             kind: approval_kind(method),
             reviewable: true,
             command: None,
+            command_arguments: None,
             cwd: text("cwd", MAX_APPROVAL_TEXT),
             reason: text("reason", MAX_APPROVAL_TEXT),
             file_changes: Vec::new(),
             requested_permissions: None,
+            requested_permission_profile: None,
         };
         // CWD and reason are part of the human decision context whenever the
         // generated request supplies them. A truncated or redacted value can
@@ -292,9 +307,15 @@ impl ApprovalDescriptor {
                     descriptor.reviewable = false;
                     return (descriptor, false);
                 };
-                let joined = parts.join(" ");
-                descriptor.reviewable &= approval_text_is_reviewable(&joined, MAX_APPROVAL_COMMAND);
-                descriptor.command = Some(sanitize_approval_text(&joined, MAX_APPROVAL_COMMAND));
+                descriptor.reviewable &= parts
+                    .iter()
+                    .all(|part| approval_text_is_reviewable(part, MAX_APPROVAL_COMMAND));
+                descriptor.command_arguments = Some(
+                    parts
+                        .iter()
+                        .map(|part| sanitize_approval_text(part, MAX_APPROVAL_COMMAND))
+                        .collect(),
+                );
             }
             "item/fileChange/requestApproval" => {
                 if let Some(root) = text("grantRoot", MAX_APPROVAL_TEXT) {
@@ -344,6 +365,13 @@ impl ApprovalDescriptor {
                     let (permissions, reviewable) = describe_permissions(&profile);
                     descriptor.requested_permissions = Some(permissions);
                     descriptor.reviewable &= reviewable;
+                    if descriptor.reviewable {
+                        // This is the very profile `approval_response` will
+                        // return for Allow. Keeping the exact validated value
+                        // alongside the summary prevents a future accepted
+                        // field from becoming invisible to review.
+                        descriptor.requested_permission_profile = Some(profile);
+                    }
                     let allow_permitted = descriptor.reviewable;
                     return (descriptor, allow_permitted);
                 }
@@ -1073,9 +1101,24 @@ impl CodexClient {
         thread_id: &str,
         turn_id: &str,
     ) -> Result<(), ClientError> {
-        self.rpc_call(
+        self.turn_interrupt_with_delivery(thread_id, turn_id, None)
+            .await
+    }
+
+    /// Send the exact live interrupt while exposing its first write attempt
+    /// to the runtime owner. Once that attempt starts, a timeout cannot be
+    /// reported as an ordinary deadline because the app-server may have
+    /// received the cancellation request.
+    pub async fn turn_interrupt_with_delivery(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        delivery: Option<&RequestDelivery>,
+    ) -> Result<(), ClientError> {
+        self.rpc_call_with_delivery(
             "turn/interrupt",
             json!({ "threadId": thread_id, "turnId": turn_id }),
+            delivery,
         )
         .await?;
         Ok(())
@@ -1243,17 +1286,7 @@ fn sanitize_approval_text(value: &str, limit: usize) -> String {
 /// A redacted descriptor can explain why a request was denied, but cannot
 /// support an informed Allow for hidden command or filesystem scope.
 fn approval_text_is_reviewable(value: &str, limit: usize) -> bool {
-    value.chars().count() <= limit
-        && !value.chars().any(char::is_control)
-        && !value
-            .split_whitespace()
-            .scan(false, |redact_next, word| {
-                let lower = word.to_ascii_lowercase();
-                let sensitive = *redact_next || sensitive_approval_word(&lower);
-                *redact_next = lower == "bearer" || lower.ends_with("bearer:");
-                Some(sensitive)
-            })
-            .any(|sensitive| sensitive)
+    value.chars().count() <= limit && sanitize_approval_text(value, limit) == value
 }
 
 fn sensitive_approval_word(lower: &str) -> bool {
@@ -1490,6 +1523,9 @@ fn describe_permissions(profile: &Value) -> (RequestedPermissions, bool) {
         RequestedPermissions {
             file_system,
             network_enabled: profile.pointer("/network/enabled").and_then(Value::as_bool),
+            glob_scan_max_depth: profile
+                .pointer("/fileSystem/globScanMaxDepth")
+                .and_then(Value::as_u64),
         },
         reviewable,
     )
@@ -1696,6 +1732,19 @@ mod tests {
                 .access,
             "write"
         );
+        assert_eq!(
+            permissions
+                .requested_permission_profile
+                .as_ref()
+                .expect("exact permission profile"),
+            &json!({
+                "fileSystem": { "entries": [{
+                    "access": "write",
+                    "path": { "type": "path", "path": "/tmp/repo/output" }
+                }] },
+                "network": { "enabled": true }
+            })
+        );
 
         let invalid =
             json!({ "permissions": { "network": { "enabled": true, "host": "unbounded" } } });
@@ -1772,6 +1821,61 @@ mod tests {
         assert!(!allowed);
         assert!(!truncated.reviewable);
         assert_eq!(truncated.file_changes.len(), MAX_APPROVAL_LIST_ITEMS);
+    }
+
+    #[test]
+    fn approval_descriptor_refuses_normalized_text_and_exposes_every_grant_field() {
+        let (command, allowed) = ApprovalDescriptor::from_request(
+            "item/commandExecution/requestApproval",
+            &json!({ "command": "printf  two-spaces" }),
+        );
+        assert!(!allowed);
+        assert!(!command.reviewable);
+        assert_eq!(command.command.as_deref(), Some("printf two-spaces"));
+
+        let profile = json!({
+            "fileSystem": {
+                "globScanMaxDepth": 4,
+                "entries": [{
+                    "access": "read",
+                    "path": { "type": "path", "path": "/repo/input" }
+                }]
+            },
+            "network": { "enabled": false }
+        });
+        let (descriptor, allowed) = ApprovalDescriptor::from_request(
+            "item/permissions/requestApproval",
+            &json!({ "permissions": profile }),
+        );
+        assert!(allowed);
+        let permissions = descriptor
+            .requested_permissions
+            .as_ref()
+            .expect("permission summary");
+        assert_eq!(permissions.glob_scan_max_depth, Some(4));
+        assert_eq!(
+            descriptor.requested_permission_profile,
+            Some(profile.clone()),
+            "the descriptor must show exactly the profile Allow returns"
+        );
+        assert_eq!(
+            approval_response(
+                "item/permissions/requestApproval",
+                ApprovalDecision::Allow,
+                Some(&json!({ "permissions": profile }))
+            )["permissions"],
+            profile
+        );
+
+        let (argv, allowed) = ApprovalDescriptor::from_request(
+            "execCommandApproval",
+            &json!({ "command": ["printf", "two  spaces"] }),
+        );
+        assert!(!allowed);
+        assert_eq!(
+            argv.command_arguments,
+            Some(vec!["printf".to_string(), "two spaces".to_string()])
+        );
     }
 
     /// T10: canonical 0.144.3 quota admission is fail-closed.  An available

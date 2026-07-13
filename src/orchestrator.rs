@@ -742,19 +742,21 @@ async fn run_controlled_flow(
     control_acknowledgement: &mut Option<oneshot::Sender<ControlOutcome>>,
 ) -> Result<ControlledCompletion, AppError> {
     let initialized = tokio::select! {
-        result = client.initialize() => result,
+        biased;
         control = controls.recv() => {
             control_received(control, control_acknowledgement)?;
             return Ok(interrupted_completion());
-        }
+        },
+        result = client.initialize() => result,
     };
     initialized?;
     let rate_limits = tokio::select! {
-        result = client.admit_live_turn() => result,
+        biased;
         control = controls.recv() => {
             control_received(control, control_acknowledgement)?;
             return Ok(interrupted_completion());
-        }
+        },
+        result = client.admit_live_turn() => result,
     }?;
     append_journal(
         context.journal,
@@ -766,25 +768,27 @@ async fn run_controlled_flow(
     .await?;
     let thread_delivery = RequestDelivery::new();
     let thread = tokio::select! {
-        result = client.thread_start_with_delivery(cwd, Some(&thread_delivery)) => result.map_err(non_idempotent("thread/start")),
+        biased;
         control = controls.recv() => {
             control_received(control, control_acknowledgement)?;
             if thread_delivery.may_have_been_written() {
                 return Err(AppError::Client(ClientError::AmbiguousNonIdempotent { method: "thread/start" }));
             }
             return Ok(interrupted_completion());
-        }
+        },
+        result = client.thread_start_with_delivery(cwd, Some(&thread_delivery)) => result.map_err(non_idempotent("thread/start")),
     }?;
     let turn_delivery = RequestDelivery::new();
     let turn_id = tokio::select! {
-        result = client.turn_start_with_delivery(&thread.thread_id, prompt, Some(&turn_delivery)) => result.map_err(non_idempotent("turn/start")),
+        biased;
         control = controls.recv() => {
             control_received(control, control_acknowledgement)?;
             if turn_delivery.may_have_been_written() {
                 return Err(AppError::Client(ClientError::AmbiguousNonIdempotent { method: "turn/start" }));
             }
             return Ok(interrupted_completion());
-        }
+        },
+        result = client.turn_start_with_delivery(&thread.thread_id, prompt, Some(&turn_delivery)) => result.map_err(non_idempotent("turn/start")),
     }?;
     append_journal(
         context.journal,
@@ -805,13 +809,25 @@ async fn run_controlled_flow(
             // synthesize a terminal state if delivery failed or its result
             // was rejected. That boundary is ambiguous and is deliberately
             // left recoverable as Unknown on restart.
-            tokio::time::timeout(
+            let interrupt_delivery = RequestDelivery::new();
+            match tokio::time::timeout(
                 CONTROLLED_CANCEL_TIMEOUT,
-                client.turn_interrupt(&thread.thread_id, &turn_id),
+                client.turn_interrupt_with_delivery(
+                    &thread.thread_id,
+                    &turn_id,
+                    Some(&interrupt_delivery),
+                ),
             )
             .await
-            .map_err(|_| AppError::Client(ClientError::TurnDeadlineExceeded))?
-            .map_err(non_idempotent("turn/interrupt"))?;
+            {
+                Ok(result) => result.map_err(non_idempotent("turn/interrupt"))?,
+                Err(_) if interrupt_delivery.may_have_been_written() => {
+                    return Err(AppError::Client(ClientError::AmbiguousNonIdempotent {
+                        method: "turn/interrupt",
+                    }));
+                }
+                Err(_) => return Err(AppError::Client(ClientError::TurnDeadlineExceeded)),
+            }
             // The interrupt response only acknowledges the RPC. A terminal
             // state is authoritative only after the matching notification.
             let terminal = tokio::time::timeout(

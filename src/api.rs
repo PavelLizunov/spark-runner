@@ -276,7 +276,7 @@ enum OwnerCommand {
     },
     Pending {
         turn_id: String,
-        pending: PendingApproval,
+        pending: Box<PendingApproval>,
     },
     ApprovalDeadline {
         turn_id: String,
@@ -477,7 +477,7 @@ async fn owner_loop(
                 }
             }
             OwnerCommand::Pending { turn_id, pending } => {
-                let _ = owner_register_pending(&mut state, &tx, &turn_id, pending).await;
+                let _ = owner_register_pending(&mut state, &tx, &turn_id, *pending).await;
             }
             OwnerCommand::ApprovalDeadline {
                 turn_id,
@@ -639,7 +639,7 @@ fn owner_create_turn(
             if pending_owner_tx
                 .send(OwnerCommand::Pending {
                     turn_id: pending_turn_id.clone(),
-                    pending,
+                    pending: Box::new(pending),
                 })
                 .await
                 .is_err()
