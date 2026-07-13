@@ -457,6 +457,7 @@ async fn t03_approval_timeout_uses_the_same_ordered_cancel_path() {
         .position(|row| row.contains("approval_decided"))
         .expect("durable timeout denial");
     assert!(requested < decided);
+    assert!(rows[decided].contains("timed_out"));
     assert_eq!(
         rows.iter()
             .filter(|row| row.contains("turn_completed"))

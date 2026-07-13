@@ -853,6 +853,10 @@ async fn owner_interrupt(
     // Claim every still-pending sender before the asynchronous delivery
     // boundary. A concurrent approve sees Delivering and can never overwrite
     // this fail-closed decision.
+    let approval_decision = match authority {
+        "approval_timeout" | "turn_deadline" => ApprovalDecision::Timeout,
+        _ => ApprovalDecision::Deny,
+    };
     let mut claimed = Vec::new();
     for approval in state.approvals.values_mut() {
         if approval.turn_id == turn_id && approval.status == ApprovalStatus::Pending {
@@ -863,7 +867,7 @@ async fn owner_interrupt(
         }
     }
     for (approval_id, sender) in claimed {
-        let delivered = deliver_approval(sender, ApprovalDecision::Deny).await;
+        let delivered = deliver_approval(sender, approval_decision).await;
         set_approval_status(state, &approval_id, ApprovalStatus::Denied);
         push_event(
             state,

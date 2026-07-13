@@ -26,6 +26,11 @@ use crate::state::{ApprovalDecision, InternalEventKind};
 
 /// Pinned live app-server binary; the exact path/version/sha256 also live in `codex.lock`.
 const LIVE_ARGS: &[&str] = &["app-server", "--listen", "stdio://"];
+/// The owner HTTP deadline includes both this protocol phase and the
+/// subsequent process-group cleanup. A stuck interrupt/terminal read must
+/// therefore return to the cleanup path rather than retain the child for the
+/// JSONL client's general 120-second read timeout.
+const CONTROLLED_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -711,18 +716,24 @@ pub async fn run_turn_with_launcher_controlled_with_journal(
                     // synthesize a terminal state if delivery failed or its
                     // result was rejected. That boundary is ambiguous and is
                     // deliberately left recoverable as Unknown on restart.
-                    client
-                        .turn_interrupt(&thread.thread_id, &turn_id)
-                        .await
-                        .map_err(non_idempotent("turn/interrupt"))?;
+                    tokio::time::timeout(
+                        CONTROLLED_CANCEL_TIMEOUT,
+                        client.turn_interrupt(&thread.thread_id, &turn_id),
+                    )
+                    .await
+                    .map_err(|_| AppError::Client(ClientError::TurnDeadlineExceeded))?
+                    .map_err(non_idempotent("turn/interrupt"))?;
                     // The 0.144.3 interrupt response only acknowledges the
                     // RPC. A terminal state is authoritative only after the
                     // matching server notification arrives on this same
                     // protocol stream.
-                    let terminal = client
-                        .wait_turn_completed()
-                        .await
-                        .map_err(non_idempotent("turn/completed"))?;
+                    let terminal = tokio::time::timeout(
+                        CONTROLLED_CANCEL_TIMEOUT,
+                        client.wait_turn_completed(),
+                    )
+                    .await
+                    .map_err(|_| AppError::Client(ClientError::TurnDeadlineExceeded))?
+                    .map_err(non_idempotent("turn/completed"))?;
                     append_journal(
                         journal.as_ref(),
                         JournalEvent::TurnCompleted {
@@ -762,6 +773,10 @@ pub async fn run_turn_with_launcher_controlled_with_journal(
         &result,
         Err(AppError::Client(ClientError::AmbiguousNonIdempotent { .. }))
     );
+    let cancellation_timeout = matches!(
+        &result,
+        Err(AppError::Client(ClientError::TurnDeadlineExceeded))
+    );
     if ambiguous_delivery {
         append_journal(
             journal.as_ref(),
@@ -774,6 +789,18 @@ pub async fn run_turn_with_launcher_controlled_with_journal(
         )
         .await?;
     } else {
+        if cancellation_timeout {
+            append_journal(
+                journal.as_ref(),
+                JournalEvent::Incident {
+                    execution_id: Some(execution_id.clone()),
+                    class: "cancellation_timeout".to_string(),
+                    message: "interrupt acknowledgement or terminal notification timed out; process group reaped"
+                        .to_string(),
+                },
+            )
+            .await?;
+        }
         append_journal(
             journal.as_ref(),
             JournalEvent::ExecutionCompleted {
