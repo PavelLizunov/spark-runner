@@ -192,8 +192,11 @@ pub struct PendingApproval {
 }
 
 /// Bounded, schema-aware context shown only to the authenticated local
-/// approval authority. It contains no original request id, opaque child id,
-/// raw patch content, or raw permission profile.
+/// approval authority. It contains no original request id or opaque child
+/// id. Fields that are part of the action an Allow grants are copied without
+/// normalization. In particular, an allow-listed patch carries its exact
+/// content/diff bytes; a patch that cannot fit through the bounded review
+/// path is deny-only.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApprovalDescriptor {
     pub kind: &'static str,
@@ -209,6 +212,14 @@ pub struct ApprovalDescriptor {
     pub command_arguments: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// The target environment changes where an accepted command or
+    /// permission profile applies, so it is part of the reviewed authority.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_id: Option<String>,
+    /// A managed-network request has authority beyond the shell text alone.
+    /// Its protocol and host are shown exactly or the request is deny-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_approval: Option<ApprovalNetworkApproval>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -221,6 +232,12 @@ pub struct ApprovalDescriptor {
     /// Allow is delivered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_permission_profile: Option<Value>,
+    /// These response fields are fixed by this owner for permission grants.
+    /// They are still shown so the authority sees the scope of its Allow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_grant_scope: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict_auto_review: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -232,6 +249,20 @@ pub struct ApprovalFileChange {
     /// verbatim (or the request is deny-only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub move_path: Option<String>,
+    /// Required for add/delete. This is deliberately not sanitized: changing
+    /// any byte would make a user review a different write than Allow grants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Required for update. This is deliberately not sanitized for the same
+    /// reason as add/delete content above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unified_diff: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalNetworkApproval {
+    pub host: String,
+    pub protocol: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -258,46 +289,144 @@ pub struct RequestedFileSystemPermission {
     pub subpath: Option<String>,
 }
 
+/// The authority-bearing fields of every server approval request supported by
+/// the pinned 0.144.3 protocol schema.  This is deliberately explicit rather
+/// than inferred from a generic JSON object: an added field must be placed in
+/// one of these buckets before it can become approvable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovalSchemaMatrixEntry {
+    pub method: &'static str,
+    /// Fields copied losslessly into [`ApprovalDescriptor`] when Allow is
+    /// possible. `reason` is shown as decision context even though it does
+    /// not itself grant authority.
+    pub descriptor_fields: &'static [&'static str],
+    /// Fields whose schema offers a broader persistent authority than this
+    /// owner ever returns. If present, this owner refuses Allow instead of
+    /// silently dropping the proposal.
+    pub deny_allow_if_present: &'static [&'static str],
+    /// Routing/correlation fields and explicitly best-effort display metadata
+    /// that do not change the action of this owner's one-request response.
+    pub non_authority_fields: &'static [&'static str],
+}
+
+pub const APPROVAL_SCHEMA_MATRIX: &[ApprovalSchemaMatrixEntry] = &[
+    ApprovalSchemaMatrixEntry {
+        method: "item/commandExecution/requestApproval",
+        descriptor_fields: &[
+            "command",
+            "cwd",
+            "environmentId",
+            "networkApprovalContext.host",
+            "networkApprovalContext.protocol",
+            "reason",
+        ],
+        deny_allow_if_present: &[
+            "proposedExecpolicyAmendment",
+            "proposedNetworkPolicyAmendments",
+        ],
+        non_authority_fields: &[
+            "approvalId",
+            "itemId",
+            "threadId",
+            "turnId",
+            "startedAtMs",
+            "commandActions",
+        ],
+    },
+    ApprovalSchemaMatrixEntry {
+        method: "execCommandApproval",
+        descriptor_fields: &["command[]", "cwd", "reason"],
+        deny_allow_if_present: &[],
+        non_authority_fields: &["approvalId", "callId", "conversationId", "parsedCmd"],
+    },
+    ApprovalSchemaMatrixEntry {
+        method: "applyPatchApproval",
+        descriptor_fields: &[
+            "grantRoot",
+            "fileChanges.<path>.type",
+            "fileChanges.<path>.content",
+            "fileChanges.<path>.unified_diff",
+            "fileChanges.<path>.move_path",
+            "reason",
+        ],
+        deny_allow_if_present: &[],
+        non_authority_fields: &["callId", "conversationId"],
+    },
+    ApprovalSchemaMatrixEntry {
+        method: "item/fileChange/requestApproval",
+        descriptor_fields: &["grantRoot", "reason"],
+        deny_allow_if_present: &[],
+        non_authority_fields: &["itemId", "threadId", "turnId", "startedAtMs"],
+    },
+    ApprovalSchemaMatrixEntry {
+        method: "item/permissions/requestApproval",
+        descriptor_fields: &[
+            "cwd",
+            "environmentId",
+            "permissions.fileSystem.entries",
+            "permissions.fileSystem.globScanMaxDepth",
+            "permissions.fileSystem.read",
+            "permissions.fileSystem.write",
+            "permissions.network.enabled",
+            "response.scope",
+            "response.strictAutoReview",
+            "reason",
+        ],
+        deny_allow_if_present: &[],
+        non_authority_fields: &["itemId", "threadId", "turnId", "startedAtMs"],
+    },
+];
+
+fn approval_schema_variant(method: &str) -> Option<&'static ApprovalSchemaMatrixEntry> {
+    APPROVAL_SCHEMA_MATRIX
+        .iter()
+        .find(|variant| variant.method == method)
+}
+
 impl ApprovalDescriptor {
     fn from_request(method: &str, params: &Value) -> (Self, bool) {
-        let text = |name, limit| {
-            params
-                .get(name)
-                .and_then(Value::as_str)
-                .map(|value| sanitize_approval_text(value, limit))
-        };
+        let (cwd, cwd_reviewable) = optional_approval_text(params, "cwd", MAX_APPROVAL_TEXT);
+        let (reason, reason_reviewable) =
+            optional_approval_text(params, "reason", MAX_APPROVAL_TEXT);
         let mut descriptor = Self {
             kind: approval_kind(method),
             reviewable: true,
             command: None,
             command_arguments: None,
-            cwd: text("cwd", MAX_APPROVAL_TEXT),
-            reason: text("reason", MAX_APPROVAL_TEXT),
+            cwd,
+            environment_id: None,
+            network_approval: None,
+            reason,
             file_changes: Vec::new(),
             requested_permissions: None,
             requested_permission_profile: None,
+            permission_grant_scope: None,
+            strict_auto_review: None,
         };
         // CWD and reason are part of the human decision context whenever the
-        // generated request supplies them. A truncated or redacted value can
-        // still explain a denial, but not an informed Allow.
-        descriptor.reviewable &= params
-            .get("cwd")
-            .and_then(Value::as_str)
-            .is_none_or(|cwd| approval_text_is_reviewable(cwd, MAX_APPROVAL_TEXT));
-        descriptor.reviewable &= params
-            .get("reason")
-            .and_then(Value::as_str)
-            .is_none_or(|reason| approval_text_is_reviewable(reason, MAX_APPROVAL_TEXT));
+        // generated request supplies them. A truncated, redacted, or
+        // malformed value can still explain a denial, but not an informed
+        // Allow.
+        descriptor.reviewable &= cwd_reviewable && reason_reviewable;
         match method {
             "item/commandExecution/requestApproval" => {
-                descriptor.command = text("command", MAX_APPROVAL_COMMAND);
-                descriptor.reviewable &=
-                    params
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .is_some_and(|command| {
-                            approval_text_is_reviewable(command, MAX_APPROVAL_COMMAND)
-                        });
+                let (command, command_reviewable) =
+                    optional_approval_text(params, "command", MAX_APPROVAL_COMMAND);
+                descriptor.command = command;
+                descriptor.reviewable &= command_reviewable && descriptor.command.is_some();
+                let (environment_id, environment_reviewable) =
+                    optional_approval_text(params, "environmentId", MAX_APPROVAL_TEXT);
+                descriptor.environment_id = environment_id;
+                descriptor.reviewable &= environment_reviewable;
+                let (network_approval, network_reviewable) =
+                    describe_network_approval(params.get("networkApprovalContext"));
+                descriptor.network_approval = network_approval;
+                descriptor.reviewable &= network_reviewable;
+                // The owner only ever returns `accept`, never a persistent
+                // cache/execpolicy/network amendment decision. Refuse Allow
+                // rather than letting either schema proposal be invisible.
+                descriptor.reviewable &= !has_non_null_field(params, "proposedExecpolicyAmendment")
+                    && !has_non_null_field(params, "proposedNetworkPolicyAmendments");
             }
             "execCommandApproval" => {
                 let Some(parts) = params.get("command").and_then(Value::as_array) else {
@@ -321,30 +450,35 @@ impl ApprovalDescriptor {
                         .map(|part| sanitize_approval_text(part, MAX_APPROVAL_COMMAND))
                         .collect(),
                 );
+                descriptor.reviewable &= descriptor.cwd.is_some();
             }
             "item/fileChange/requestApproval" => {
-                if let Some(root) = text("grantRoot", MAX_APPROVAL_TEXT) {
+                let (root, root_reviewable) =
+                    optional_approval_text(params, "grantRoot", MAX_APPROVAL_TEXT);
+                if let Some(root) = root {
                     descriptor.file_changes.push(ApprovalFileChange {
                         path: root,
                         operation: "grant_root".to_string(),
                         move_path: None,
+                        content: None,
+                        unified_diff: None,
                     });
                 }
-                descriptor.reviewable &= params
-                    .get("grantRoot")
-                    .and_then(Value::as_str)
-                    .is_some_and(|root| approval_text_is_reviewable(root, MAX_APPROVAL_TEXT));
+                // This request carries no file payload. The session write
+                // root is therefore the entire authority an Allow can grant.
+                descriptor.reviewable &= root_reviewable && !descriptor.file_changes.is_empty();
             }
             "applyPatchApproval" => {
-                descriptor.reviewable &= params
-                    .get("grantRoot")
-                    .and_then(Value::as_str)
-                    .is_none_or(|root| approval_text_is_reviewable(root, MAX_APPROVAL_TEXT));
-                if let Some(root) = text("grantRoot", MAX_APPROVAL_TEXT) {
+                let (root, root_reviewable) =
+                    optional_approval_text(params, "grantRoot", MAX_APPROVAL_TEXT);
+                descriptor.reviewable &= root_reviewable;
+                if let Some(root) = root {
                     descriptor.file_changes.push(ApprovalFileChange {
                         path: root,
                         operation: "grant_root".to_string(),
                         move_path: None,
+                        content: None,
+                        unified_diff: None,
                     });
                 }
                 let Some(changes) = params.get("fileChanges").and_then(Value::as_object) else {
@@ -354,45 +488,70 @@ impl ApprovalDescriptor {
                 if changes.len() > MAX_APPROVAL_LIST_ITEMS {
                     descriptor.reviewable = false;
                 }
+                let mut patch_bytes = 0;
                 for (path, change) in changes.iter().take(MAX_APPROVAL_LIST_ITEMS) {
+                    let Some(change) = change.as_object() else {
+                        descriptor.reviewable = false;
+                        descriptor.file_changes.push(ApprovalFileChange {
+                            path: sanitize_approval_text(path, MAX_APPROVAL_TEXT),
+                            operation: "unknown".to_string(),
+                            move_path: None,
+                            content: None,
+                            unified_diff: None,
+                        });
+                        continue;
+                    };
                     let operation = change
                         .get("type")
                         .and_then(Value::as_str)
                         .filter(|kind| matches!(*kind, "add" | "update" | "delete"));
                     descriptor.reviewable &=
                         operation.is_some() && approval_text_is_reviewable(path, MAX_APPROVAL_TEXT);
-                    let move_path = match operation {
-                        Some("update") => match change.get("move_path") {
-                            None | Some(Value::Null) => None,
-                            Some(Value::String(move_path)) => {
-                                descriptor.reviewable &=
-                                    approval_text_is_reviewable(move_path, MAX_APPROVAL_TEXT);
-                                Some(sanitize_approval_text(move_path, MAX_APPROVAL_TEXT))
-                            }
-                            Some(_) => {
-                                descriptor.reviewable = false;
-                                None
-                            }
-                        },
+                    let (content, unified_diff, move_path, change_reviewable) = match operation {
                         Some("add" | "delete") => {
-                            // `move_path` is valid only for update changes.
-                            // Do not permit an unshown extension of the
-                            // source-path operation to become approvable.
-                            if change.get("move_path").is_some() {
-                                descriptor.reviewable = false;
-                            }
-                            None
+                            let (content, content_reviewable) =
+                                exact_patch_text(change, "content", &mut patch_bytes);
+                            (
+                                content,
+                                None,
+                                None,
+                                content_reviewable && has_exact_keys(change, &["type", "content"]),
+                            )
                         }
-                        _ => None,
+                        Some("update") => {
+                            let (unified_diff, diff_reviewable) =
+                                exact_patch_text(change, "unified_diff", &mut patch_bytes);
+                            let (move_path, move_reviewable) =
+                                optional_patch_path(change, "move_path");
+                            (
+                                None,
+                                unified_diff,
+                                move_path,
+                                diff_reviewable
+                                    && move_reviewable
+                                    && has_exact_keys(
+                                        change,
+                                        &["type", "unified_diff", "move_path"],
+                                    ),
+                            )
+                        }
+                        _ => (None, None, None, false),
                     };
+                    descriptor.reviewable &= change_reviewable;
                     descriptor.file_changes.push(ApprovalFileChange {
                         path: sanitize_approval_text(path, MAX_APPROVAL_TEXT),
                         operation: operation.unwrap_or("unknown").to_string(),
                         move_path,
+                        content,
+                        unified_diff,
                     });
                 }
             }
             "item/permissions/requestApproval" => {
+                let (environment_id, environment_reviewable) =
+                    optional_approval_text(params, "environmentId", MAX_APPROVAL_TEXT);
+                descriptor.environment_id = environment_id;
+                descriptor.reviewable &= environment_reviewable && descriptor.cwd.is_some();
                 if let Some(profile) = validated_requested_permissions(params) {
                     let (permissions, reviewable) = describe_permissions(&profile);
                     descriptor.requested_permissions = Some(permissions);
@@ -403,6 +562,8 @@ impl ApprovalDescriptor {
                         // alongside the summary prevents a future accepted
                         // field from becoming invisible to review.
                         descriptor.requested_permission_profile = Some(profile);
+                        descriptor.permission_grant_scope = Some("turn");
+                        descriptor.strict_auto_review = Some(true);
                     }
                     let allow_permitted = descriptor.reviewable;
                     return (descriptor, allow_permitted);
@@ -1257,14 +1418,7 @@ fn quota_available(rate_limits: &Value) -> bool {
 }
 
 fn is_known_approval_method(method: &str) -> bool {
-    matches!(
-        method,
-        "item/commandExecution/requestApproval"
-            | "item/fileChange/requestApproval"
-            | "item/permissions/requestApproval"
-            | "execCommandApproval"
-            | "applyPatchApproval"
-    )
+    approval_schema_variant(method).is_some()
 }
 
 fn is_request_id(value: &&Value) -> bool {
@@ -1276,6 +1430,10 @@ fn is_request_id(value: &&Value) -> bool {
 const MAX_APPROVAL_TEXT: usize = 160;
 const MAX_APPROVAL_COMMAND: usize = 512;
 const MAX_APPROVAL_LIST_ITEMS: usize = 16;
+// Patch strings are copied byte-for-byte into the descriptor. Bound their
+// aggregate source bytes before copying; the owner additionally admits the
+// final escaped SSE envelope before it becomes actionable.
+const MAX_APPROVAL_PATCH_BYTES: usize = 8 * 1024;
 const MAX_PERMISSION_PROFILE_BYTES: usize = 8 * 1024;
 const MAX_PERMISSION_ENTRIES: usize = 16;
 
@@ -1285,6 +1443,106 @@ fn approval_kind(method: &str) -> &'static str {
         "item/fileChange/requestApproval" | "applyPatchApproval" => "file_change",
         "item/permissions/requestApproval" => "permissions",
         _ => "unknown",
+    }
+}
+
+fn has_non_null_field(params: &Value, name: &str) -> bool {
+    params.get(name).is_some_and(|value| !value.is_null())
+}
+
+/// Copy an optional schema string only when it can be shown exactly. This is
+/// intentionally stricter than `Value::as_str().is_none_or(...)`: a present
+/// value of the wrong type must never masquerade as an absent authority field.
+fn optional_approval_text(params: &Value, name: &str, limit: usize) -> (Option<String>, bool) {
+    match params.get(name) {
+        None | Some(Value::Null) => (None, true),
+        Some(Value::String(value)) => (
+            Some(sanitize_approval_text(value, limit)),
+            approval_text_is_reviewable(value, limit),
+        ),
+        Some(_) => (None, false),
+    }
+}
+
+fn describe_network_approval(value: Option<&Value>) -> (Option<ApprovalNetworkApproval>, bool) {
+    let Some(value) = value else {
+        return (None, true);
+    };
+    if value.is_null() {
+        return (None, true);
+    }
+    let Some(context) = value.as_object() else {
+        return (None, false);
+    };
+    if !has_only_keys(context, &["host", "protocol"]) {
+        return (None, false);
+    }
+    let Some(host) = context.get("host").and_then(Value::as_str) else {
+        return (None, false);
+    };
+    let Some(protocol) = context.get("protocol").and_then(Value::as_str) else {
+        return (None, false);
+    };
+    let protocol = match protocol {
+        "http" => "http",
+        "https" => "https",
+        "socks5Tcp" => "socks5Tcp",
+        "socks5Udp" => "socks5Udp",
+        _ => return (None, false),
+    };
+    let reviewable = approval_text_is_reviewable(host, MAX_APPROVAL_TEXT);
+    (
+        Some(ApprovalNetworkApproval {
+            host: sanitize_approval_text(host, MAX_APPROVAL_TEXT),
+            protocol,
+        }),
+        reviewable,
+    )
+}
+
+/// Every accepted patch variant has exactly the keys defined by the 0.144.3
+/// `FileChange` union. Rejecting extensions prevents an action-bearing byte
+/// from being silently dropped from an otherwise approvable descriptor.
+fn has_exact_keys(change: &serde_json::Map<String, Value>, allowed: &[&str]) -> bool {
+    has_only_keys(change, allowed) && change.contains_key("type")
+}
+
+fn has_only_keys(value: &serde_json::Map<String, Value>, allowed: &[&str]) -> bool {
+    value.keys().all(|key| allowed.contains(&key.as_str()))
+}
+
+/// Preserve patch bytes exactly. A digest is deliberately not used here: it
+/// cannot let a human independently review the requested content. Returning
+/// `false` avoids copying over-budget content and makes Allow impossible.
+fn exact_patch_text(
+    change: &serde_json::Map<String, Value>,
+    name: &str,
+    total_bytes: &mut usize,
+) -> (Option<String>, bool) {
+    let Some(value) = change.get(name).and_then(Value::as_str) else {
+        return (None, false);
+    };
+    let Some(next_total) = total_bytes.checked_add(value.len()) else {
+        return (None, false);
+    };
+    if next_total > MAX_APPROVAL_PATCH_BYTES {
+        return (None, false);
+    }
+    *total_bytes = next_total;
+    (Some(value.to_string()), true)
+}
+
+fn optional_patch_path(
+    change: &serde_json::Map<String, Value>,
+    name: &str,
+) -> (Option<String>, bool) {
+    match change.get(name) {
+        None | Some(Value::Null) => (None, true),
+        Some(Value::String(value)) => (
+            Some(sanitize_approval_text(value, MAX_APPROVAL_TEXT)),
+            approval_text_is_reviewable(value, MAX_APPROVAL_TEXT),
+        ),
+        Some(_) => (None, false),
     }
 }
 
@@ -1684,8 +1942,8 @@ fn approval_response(method: &str, decision: ApprovalDecision, params: Option<&V
             // 0.144.3 requires a GrantedPermissionProfile rather than a
             // decision enum. An explicit owner Allow grants the exact
             // profile requested on this one original request; Deny/timeout
-            // use an empty profile. The child-controlled profile is never
-            // persisted or exposed through SSE.
+            // use an empty profile. The profile is never persisted; a bounded
+            // exact copy is exposed only in the authenticated review event.
             let permissions = match decision {
                 ApprovalDecision::Allow => params
                     .and_then(validated_requested_permissions)
@@ -1713,10 +1971,10 @@ fn empty_permission_profile() -> Value {
 mod tests {
     use super::*;
 
-    /// Approval context is enough to review the requested action, but it is
-    /// bounded and redacted before it crosses the authenticated API/SSE
-    /// boundary. Raw patch content and secret-shaped command text never join
-    /// that descriptor.
+    /// Command context is bounded and redacted before it crosses the
+    /// authenticated API/SSE boundary. A secret-shaped command is deny-only;
+    /// patch contents are handled separately because a patch Allow requires
+    /// their exact bytes to reach the reviewer.
     #[test]
     fn approval_descriptor_is_schema_aware_bounded_and_redacted() {
         let canary = "APPROVAL_SECRET_CANARY_DO_NOT_EXPOSE";
@@ -1797,6 +2055,7 @@ mod tests {
         let (descriptor, allowed) = ApprovalDescriptor::from_request(
             "item/permissions/requestApproval",
             &json!({
+                "cwd": "/repo",
                 "permissions": {
                     "fileSystem": { "entries": [
                         {
@@ -1862,7 +2121,7 @@ mod tests {
                 "fileChanges": {
                     "/repo/source.rs": {
                         "type": "update",
-                        "unified_diff": "[suppressed fixture diff]",
+                        "unified_diff": "@@ -1 +1 @@\n-old\n+new\n",
                         "move_path": "/repo/destination.rs"
                     }
                 }
@@ -1878,6 +2137,11 @@ mod tests {
             Some("/repo/destination.rs"),
             "an Allow must not hide the move destination"
         );
+        assert_eq!(
+            moved.file_changes[0].unified_diff.as_deref(),
+            Some("@@ -1 +1 @@\n-old\n+new\n"),
+            "an Allow must not hide the exact update bytes"
+        );
 
         let (unreviewable_move, allowed) = ApprovalDescriptor::from_request(
             "applyPatchApproval",
@@ -1887,7 +2151,7 @@ mod tests {
                 "fileChanges": {
                     "/repo/source.rs": {
                         "type": "update",
-                        "unified_diff": "[suppressed fixture diff]",
+                        "unified_diff": "@@ -1 +1 @@\n-old\n+new\n",
                         "move_path": "/repo/two  spaces.rs"
                     }
                 }
@@ -1898,7 +2162,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_descriptor_refuses_normalized_text_and_exposes_every_grant_field() {
+    fn approval_descriptor_refuses_normalized_text_and_exposes_permission_profile() {
         let (command, allowed) = ApprovalDescriptor::from_request(
             "item/commandExecution/requestApproval",
             &json!({ "command": "printf  two-spaces" }),
@@ -1919,7 +2183,7 @@ mod tests {
         });
         let (descriptor, allowed) = ApprovalDescriptor::from_request(
             "item/permissions/requestApproval",
-            &json!({ "permissions": profile }),
+            &json!({ "cwd": "/repo", "permissions": profile }),
         );
         assert!(allowed);
         let permissions = descriptor
@@ -1936,7 +2200,7 @@ mod tests {
             approval_response(
                 "item/permissions/requestApproval",
                 ApprovalDecision::Allow,
-                Some(&json!({ "permissions": profile }))
+                Some(&json!({ "cwd": "/repo", "permissions": profile }))
             )["permissions"],
             profile
         );
@@ -1953,7 +2217,10 @@ mod tests {
 
         let (large_argv, allowed) = ApprovalDescriptor::from_request(
             "execCommandApproval",
-            &json!({ "command": vec!["界".repeat(512); MAX_APPROVAL_LIST_ITEMS] }),
+            &json!({
+                "command": vec!["界".repeat(512); MAX_APPROVAL_LIST_ITEMS],
+                "cwd": "/repo",
+            }),
         );
         assert!(
             allowed && large_argv.reviewable,
@@ -1963,6 +2230,302 @@ mod tests {
             large_argv.command_arguments,
             Some(vec!["界".repeat(512); MAX_APPROVAL_LIST_ITEMS])
         );
+    }
+
+    /// Schema-derived regression matrix for all approval methods supported by
+    /// this owner. Every row supplies the special fields that change the
+    /// action/scope and asserts the exact descriptor value an Allow exposes.
+    #[test]
+    fn approval_schema_matrix_losslessly_covers_allowable_authority() {
+        struct MatrixCase {
+            name: &'static str,
+            method: &'static str,
+            params: Value,
+            expected: Vec<(&'static str, Value)>,
+        }
+
+        let permission_profile = json!({
+            "fileSystem": {
+                "entries": [
+                    {
+                        "access": "write",
+                        "path": { "type": "path", "path": "/repo/generated" }
+                    },
+                    {
+                        "access": "read",
+                        "path": { "type": "glob_pattern", "pattern": "/repo/**/*.rs" }
+                    },
+                    {
+                        "access": "read",
+                        "path": {
+                            "type": "special",
+                            "value": { "kind": "project_roots", "subpath": "inputs" }
+                        }
+                    },
+                    {
+                        "access": "deny",
+                        "path": {
+                            "type": "special",
+                            "value": {
+                                "kind": "unknown",
+                                "path": "/outside",
+                                "subpath": "private"
+                            }
+                        }
+                    }
+                ],
+                "globScanMaxDepth": 4,
+                "read": ["/legacy/read"],
+                "write": ["/legacy/write"]
+            },
+            "network": { "enabled": true }
+        });
+        let cases = vec![
+            MatrixCase {
+                name: "command_execution_environment_and_network",
+                method: "item/commandExecution/requestApproval",
+                params: json!({
+                    "command": "curl https://registry.example/v1/index",
+                    "cwd": "/repo",
+                    "environmentId": "container-a",
+                    "networkApprovalContext": {
+                        "host": "registry.example",
+                        "protocol": "https"
+                    },
+                    "reason": "fetch registry metadata",
+                    "itemId": "item-1",
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "startedAtMs": 1,
+                    "commandActions": []
+                }),
+                expected: vec![
+                    ("/command", json!("curl https://registry.example/v1/index")),
+                    ("/cwd", json!("/repo")),
+                    ("/environment_id", json!("container-a")),
+                    ("/network_approval/host", json!("registry.example")),
+                    ("/network_approval/protocol", json!("https")),
+                ],
+            },
+            MatrixCase {
+                name: "exec_command_exact_argv",
+                method: "execCommandApproval",
+                params: json!({
+                    "approvalId": "approval-1",
+                    "callId": "call-1",
+                    "command": ["printf", "%s\\n", "two words"],
+                    "conversationId": "thread-1",
+                    "cwd": "/repo",
+                    "parsedCmd": [{ "cmd": "printf", "type": "unknown" }],
+                    "reason": "write a status line"
+                }),
+                expected: vec![
+                    (
+                        "/command_arguments",
+                        json!(["printf", "%s\\n", "two words"]),
+                    ),
+                    ("/cwd", json!("/repo")),
+                ],
+            },
+            MatrixCase {
+                name: "apply_patch_add_delete_update_and_move",
+                method: "applyPatchApproval",
+                params: json!({
+                    "callId": "call-1",
+                    "conversationId": "thread-1",
+                    "grantRoot": "/repo",
+                    "reason": "apply reviewed changes",
+                    "fileChanges": {
+                        "/repo/add.rs": {
+                            "type": "add",
+                            "content": "pub fn added() {}\\n"
+                        },
+                        "/repo/delete.rs": {
+                            "type": "delete",
+                            "content": "obsolete  bytes\\n"
+                        },
+                        "/repo/update.rs": {
+                            "type": "update",
+                            "unified_diff": "@@ -1 +1 @@\\n-old\\n+new\\n",
+                            "move_path": "/repo/moved.rs"
+                        }
+                    }
+                }),
+                expected: vec![
+                    ("/file_changes/0/path", json!("/repo")),
+                    ("/file_changes/1/content", json!("pub fn added() {}\\n")),
+                    ("/file_changes/2/content", json!("obsolete  bytes\\n")),
+                    (
+                        "/file_changes/3/unified_diff",
+                        json!("@@ -1 +1 @@\\n-old\\n+new\\n"),
+                    ),
+                    ("/file_changes/3/move_path", json!("/repo/moved.rs")),
+                ],
+            },
+            MatrixCase {
+                name: "file_change_session_root",
+                method: "item/fileChange/requestApproval",
+                params: json!({
+                    "grantRoot": "/repo/generated",
+                    "reason": "allow writes under generated",
+                    "itemId": "item-1",
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "startedAtMs": 1
+                }),
+                expected: vec![
+                    ("/file_changes/0/path", json!("/repo/generated")),
+                    ("/file_changes/0/operation", json!("grant_root")),
+                ],
+            },
+            MatrixCase {
+                name: "permissions_full_profile_and_fixed_response_scope",
+                method: "item/permissions/requestApproval",
+                params: json!({
+                    "cwd": "/repo",
+                    "environmentId": "container-a",
+                    "reason": "build generated output",
+                    "permissions": permission_profile,
+                    "itemId": "item-1",
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "startedAtMs": 1
+                }),
+                expected: vec![
+                    ("/cwd", json!("/repo")),
+                    ("/environment_id", json!("container-a")),
+                    ("/requested_permission_profile", permission_profile.clone()),
+                    ("/requested_permissions/glob_scan_max_depth", json!(4)),
+                    ("/permission_grant_scope", json!("turn")),
+                    ("/strict_auto_review", json!(true)),
+                ],
+            },
+        ];
+
+        assert_eq!(APPROVAL_SCHEMA_MATRIX.len(), cases.len());
+        let mut descriptors = Vec::new();
+        for case in cases {
+            assert!(
+                APPROVAL_SCHEMA_MATRIX
+                    .iter()
+                    .any(|entry| entry.method == case.method),
+                "{} must be a declared schema variant",
+                case.name
+            );
+            let (descriptor, allowed) = ApprovalDescriptor::from_request(case.method, &case.params);
+            assert!(
+                allowed && descriptor.reviewable,
+                "{} must be allowable",
+                case.name
+            );
+            let descriptor = serde_json::to_value(descriptor).expect("descriptor JSON");
+            for (pointer, expected) in case.expected {
+                assert_eq!(
+                    descriptor.pointer(pointer),
+                    Some(&expected),
+                    "{} must expose {pointer} losslessly",
+                    case.name
+                );
+            }
+            descriptors.push((case.name, descriptor));
+        }
+
+        let patch_a = json!({
+            "callId": "call-1",
+            "conversationId": "thread-1",
+            "fileChanges": {
+                "/repo/update.rs": {
+                    "type": "update",
+                    "unified_diff": "@@ -1 +1 @@\\n-before\\n+after-a\\n"
+                }
+            }
+        });
+        let patch_b = json!({
+            "callId": "call-1",
+            "conversationId": "thread-1",
+            "fileChanges": {
+                "/repo/update.rs": {
+                    "type": "update",
+                    "unified_diff": "@@ -1 +1 @@\\n-before\\n+after-b\\n"
+                }
+            }
+        });
+        let (descriptor_a, allowed_a) =
+            ApprovalDescriptor::from_request("applyPatchApproval", &patch_a);
+        let (descriptor_b, allowed_b) =
+            ApprovalDescriptor::from_request("applyPatchApproval", &patch_b);
+        assert!(allowed_a && allowed_b);
+        assert_ne!(
+            serde_json::to_value(descriptor_a).expect("patch A descriptor"),
+            serde_json::to_value(descriptor_b).expect("patch B descriptor"),
+            "distinct patch payload bytes must not share an allowable descriptor"
+        );
+        assert!(
+            descriptors
+                .iter()
+                .any(|(name, _)| *name == "apply_patch_add_delete_update_and_move"),
+            "the table must cover the complete apply-patch union"
+        );
+
+        let deny_cases = [
+            (
+                "command persistent proposal",
+                "item/commandExecution/requestApproval",
+                json!({
+                    "command": "echo current-only",
+                    "proposedExecpolicyAmendment": ["echo *"]
+                }),
+            ),
+            (
+                "network policy proposal",
+                "item/commandExecution/requestApproval",
+                json!({
+                    "command": "curl https://registry.example",
+                    "proposedNetworkPolicyAmendments": [
+                        { "action": "allow", "host": "registry.example" }
+                    ]
+                }),
+            ),
+            (
+                "add without required content",
+                "applyPatchApproval",
+                json!({
+                    "fileChanges": { "/repo/add.rs": { "type": "add" } }
+                }),
+            ),
+            (
+                "update with unreviewed extension",
+                "applyPatchApproval",
+                json!({
+                    "fileChanges": {
+                        "/repo/update.rs": {
+                            "type": "update",
+                            "unified_diff": "@@ -1 +1 @@\\n-a\\n+b\\n",
+                            "extraAuthority": "hidden"
+                        }
+                    }
+                }),
+            ),
+            (
+                "patch content over bounded review budget",
+                "applyPatchApproval",
+                json!({
+                    "fileChanges": {
+                        "/repo/large.rs": {
+                            "type": "add",
+                            "content": "x".repeat(MAX_APPROVAL_PATCH_BYTES + 1)
+                        }
+                    }
+                }),
+            ),
+        ];
+        for (name, method, params) in deny_cases {
+            let (descriptor, allowed) = ApprovalDescriptor::from_request(method, &params);
+            assert!(
+                !allowed && !descriptor.reviewable,
+                "{name} must make Allow impossible"
+            );
+        }
     }
 
     /// T10: canonical 0.144.3 quota admission is fail-closed.  An available

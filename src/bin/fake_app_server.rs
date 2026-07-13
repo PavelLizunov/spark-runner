@@ -594,7 +594,7 @@ fn send_approval_request(
         "applyPatchApproval" => json!({
             "callId": "call-1",
             "conversationId": thread_id,
-            "fileChanges": { "/tmp/fake-file": { "type": "update", "unified_diff": "[suppressed fixture diff]" } },
+            "fileChanges": { "/tmp/fake-file": { "type": "update", "unified_diff": "@@ -0,0 +1 @@\n+deterministic fake patch\n" } },
             "reason": "deterministic fake patch",
         }),
         _ => json!({

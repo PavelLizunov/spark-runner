@@ -1958,10 +1958,14 @@ mod tests {
             // deny-only rather than silently invisible.
             command_arguments: Some(vec!["界".repeat(512); 16]),
             cwd: None,
+            environment_id: None,
+            network_approval: None,
             reason: None,
             file_changes: Vec::new(),
             requested_permissions: None,
             requested_permission_profile: None,
+            permission_grant_scope: None,
+            strict_auto_review: None,
         };
         let payload = approval_requested_payload(
             "approval_1",

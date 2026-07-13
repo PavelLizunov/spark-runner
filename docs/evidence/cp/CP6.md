@@ -1,8 +1,8 @@
 # CP6 — local HTTP/SSE adapter
 
-Status: **cycle 15 remediation gate-verified offline**. All evidence below is deterministic and offline: no OAuth, network request, credential value, or model turn was used.
+Status: **cycle 17 remediation gate-verified offline**. All evidence below is deterministic and offline: no OAuth, network request, credential value, or model turn was used.
 
-Code SHA evidence: `8aa051f9f2214883ad22ac7c2490090f08d69c3a` (`fix(cp6): harden auth approval and cancellation`). This evidence commit is separate metadata, not a claim that its own SHA is the code SHA.
+Historical cycle-13 code SHA evidence: `8aa051f9f2214883ad22ac7c2490090f08d69c3a` (`fix(cp6): harden auth approval and cancellation`). This evidence commit is separate metadata, not a claim that it is the current code SHA.
 
 ## Lifecycle root and executable coverage
 
@@ -14,7 +14,7 @@ Code SHA evidence: `8aa051f9f2214883ad22ac7c2490090f08d69c3a` (`fix(cp6): harden
 - Child-controlled approval identifiers are hashed to short opaque keys before SSE, SQLite, and duplicate tracking. Duplicate tracking, internal events, API retention, and SSE replay are bounded; executable oversized/repeated-child-ID coverage verifies no raw canary reaches durable state.
 - Reroute/auth/model/quota execution failures clear the owner readiness/model/quota snapshot. Token-file owner-only permissions, API capacity, replay, and retention coverage remain executable.
 - Live launch now requires the explicitly configured `SPARK_RUNNER_SUBSCRIPTION_AUTH_FILE`; it rejects absent, relative, symlinked, non-regular, or non-owner-only sources before spawn. The selected opaque handle alone is copied to the fresh `CODEX_HOME/auth.json` with `0600` permissions under its `0700` home. The child inherits neither the source path nor ambient Codex configuration, MCP configuration, or credential environment. Fake-canary coverage verifies this route and unsafe-mode rejection only; it does not inspect a real auth file.
-- `approval.requested` SSE events now carry a bounded, redacted, schema-aware descriptor for commands, file-change paths/types, cwd, reason, and requested permission summaries. Invalid permission profiles cannot be approved; a valid Allow returns exactly the validated in-flight profile, while Deny and Timeout return distinct fail-closed schema-valid responses.
+- `approval.requested` SSE events carry an explicit 0.144.3 schema-derived approval matrix. Every authority-bearing field is either copied losslessly into the authenticated owner descriptor or makes Allow impossible. This includes command environments and managed-network host/protocol, file-change session roots, exact add/delete content, exact update `unified_diff` and `move_path`, and the exact bounded permission profile plus this owner's fixed turn/strict-review response scope. Invalid permission profiles cannot be approved; a valid Allow returns exactly the validated in-flight profile, while Deny and Timeout return distinct fail-closed schema-valid responses.
 - Controlled cancellation now records execution interruption rather than completion before initialize/admission or before an irreversible write. A tracked JSONL flush boundary turns a control race after `thread/start` or `turn/start` delivery into a `delivery_ambiguous` durable incident and Unknown owner outcome; no synthetic interrupt is sent without both real identifiers. Deterministic fixture barriers cover all four phases without sleeps.
 
 ## Cycle 13 gates (code SHA above)
@@ -64,9 +64,10 @@ These durations are outer measurements from this exact serial run, rounded to mi
 This record is limited to the local offline run described below; it does not
 assert live app-server, account, credential, network, or model verification.
 
-- `applyPatchApproval` descriptors now expose an update's exact `move_path`.
+- `applyPatchApproval` descriptors exposed an update's exact `move_path`.
   A destination that would be redacted, truncated, or whitespace-normalized
-  is deny-only.
+  was deny-only. This cycle did **not** yet expose required add/delete content
+  or update `unified_diff`; cycle 17 corrects that incomplete approval review.
 - The runtime owner computes the complete `approval.requested` SSE event
   before adding its decision sender to the actionable approval map. If that
   exact event exceeds the replay-event limit, it sends an original-ID Deny
@@ -85,3 +86,35 @@ handoff JSON after it completes.
 - `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-16 cargo fmt --all -- --check` — exit 0; duration 0.2s.
 - `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-16 CARGO_NET_OFFLINE=true cargo test --locked --all-targets --all-features` — exit 0; duration 27.4s; 74 tests.
 - `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-16 CARGO_NET_OFFLINE=true cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0; duration 2.7s.
+
+## Cycle 17 schema-wide approval remediation
+
+This cycle is limited to deterministic local/offline code and fake fixtures;
+it does not claim live app-server, account, credential, OAuth, network, or
+model verification.
+
+- `src/client.rs` now declares a 0.144.3-derived matrix for every supported
+  request variant: command execution, legacy exec, apply-patch, file-change,
+  and permissions. The matrix identifies descriptor fields, persistent
+  proposals that this owner rejects rather than silently broadening, and
+  correlation/best-effort-only fields.
+- Add/delete `content` and update `unified_diff` are copied byte-for-byte into
+  the authenticated descriptor. Every accepted `FileChange` uses only its
+  schema variant's keys, so an extension cannot be silently omitted. The
+  aggregate patch-copy budget is 8 KiB and the pre-registration final SSE
+  event admission remains the authoritative size check; either limit makes
+  Allow impossible before a pending approval is actionable.
+- The table-driven regression covers all five variants, command environment
+  and network context, argv separation, patch add/delete/update/move fields,
+  permission special paths and `globScanMaxDepth`, fixed permission grant
+  scope, persistent proposals, malformed/oversized patches, and two distinct
+  update payloads that must serialize to distinct allowable descriptors.
+- Existing move-path, queued-control, event-size admission, and interrupt
+  delivery-ambiguity corrections remain covered by the full suite.
+
+## Cycle 17 serial gate measurements
+
+- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-17 cargo fmt --all -- --check` — exit 0; duration 0.6s.
+- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-17 CARGO_NET_OFFLINE=true cargo test --locked --all-targets --all-features` — exit 0; duration 28.7s; 75 tests.
+- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-17 CARGO_NET_OFFLINE=true cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0; duration 8.7s.
+- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-17 git diff --check` — exit 0; duration 0.1s.
