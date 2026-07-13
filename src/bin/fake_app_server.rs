@@ -115,6 +115,7 @@ fn main() -> io::Result<()> {
     let mut thread_counter: u64 = 0;
     let mut turn_counter: u64 = 0;
     let mut fault_pending = fake_mode.is_some();
+    let mut awaiting_initialized = false;
 
     while let Some(line) = lines.next() {
         let line = line?;
@@ -130,6 +131,17 @@ fn main() -> io::Result<()> {
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let params = request.get("params").cloned().unwrap_or(Value::Null);
 
+        if awaiting_initialized {
+            if method != "initialized" || request.get("id").is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "strict fixture expected initialized notification",
+                ));
+            }
+            awaiting_initialized = false;
+            continue;
+        }
+
         if fault_pending {
             fault_pending = false;
             if maybe_apply_fault(fake_mode.as_deref(), fail_marker.as_ref(), &mut stdout, id)? {
@@ -138,18 +150,40 @@ fn main() -> io::Result<()> {
         }
 
         match method {
-            "initialize" => send(
-                &mut stdout,
-                &json!({
+            "initialize" => {
+                send(
+                    &mut stdout,
+                    &json!({
                     "id": id,
                     "result": {
                         "serverInfo": { "name": "fake-codex-app-server", "version": "0.144.3" }
                     }
-                }),
-            )?,
-            "account/read" => send(
-                &mut stdout,
-                &json!({
+                    }),
+                )?;
+                awaiting_initialized = fake_mode.as_deref() == Some("strict_initialize");
+            }
+            "account/read" => {
+                // T11 fixture: a conforming server may need an owner answer
+                // before releasing an unrelated RPC response.
+                if fake_mode.as_deref() == Some("approval_during_account") {
+                    send_approval_request(
+                        &mut stdout,
+                        -9001,
+                        "bootstrap-thread",
+                        "bootstrap-turn",
+                    )?;
+                    let response = read_server_message(&mut lines)?;
+                    let decision = response
+                        .as_ref()
+                        .and_then(|value| value.pointer("/result/decision"))
+                        .and_then(Value::as_str);
+                    if decision != Some("accept") {
+                        return Ok(());
+                    }
+                }
+                send(
+                    &mut stdout,
+                    &json!({
                     "id": id,
                     "result": {
                         "account": {
@@ -159,8 +193,9 @@ fn main() -> io::Result<()> {
                         },
                         "requiresOpenaiAuth": false
                     }
-                }),
-            )?,
+                    }),
+                )?
+            }
             "model/list" => send(
                 &mut stdout,
                 &json!({
@@ -190,7 +225,7 @@ fn main() -> io::Result<()> {
                             "limitId": "codex",
                             "limitName": "Codex",
                             "planType": "pro",
-                            "primary": { "usedPercent": 0, "resetsAt": null, "windowDurationMins": null },
+                            "primary": { "usedPercent": if fake_mode.as_deref() == Some("quota_exhausted") { 100 } else { 0 }, "resetsAt": null, "windowDurationMins": null },
                             "secondary": null,
                             "credits": null,
                             "individualLimit": null,
@@ -201,7 +236,7 @@ fn main() -> io::Result<()> {
                                 "limitId": "codex",
                                 "limitName": "Codex",
                                 "planType": "pro",
-                                "primary": { "usedPercent": 0, "resetsAt": null, "windowDurationMins": null },
+                                "primary": { "usedPercent": if fake_mode.as_deref() == Some("quota_exhausted") { 100 } else { 0 }, "resetsAt": null, "windowDurationMins": null },
                                 "secondary": null,
                                 "credits": null,
                                 "individualLimit": null,
@@ -290,6 +325,16 @@ fn main() -> io::Result<()> {
                     stdout.flush()?;
                     continue;
                 }
+                if fake_mode.as_deref() == Some("model_rerouted") {
+                    send(
+                        &mut stdout,
+                        &json!({
+                            "method": "model/rerouted",
+                            "params": { "model": "gpt-unpinned-reroute" }
+                        }),
+                    )?;
+                    continue;
+                }
                 send(
                     &mut stdout,
                     &json!({
@@ -375,7 +420,7 @@ fn handle_approval_mode(
 
 fn send_approval_request(
     stdout: &mut impl Write,
-    id: u64,
+    id: i64,
     thread_id: &str,
     turn_id: &str,
 ) -> io::Result<()> {

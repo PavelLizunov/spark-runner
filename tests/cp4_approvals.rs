@@ -35,6 +35,24 @@ async fn owner_allow_approval_completes_turn() {
     );
 }
 
+/// T11: a signed-i64 server approval may arrive while account/read is still
+/// awaited. The same owner must answer it and continue the original RPC.
+#[tokio::test]
+async fn known_interleaved_approval_uses_owner_policy_and_preserves_i64_id() {
+    let args = vec![
+        "--fake-mode".to_string(),
+        "approval_during_account".to_string(),
+    ];
+    let summary =
+        run_doctor_with_fake_server_args_and_approval_policy(&args, ApprovalPolicy::AllowForTests)
+            .await
+            .expect("owner must answer the interleaved signed-i64 approval");
+    assert!(
+        summary.contains("turn_status=completed"),
+        "summary: {summary}"
+    );
+}
+
 #[tokio::test]
 async fn default_deny_approval_interrupts_and_fails_turn_closed() {
     let args = vec!["--approval-mode".to_string(), "deny".to_string()];

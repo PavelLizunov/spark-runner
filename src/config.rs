@@ -11,6 +11,7 @@ use serde::Deserialize;
 
 pub const DEFAULT_CODEX_LOCK: &str = "codex.lock";
 const EXPECTED_CODEX_TRANSPORT: &str = "stdio";
+const EXPECTED_CODEX_VERSION: &str = "0.144.3";
 const EXPECTED_CODEX_SCHEMA_PATH: &str =
     "protocol/0.144.3/codex_app_server_protocol.v2.schemas.json";
 const PLACEHOLDER_SCHEMA_HASH: &str = "generated-after-implementation";
@@ -110,6 +111,7 @@ impl CodexLock {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        validate_lock_field("version", EXPECTED_CODEX_VERSION, &self.version)?;
         validate_lock_field("transport", EXPECTED_CODEX_TRANSPORT, &self.transport)?;
         validate_lock_field(
             "required_model",
@@ -455,5 +457,37 @@ mod tests {
             CodexLock::load(std::path::Path::new(super::DEFAULT_CODEX_LOCK)).expect("checked lock");
         let verified = lock.verify_for_spawn().expect("matching native pin");
         assert_eq!(verified, std::fs::canonicalize(lock.native_path).unwrap());
+    }
+
+    /// T09: mutable lock metadata cannot downgrade platform, generated-schema,
+    /// or version assertions before a live process is admitted.
+    #[test]
+    fn platform_schema_and_version_mismatches_fail_closed() {
+        let lock =
+            CodexLock::load(std::path::Path::new(super::DEFAULT_CODEX_LOCK)).expect("checked lock");
+
+        let mut wrong_platform = lock.clone();
+        wrong_platform.platform = "definitely-not-this-host".to_string();
+        assert!(matches!(
+            wrong_platform.verify_for_spawn(),
+            Err(ConfigError::PlatformMismatch { .. })
+        ));
+
+        let mut wrong_schema = lock.clone();
+        wrong_schema.schema_hash = "0".repeat(64);
+        assert!(matches!(
+            wrong_schema.verify_for_spawn(),
+            Err(ConfigError::HashMismatch { kind: "schema", .. })
+        ));
+
+        let mut wrong_version = lock;
+        wrong_version.version = "0.0.0-not-codex".to_string();
+        assert!(matches!(
+            wrong_version.verify_for_spawn(),
+            Err(ConfigError::LockMismatch {
+                field: "version",
+                ..
+            })
+        ));
     }
 }

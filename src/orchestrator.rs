@@ -518,8 +518,13 @@ pub async fn run_turn_with_approval_policy_controlled(
             control = controls.recv() => match control {
                 Some(RuntimeControl::Interrupt(ack)) => {
                     // Both ids come from accepted 0.144.3 responses; do not
-                    // synthesize an interrupt for an unknown execution.
-                    let _ = client.turn_interrupt(&thread.thread_id, &turn_id).await;
+                    // synthesize a terminal state if delivery failed or its
+                    // result was rejected. That boundary is ambiguous and is
+                    // deliberately left recoverable as Unknown on restart.
+                    client
+                        .turn_interrupt(&thread.thread_id, &turn_id)
+                        .await
+                        .map_err(non_idempotent("turn/interrupt"))?;
                     append_journal(
                         journal.as_ref(),
                         JournalEvent::TurnCompleted {
@@ -549,18 +554,35 @@ pub async fn run_turn_with_approval_policy_controlled(
     }
     .await;
     append_internal_events(journal.as_ref(), &execution_id, client.internal_events()).await?;
-    append_journal(
-        journal.as_ref(),
-        JournalEvent::ExecutionCompleted {
-            execution_id: execution_id.clone(),
-            status: if result.is_ok() {
-                ExecutionTerminalStatus::Completed
-            } else {
-                ExecutionTerminalStatus::Failed
+    let ambiguous_delivery = matches!(
+        &result,
+        Err(AppError::Client(ClientError::AmbiguousNonIdempotent { .. }))
+    );
+    if ambiguous_delivery {
+        append_journal(
+            journal.as_ref(),
+            JournalEvent::Incident {
+                execution_id: Some(execution_id.clone()),
+                class: "delivery_ambiguous".to_string(),
+                message: "non-idempotent delivery outcome is unknown; recovery required"
+                    .to_string(),
             },
-        },
-    )
-    .await?;
+        )
+        .await?;
+    } else {
+        append_journal(
+            journal.as_ref(),
+            JournalEvent::ExecutionCompleted {
+                execution_id: execution_id.clone(),
+                status: if result.is_ok() {
+                    ExecutionTerminalStatus::Completed
+                } else {
+                    ExecutionTerminalStatus::Failed
+                },
+            },
+        )
+        .await?;
+    }
     let interrupt_ack = result.as_ref().ok().and_then(|(ack, _)| ack.as_ref());
     client.shutdown().await?;
     let _ = std::fs::remove_dir_all(&cwd);

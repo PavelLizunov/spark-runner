@@ -1,6 +1,6 @@
-# CP3: Resilient session — restart on protocol desync — LOCAL GREEN
+# CP3: Resilient session — restart on protocol desync — PARTIAL
 
-Status: **local gates green on `uap-build-1`**. Implementation is complete on the current CP3 working tree.
+Status: **partial**. Historical local gate evidence below remains valid for its stated revision, but CP3 is not implementation-complete: later CP6 review identified remaining runtime-owner and interleaved-request work.
 No live model run was needed or performed for this checkpoint; all evidence below is from deterministic,
 offline gates against the `fake_app_server` fixture.
 

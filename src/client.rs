@@ -52,6 +52,8 @@ pub enum ClientError {
     QuotaUnavailable,
     #[error("runtime turn deadline elapsed; execution cancelled")]
     TurnDeadlineExceeded,
+    #[error("app-server requested ChatGPT token refresh but the runtime owner has no bounded refresh response")]
+    AuthTokensRefreshUnavailable,
 }
 
 impl ClientError {
@@ -136,7 +138,23 @@ impl CodexClient {
     /// so every direct `CodexClient` caller observes the poison, not just
     /// the higher-level doctor/run orchestration.
     async fn rpc_call(&mut self, method: &str, params: Value) -> Result<Value, ClientError> {
-        match self.rpc.call(method, params).await {
+        // JsonlClient delegates server requests back to this owner even while
+        // an ordinary response is awaited. The cloned policy is an owner
+        // capability (the external channel leads to the authenticated API),
+        // never transport-side approval authority.
+        let rpc = &self.rpc;
+        let approval_policy = self.approval_policy.clone();
+        match rpc
+            .call_with_server_request_handler(method, params, move |message| {
+                let approval_policy = approval_policy.clone();
+                async move {
+                    Self::dispatch_server_request_during_call(rpc, &approval_policy, message)
+                        .await
+                        .map_err(|_| JsonlError::ServerRequestDuringCall)
+                }
+            })
+            .await
+        {
             Ok(value) => Ok(value),
             Err(error) => {
                 if error.is_desync() {
@@ -287,7 +305,7 @@ impl CodexClient {
 
             if let Some(method) = message.get("method").and_then(Value::as_str) {
                 if message.get("id").is_some() {
-                    self.handle_server_request(&message, method).await?;
+                    self.handle_server_request(&message).await?;
                     continue;
                 }
                 if method == "turn/completed" {
@@ -340,19 +358,46 @@ impl CodexClient {
         Ok(TurnCompleted { status })
     }
 
-    async fn handle_server_request(
-        &mut self,
+    async fn handle_server_request(&mut self, message: &Value) -> Result<(), ClientError> {
+        Self::handle_server_request_parts(
+            &self.rpc,
+            &mut self.state,
+            &self.approval_policy,
+            &mut self.seen_approvals,
+            message,
+        )
+        .await
+    }
+
+    async fn handle_server_request_parts(
+        rpc: &JsonlClient,
+        state: &mut SessionState,
+        approval_policy: &ApprovalPolicy,
+        seen_approvals: &mut HashSet<String>,
         message: &Value,
-        method: &str,
     ) -> Result<(), ClientError> {
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let id = message
             .get("id")
             .filter(is_request_id)
             .cloned()
             .ok_or(ClientError::MissingServerRequestId)?;
+        if method == "account/chatgptAuthTokens/refresh" {
+            // Tokens are deliberately not read from the environment or
+            // persisted.  A live owner may install a bounded provider in a
+            // later authenticated integration; absent one must fail closed
+            // after replying, never silently continue.
+            rpc.respond_error(id, -32000, "authentication refresh unavailable")
+                .await?;
+            state.poison();
+            return Err(ClientError::AuthTokensRefreshUnavailable);
+        }
         if !is_known_approval_method(method) {
-            let _ = self.rpc.respond_error(id, -32601, "method not found").await;
-            self.state.poison();
+            rpc.respond_error(id, -32601, "method not found").await?;
+            state.poison();
             return Err(ClientError::UnknownServerRequest {
                 method: method.to_string(),
             });
@@ -360,21 +405,18 @@ impl CodexClient {
 
         let params = message.get("params").unwrap_or(&Value::Null);
         let request_key = approval_request_key(method, &id, params);
-        if !self.seen_approvals.insert(request_key.clone()) {
-            let _ = self
-                .rpc
-                .respond(
-                    id.clone(),
-                    approval_response(method, ApprovalDecision::Deny),
-                )
-                .await;
-            self.state.poison();
+        if !seen_approvals.insert(request_key.clone()) {
+            rpc.respond(
+                id.clone(),
+                approval_response(method, ApprovalDecision::Deny),
+            )
+            .await?;
+            state.poison();
             return Err(ClientError::DuplicateApproval { request_key });
         }
 
-        self.state
-            .on_approval_requested(request_key.clone(), method.to_string())?;
-        let decision = match &self.approval_policy {
+        state.on_approval_requested(request_key.clone(), method.to_string())?;
+        let decision = match approval_policy {
             ApprovalPolicy::AllowForTests => ApprovalDecision::Allow,
             ApprovalPolicy::Deny => ApprovalDecision::Deny,
             ApprovalPolicy::External { pending, timeout } => {
@@ -394,15 +436,63 @@ impl CodexClient {
                 }
             }
         };
-        self.state.on_approval_decided(
+        state.on_approval_decided(
             request_key,
             method.to_string(),
             decision,
             ApprovalSource::Owner,
         )?;
-        self.rpc
-            .respond(id, approval_response(method, decision))
-            .await?;
+        rpc.respond(id, approval_response(method, decision)).await?;
+        Ok(())
+    }
+
+    async fn dispatch_server_request_during_call(
+        rpc: &JsonlClient,
+        approval_policy: &ApprovalPolicy,
+        message: Value,
+    ) -> Result<(), ClientError> {
+        let id = message
+            .get("id")
+            .filter(is_request_id)
+            .cloned()
+            .ok_or(ClientError::MissingServerRequestId)?;
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if method == "account/chatgptAuthTokens/refresh" {
+            rpc.respond_error(id, -32000, "authentication refresh unavailable")
+                .await?;
+            return Err(ClientError::AuthTokensRefreshUnavailable);
+        }
+        if !is_known_approval_method(method) {
+            rpc.respond_error(id, -32601, "method not found").await?;
+            return Err(ClientError::UnknownServerRequest {
+                method: method.to_string(),
+            });
+        }
+        let params = message.get("params").unwrap_or(&Value::Null);
+        let request_key = approval_request_key(method, &id, params);
+        let decision = match approval_policy {
+            ApprovalPolicy::AllowForTests => ApprovalDecision::Allow,
+            ApprovalPolicy::Deny => ApprovalDecision::Deny,
+            ApprovalPolicy::External { pending, timeout } => {
+                let (decision_tx, decision_rx) = oneshot::channel();
+                pending
+                    .send(PendingApproval {
+                        request_key,
+                        method: method.to_string(),
+                        decision: decision_tx,
+                    })
+                    .await
+                    .map_err(|_| ClientError::AuthTokensRefreshUnavailable)?;
+                match tokio::time::timeout(*timeout, decision_rx).await {
+                    Ok(Ok(decision)) => decision,
+                    Ok(Err(_)) | Err(_) => ApprovalDecision::Timeout,
+                }
+            }
+        };
+        rpc.respond(id, approval_response(method, decision)).await?;
         Ok(())
     }
 

@@ -17,7 +17,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-const STDERR_TAIL_BYTES: usize = 16 * 1024;
+pub const STDERR_TAIL_BYTES: usize = 16 * 1024;
 /// Upper bound on kill/wait and stderr-task join during shutdown, so cleanup
 /// can never hang even if a process-group kill somehow fails to land.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -198,6 +198,12 @@ impl ChildProcess {
     /// Sanitized-by-construction snapshot of the last stderr lines (no stdout/protocol content).
     pub async fn stderr_tail(&self) -> String {
         self.stderr_tail.lock().await.snapshot()
+    }
+
+    /// Testable bounded-retention metric. The bytes themselves are never
+    /// rendered into errors, journals, or logs.
+    pub async fn stderr_tail_len(&self) -> usize {
+        self.stderr_tail.lock().await.bytes.len()
     }
 
     /// Kill the whole process group (so native descendants die too), wait for

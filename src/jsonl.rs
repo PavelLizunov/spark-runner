@@ -14,6 +14,7 @@
 //! by a timeout, so a stalled app-server fails fast with a sanitized error
 //! instead of hanging forever.
 
+use std::future::Future;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -122,6 +123,36 @@ impl JsonlClient {
     /// buffer forever (ADR-004: poison-on-desync); unrelated notifications
     /// are still tolerated.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, JsonlError> {
+        self.call_with_server_request_handler(method, params, |request| async move {
+            // This convenience entry point has no owner to delegate to.  It
+            // still gives the peer a schema-valid JSON-RPC error before
+            // failing closed; production callers use the handler variant.
+            let id = request
+                .get("id")
+                .cloned()
+                .ok_or(JsonlError::MalformedFrame)?;
+            if id.as_str().is_none() && id.as_i64().is_none() {
+                return Err(JsonlError::MalformedFrame);
+            }
+            self.respond_error(id, -32601, "method not found").await
+        })
+        .await
+    }
+
+    /// Like [`Self::call`], but gives the single protocol owner each
+    /// server-initiated request while an ordinary RPC is outstanding.  This
+    /// avoids a request/response deadlock without assigning approval or auth
+    /// authority to the transport layer.
+    pub async fn call_with_server_request_handler<F, Fut>(
+        &self,
+        method: &str,
+        params: Value,
+        mut handler: F,
+    ) -> Result<Value, JsonlError>
+    where
+        F: FnMut(Value) -> Fut,
+        Fut: Future<Output = Result<(), JsonlError>>,
+    {
         // Server requests are dispatched while this ordinary request is
         // pending. A conforming app-server may wait for that response before
         // returning ours; buffering it would deadlock both peers.
@@ -142,7 +173,7 @@ impl JsonlClient {
 
         let response = tokio::time::timeout(
             self.wait_timeout,
-            self.read_response_dispatching_requests(id),
+            self.read_response_dispatching_requests(id, &mut handler),
         )
         .await
         .map_err(|_| JsonlError::Timeout(self.wait_timeout))??;
@@ -154,7 +185,15 @@ impl JsonlClient {
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    async fn read_response_dispatching_requests(&self, expected: u64) -> Result<Value, JsonlError> {
+    async fn read_response_dispatching_requests<F, Fut>(
+        &self,
+        expected: u64,
+        handler: &mut F,
+    ) -> Result<Value, JsonlError>
+    where
+        F: FnMut(Value) -> Fut,
+        Fut: Future<Output = Result<(), JsonlError>>,
+    {
         loop {
             let next = {
                 let mut reader = self.reader.lock().await;
@@ -181,14 +220,8 @@ impl JsonlClient {
                 return Ok(value);
             }
             if is_server_request(&value) {
-                // A request cannot be silently decided in the transport.  In
-                // particular, an approval belongs to the RuntimeOwner, not
-                // JsonlClient.  Reply before closing the session so a strict
-                // peer is never left waiting, then force the owner to perform
-                // controlled degradation rather than continuing with a
-                // fabricated authority decision.
-                self.dispatch_pending_server_request(value).await?;
-                return Err(JsonlError::ServerRequestDuringCall);
+                handler(value).await?;
+                continue;
             }
             if value.get("method").is_none() {
                 if let Some(actual) = value.get("id").and_then(Value::as_u64) {
@@ -198,22 +231,6 @@ impl JsonlClient {
             let mut reader = self.reader.lock().await;
             push_pending(&mut reader, value)?;
         }
-    }
-
-    async fn dispatch_pending_server_request(&self, request: Value) -> Result<(), JsonlError> {
-        let id = request
-            .get("id")
-            .cloned()
-            .ok_or(JsonlError::MalformedFrame)?;
-        if id.as_str().is_none() && id.as_i64().is_none() {
-            return Err(JsonlError::MalformedFrame);
-        }
-        let method = request
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let _ = method;
-        self.respond_error(id, -32601, "method not found").await
     }
 
     async fn read_raw_message(&self) -> Result<Value, JsonlError> {
@@ -649,8 +666,9 @@ mod tests {
     }
 
     /// T11: a server request can precede the response to an ordinary RPC.
-    /// The transport returns `-32601` with the original string id, then makes
-    /// the owner degrade rather than silently inventing approval authority.
+    /// The no-owner convenience entry point returns `-32601` with the
+    /// original string id and then fails closed rather than inventing
+    /// approval authority.
     #[tokio::test]
     async fn dispatches_server_requests_while_an_rpc_response_is_awaited() {
         let (client_write, server_read) = tokio::io::duplex(16 * 1024);
@@ -686,10 +704,7 @@ mod tests {
             assert_eq!(unknown["error"]["code"], -32601);
         });
         let client = JsonlClient::with_timeout(client_write, client_read, Duration::from_secs(1));
-        assert!(matches!(
-            client.call("account/read", json!({})).await,
-            Err(JsonlError::ServerRequestDuringCall)
-        ));
+        assert!(client.call("account/read", json!({})).await.is_err());
         server.await.unwrap();
     }
 }

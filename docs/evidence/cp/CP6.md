@@ -1,20 +1,28 @@
 # CP6 — local HTTP/SSE adapter
 
-Status: **partial/active**. This evidence covers deterministic offline proof only; no live OAuth, network request, credential, or model turn was performed.
+Status: **partial/active**. All evidence below is deterministic and offline: no OAuth, network request, credential value, or model turn was used.
 
-Current controls include loopback-only binding, mandatory bearer authentication, bounded request bodies and SSE replay, a compact API rejection type, initialized handshake notification, byte-bounded JSONL and stderr retention, curated child environment, live-turn admission checks, and append-only journal events with independently expiring captures.
+Cycle-seven code/tree evidence is the commit created from this tree; it is intentionally not stated here because a markdown file cannot contain its own final commit SHA. Reviewer/release SHA remains external verification.
 
-Cycle-two remediation additionally verifies the actual executable/schema bytes and platform before live spawn, rejects stale terminal transitions, requires an authenticated API approval before the offline fixture proceeds, cancels the owned task on interrupt, migrates legacy expiring captures, and projects recovery before work is admitted. CP6 remains partial until a live pinned runtime is available and the HTTP adapter is fully backed by its runtime owner.
+## Executable coverage
 
-Cycle-six executable remediation commit: `f12798dab310f6faf099a51b84695b0f4484322c`.
+- T01: interrupt path sends `turn/interrupt` with accepted identifiers, checks delivery, cleans up before acknowledgement, and has a terminal-once HTTP regression.
+- T02/T03: genuine approval decisions and timeout remain fail-closed; T03 does not yet exercise a dropped controlling SSE lease.
+- T04: unadmitted live mode rejects before the offline launcher can run.
+- T05/T06: post-delivery ambiguity is not replayed; oversized newline-free frames fail closed.
+- T07: executable long-line and many-line stderr fixture proves byte retention is capped and diagnostics disclose only counts.
+- T08: executable ambient-secret canary proves curated child environment and 0700 private `CODEX_HOME`.
+- T09: executable native/schema/platform/version/symlink mismatch checks fail before live spawn.
+- T10: executable exhausted quota and post-admission model reroute fixtures fail closed.
+- T11: strict `initialize` then `initialized`, signed-i64 interleaved approval delegation, and unknown string-ID `-32601` response are covered. ChatGPT token refresh absence returns a deterministic bounded error without reading or persisting secret values.
+- T12: durable, idempotent startup recovery remains covered.
 
-- `cargo fmt --all -- --check` — exit 0.
-- `CARGO_NET_OFFLINE=true cargo test --locked --all-targets --all-features` — exit 0; deterministic offline suite passed.
-- `CARGO_NET_OFFLINE=true cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0.
-- `git diff --check` — exit 0.
+## Cycle-seven gates
 
-This cycle parses the generated 0.144.3 account (`account.type`), rate-limit (`rateLimits` / `rateLimitsByLimitId`, `rateLimitReachedType`, and `usedPercent`), and turn (`turn.id`) envelopes. The offline fixture emits those canonical shapes. Quota admission now rejects exhausted primary windows, reached types, depleted credits, and malformed snapshots. Interleaved unknown server requests preserve string/signed-i64 IDs, receive `-32601`, and force controlled degradation instead of a transport-level approval decision.
+- `CARGO_NET_OFFLINE=true cargo test --locked --all-targets --all-features` — exit 0, 22.102s (52 tests).
+- `CARGO_NET_OFFLINE=true cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0, 1.343s.
+- `cargo fmt --all -- --check` and `git diff --check` are recorded with the final tree verification.
 
-The HTTP adapter sends interrupt through the runtime execution command channel. The execution owns the real `CodexClient`, sends generated-schema-valid `turn/interrupt` with accepted `threadId` and `turnId`, appends an interrupted terminal journal record, reaps the process group, then acknowledges the API so admission is released only after cleanup. Timeout closure emits one fail-closed approval decision and one terminal turn event; SSE aggregate eviction updates global and per-turn retained byte counts together.
+## Remaining risk
 
-Remaining risks: live startup admission is intentionally fail-closed until an authenticated pinned runtime session is supplied; this offline suite cannot prove live OAuth behavior. SSE controller-disconnect ownership is not separately exercised; terminal, explicit deny, timeout, and interrupt closure are covered. No live OAuth, network access, credentials, or model turn was used.
+The HTTP adapter still has local projection state rather than a fully persistent actor command loop, live admission is fail-closed until a real authenticated session is supplied, and controlling-SSE disconnect ownership lacks the required executable lease/drop test. No claim of live OAuth or production model execution is made.
