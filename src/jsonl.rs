@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 /// Default bound for a single response/notification wait. Generous enough for
@@ -31,6 +31,8 @@ const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// against an unbounded or corrupted frame instead of buffering it
 /// indefinitely; the frame content itself is never logged.
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
+const MAX_PENDING_MESSAGES: usize = 128;
+const MAX_PENDING_BYTES: usize = 2 * MAX_FRAME_LEN;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JsonlError {
@@ -75,6 +77,7 @@ impl JsonlError {
 struct ReaderState {
     stdout: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
     pending: Vec<Value>,
+    pending_bytes: usize,
 }
 
 pub struct JsonlClient {
@@ -102,6 +105,7 @@ impl JsonlClient {
             reader: Mutex::new(ReaderState {
                 stdout: BufReader::new(Box::new(stdout)),
                 pending: Vec::new(),
+                pending_bytes: 0,
             }),
             next_id: AtomicU64::new(1),
             wait_timeout,
@@ -166,6 +170,20 @@ impl JsonlClient {
         Ok(())
     }
 
+    /// Send a JSON-RPC notification. The stable protocol requires this
+    /// immediately after a successful initialize response.
+    pub async fn notify(&self, method: &str, params: Value) -> Result<(), JsonlError> {
+        let line = serde_json::to_string(&serde_json::json!({
+            "method": method,
+            "params": params,
+        }))?;
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
     /// Read the next protocol message, first draining messages buffered while
     /// another wait was in progress. This is used by the single owner task
     /// that must handle app-server approval requests interleaved with turn
@@ -194,22 +212,15 @@ impl JsonlClient {
         }
 
         loop {
-            let mut line = String::new();
-            let bytes_read = reader.stdout.read_line(&mut line).await?;
-            if bytes_read == 0 {
+            let Some(line) = read_bounded_frame(&mut reader.stdout).await? else {
                 return Err(JsonlError::StreamClosed);
-            }
-            if bytes_read > MAX_FRAME_LEN {
-                return Err(JsonlError::OversizedFrame {
-                    limit: MAX_FRAME_LEN,
-                });
-            }
-            let trimmed = line.trim();
+            };
+            let trimmed = trim_ascii(&line);
             if trimmed.is_empty() {
                 continue;
             }
             let value: Value =
-                serde_json::from_str(trimmed).map_err(|_| JsonlError::MalformedFrame)?;
+                serde_json::from_slice(trimmed).map_err(|_| JsonlError::MalformedFrame)?;
 
             if target.matches(&value) {
                 return Ok(value);
@@ -237,7 +248,7 @@ impl JsonlClient {
                 has_id = value.get("id").is_some(),
                 "buffering unrelated message while waiting"
             );
-            reader.pending.push(value);
+            push_pending(&mut reader, value)?;
         }
     }
 
@@ -248,23 +259,68 @@ impl JsonlClient {
         }
 
         loop {
-            let mut line = String::new();
-            let bytes_read = reader.stdout.read_line(&mut line).await?;
-            if bytes_read == 0 {
+            let Some(line) = read_bounded_frame(&mut reader.stdout).await? else {
                 return Err(JsonlError::StreamClosed);
-            }
-            if bytes_read > MAX_FRAME_LEN {
-                return Err(JsonlError::OversizedFrame {
-                    limit: MAX_FRAME_LEN,
-                });
-            }
-            let trimmed = line.trim();
+            };
+            let trimmed = trim_ascii(&line);
             if trimmed.is_empty() {
                 continue;
             }
-            return serde_json::from_str(trimmed).map_err(|_| JsonlError::MalformedFrame);
+            return serde_json::from_slice(trimmed).map_err(|_| JsonlError::MalformedFrame);
         }
     }
+}
+
+async fn read_bounded_frame(
+    reader: &mut BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+) -> Result<Option<Vec<u8>>, JsonlError> {
+    let mut frame = Vec::with_capacity(1024);
+    loop {
+        let mut byte = [0_u8; 1];
+        let read = reader.read(&mut byte).await?;
+        if read == 0 {
+            return if frame.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(frame))
+            };
+        }
+        if frame.len() == MAX_FRAME_LEN {
+            return Err(JsonlError::OversizedFrame {
+                limit: MAX_FRAME_LEN,
+            });
+        }
+        frame.push(byte[0]);
+        if byte[0] == b'\n' {
+            return Ok(Some(frame));
+        }
+    }
+}
+
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &bytes[start..end]
+}
+
+fn push_pending(reader: &mut ReaderState, value: Value) -> Result<(), JsonlError> {
+    let bytes = serde_json::to_vec(&value)?.len();
+    if reader.pending.len() == MAX_PENDING_MESSAGES
+        || reader.pending_bytes.saturating_add(bytes) > MAX_PENDING_BYTES
+    {
+        return Err(JsonlError::OversizedFrame {
+            limit: MAX_PENDING_BYTES,
+        });
+    }
+    reader.pending_bytes += bytes;
+    reader.pending.push(value);
+    Ok(())
 }
 
 /// What a given wait is looking for: a response with a specific id, or a

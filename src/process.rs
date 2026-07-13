@@ -12,12 +12,12 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-const STDERR_TAIL_LINES: usize = 200;
+const STDERR_TAIL_BYTES: usize = 16 * 1024;
 /// Upper bound on kill/wait and stderr-task join during shutdown, so cleanup
 /// can never hang even if a process-group kill somehow fails to land.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -53,6 +53,51 @@ mod unix {
     }
 }
 
+#[derive(Debug, Default)]
+struct StderrTail {
+    bytes: VecDeque<u8>,
+    total_seen: usize,
+}
+
+impl StderrTail {
+    fn push(&mut self, chunk: &[u8]) {
+        self.total_seen = self.total_seen.saturating_add(chunk.len());
+        for byte in chunk {
+            if self.bytes.len() == STDERR_TAIL_BYTES {
+                self.bytes.pop_front();
+            }
+            self.bytes.push_back(*byte);
+        }
+    }
+
+    fn snapshot(&self) -> String {
+        // Child stderr is untrusted. Do not render it into logs, journals, or
+        // public errors; retain only bounded diagnostic metadata.
+        format!("stderr_bytes_seen={}", self.total_seen)
+    }
+}
+
+fn configure_environment(command: &mut Command, cwd: Option<&Path>) -> Result<(), ProcessError> {
+    command.env_clear();
+    for name in ["LANG", "LC_ALL", "TZ"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    if let Some(dir) = cwd {
+        let codex_home = dir.join("codex-home");
+        std::fs::create_dir_all(&codex_home).map_err(ProcessError::CodexHome)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o700))
+                .map_err(ProcessError::CodexHome)?;
+        }
+        command.env("CODEX_HOME", codex_home);
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessError {
     #[error("failed to spawn {program}: {source}")]
@@ -61,26 +106,10 @@ pub enum ProcessError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to prepare private CODEX_HOME: {0}")]
+    CodexHome(std::io::Error),
     #[error("child process did not expose a piped {0} handle")]
     MissingHandle(&'static str),
-}
-
-#[derive(Debug, Default)]
-struct StderrTail {
-    lines: VecDeque<String>,
-}
-
-impl StderrTail {
-    fn push(&mut self, line: String) {
-        if self.lines.len() >= STDERR_TAIL_LINES {
-            self.lines.pop_front();
-        }
-        self.lines.push_back(line);
-    }
-
-    fn snapshot(&self) -> String {
-        self.lines.iter().cloned().collect::<Vec<_>>().join("\n")
-    }
 }
 
 pub struct SpawnedChild {
@@ -110,6 +139,7 @@ impl ChildProcess {
         if let Some(dir) = cwd {
             command.current_dir(dir);
         }
+        configure_environment(&mut command, cwd)?;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -142,9 +172,13 @@ impl ChildProcess {
         let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
         let tail_for_task = Arc::clone(&stderr_tail);
         let stderr_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tail_for_task.lock().await.push(line);
+            let mut stderr = BufReader::new(stderr);
+            let mut chunk = [0_u8; 1024];
+            while let Ok(read) = stderr.read(&mut chunk).await {
+                if read == 0 {
+                    break;
+                }
+                tail_for_task.lock().await.push(&chunk[..read]);
             }
         });
 

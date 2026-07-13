@@ -10,9 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
-
-use crate::client::{ApprovalPolicy, ClientError, CodexClient, REQUIRED_MODEL};
+use crate::client::{ApprovalPolicy, ClientError, CodexClient};
 use crate::config::{self, CodexLock, ConfigError, DEFAULT_CODEX_LOCK};
 use crate::journal::{
     ApprovalTerminalDecision, ExecutionTerminalStatus, JournalConfig, JournalEvent, JournalWriter,
@@ -34,6 +32,8 @@ pub enum AppError {
     Client(#[from] ClientError),
     #[error(transparent)]
     Journal(#[from] crate::journal::JournalError),
+    #[error(transparent)]
+    Api(#[from] crate::api::ApiError),
 }
 
 impl AppError {
@@ -71,7 +71,7 @@ async fn spawn_client(
 ) -> Result<(CodexClient, PathBuf), AppError> {
     let (program, args) = launch_spec(live, fake_server_args)?;
     let cwd = config::ephemeral_cwd()?;
-    let spawned = ChildProcess::spawn(&program, &args, None)?;
+    let spawned = ChildProcess::spawn(&program, &args, Some(&cwd))?;
     let client = CodexClient::with_approval_policy(
         spawned.process,
         spawned.stdin,
@@ -79,19 +79,6 @@ async fn spawn_client(
         approval_policy,
     );
     Ok((client, cwd))
-}
-
-fn model_list_has_required_model(model_list: &Value) -> bool {
-    model_list
-        .get("data")
-        .or_else(|| model_list.get("models"))
-        .and_then(Value::as_array)
-        .map(|models| {
-            models
-                .iter()
-                .any(|model| model.get("id").and_then(Value::as_str) == Some(REQUIRED_MODEL))
-        })
-        .unwrap_or(false)
 }
 
 fn mode_label(live: bool) -> &'static str {
@@ -113,15 +100,7 @@ async fn run_flow_body(
     match flow {
         Flow::Doctor => {
             client.initialize().await?;
-            client.account_read().await?;
-            let model_list = client.model_list().await?;
-            if !model_list_has_required_model(&model_list) {
-                return Err(AppError::Client(ClientError::FallbackModel {
-                    observed: "missing-from-model-list".to_string(),
-                    required: REQUIRED_MODEL,
-                }));
-            }
-            let rate_limits = client.rate_limits_read().await?;
+            let rate_limits = client.admit_live_turn().await?;
             append_journal(
                 journal,
                 JournalEvent::RateLimitSnapshot {
@@ -156,7 +135,8 @@ async fn run_flow_body(
             if client.is_poisoned() {
                 return Err(AppError::Client(ClientError::SessionPoisoned));
             }
-            tracing::debug!(stderr_tail = %client.stderr_tail().await, "app-server stderr tail (diagnostic only)");
+            let stderr_tail = client.stderr_tail().await;
+            tracing::debug!(stderr_tail = %stderr_tail, "app-server stderr tail (diagnostic only)");
 
             Ok(format!(
                 "doctor: ok mode={} model={} turn_status={}",
@@ -167,6 +147,15 @@ async fn run_flow_body(
         }
         Flow::Run(prompt) => {
             client.initialize().await?;
+            let rate_limits = client.admit_live_turn().await?;
+            append_journal(
+                journal,
+                JournalEvent::RateLimitSnapshot {
+                    execution_id: execution_id.to_string(),
+                    snapshot: rate_limits,
+                },
+            )
+            .await?;
             let thread = client.thread_start(cwd).await?;
             let turn_id = client.turn_start(&thread.thread_id, prompt).await?;
             append_journal(
@@ -190,7 +179,8 @@ async fn run_flow_body(
             if client.is_poisoned() {
                 return Err(AppError::Client(ClientError::SessionPoisoned));
             }
-            tracing::debug!(stderr_tail = %client.stderr_tail().await, "app-server stderr tail (diagnostic only)");
+            let stderr_tail = client.stderr_tail().await;
+            tracing::debug!(stderr_tail = %stderr_tail, "app-server stderr tail (diagnostic only)");
 
             Ok(format!(
                 "run: mode={} model={} turn_status={}",
@@ -380,6 +370,17 @@ pub async fn run_doctor(live: bool) -> Result<String, AppError> {
 
 pub async fn run_turn(prompt: String, live: bool) -> Result<String, AppError> {
     run_with_restart(Flow::Run(prompt), live, &[], ApprovalPolicy::Deny).await
+}
+
+/// Test-support/API entry point for the offline fake app-server only: same as
+/// [`run_turn`], but passes deterministic fake-server args and approval policy
+/// through the existing runtime/client path.
+pub async fn run_turn_with_fake_server_args_and_approval_policy(
+    prompt: String,
+    fake_server_args: &[String],
+    approval_policy: ApprovalPolicy,
+) -> Result<String, AppError> {
+    run_with_restart(Flow::Run(prompt), false, fake_server_args, approval_policy).await
 }
 
 /// Test-support entry point for the offline fake app-server only: same as

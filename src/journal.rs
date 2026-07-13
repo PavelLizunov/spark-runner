@@ -332,7 +332,14 @@ fn prepare_connection(connection: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_journal_events_execution ON journal_events(execution_id, id);
         CREATE INDEX IF NOT EXISTS idx_journal_events_approval ON journal_events(approval_key, id);
-        CREATE INDEX IF NOT EXISTS idx_journal_events_expiry ON journal_events(expires_at_ms);",
+        CREATE TABLE IF NOT EXISTS journal_captures (
+            event_id INTEGER NOT NULL REFERENCES journal_events(id),
+            kind TEXT NOT NULL,
+            data TEXT NOT NULL,
+            expires_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(event_id, kind)
+        );
+        CREATE INDEX IF NOT EXISTS idx_journal_captures_expiry ON journal_captures(expires_at_ms);",
     )
 }
 
@@ -345,33 +352,30 @@ fn append_record(
     let mut payload = serde_json::to_value(&record.event)?;
     redact_value(&mut payload);
     let payload_json = serde_json::to_string(&payload)?;
-    let terminal_output = record
-        .terminal_output
-        .zip(config.terminal_output_ttl)
-        .map(|(output, _)| redact_string(&output));
-    let raw_capture_json = match (record.raw_capture, config.raw_capture_ttl) {
-        (Some(mut raw), Some(_)) => {
-            redact_value(&mut raw);
-            Some(serde_json::to_string(&raw)?)
-        }
-        _ => None,
-    };
-    let expires_at_ms = [config.terminal_output_ttl, config.raw_capture_ttl]
-        .into_iter()
-        .flatten()
-        .min()
-        .map(|ttl| now.saturating_add(duration_ms(ttl)));
-
     connection.execute(
         "INSERT INTO journal_events (created_at_ms, event_type, execution_id, turn_id, approval_key, payload_json, terminal_output, raw_capture_json, expires_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![now, record.event.event_type(), record.event.execution_id(), record.event.turn_id(), record.event.approval_key(), payload_json, terminal_output, raw_capture_json, expires_at_ms],
+        params![now, record.event.event_type(), record.event.execution_id(), record.event.turn_id(), record.event.approval_key(), payload_json, Option::<String>::None, Option::<String>::None, Option::<i64>::None],
     )?;
+    let event_id = connection.last_insert_rowid();
+    if let (Some(output), Some(ttl)) = (record.terminal_output, config.terminal_output_ttl) {
+        connection.execute(
+            "INSERT INTO journal_captures (event_id, kind, data, expires_at_ms) VALUES (?1, 'terminal_output', ?2, ?3)",
+            params![event_id, redact_string(&output), now.saturating_add(duration_ms(ttl))],
+        )?;
+    }
+    if let (Some(mut raw), Some(ttl)) = (record.raw_capture, config.raw_capture_ttl) {
+        redact_value(&mut raw);
+        connection.execute(
+            "INSERT INTO journal_captures (event_id, kind, data, expires_at_ms) VALUES (?1, 'raw_capture', ?2, ?3)",
+            params![event_id, serde_json::to_string(&raw)?, now.saturating_add(duration_ms(ttl))],
+        )?;
+    }
     Ok(())
 }
 
 fn prune_expired(connection: &Connection) -> JournalResult<usize> {
     Ok(connection.execute(
-        "DELETE FROM journal_events WHERE expires_at_ms IS NOT NULL AND expires_at_ms <= ?1",
+        "DELETE FROM journal_captures WHERE expires_at_ms <= ?1",
         params![now_ms()],
     )?)
 }

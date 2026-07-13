@@ -193,21 +193,33 @@ async fn opt_in_capture_is_redacted_and_pruned_by_ttl() {
         .unwrap();
 
     let connection = Connection::open(&path).unwrap();
-    let (terminal_output, raw_capture): (Option<String>, Option<String>) = connection
+    let terminal_output: String = connection
         .query_row(
-            "SELECT terminal_output, raw_capture_json FROM journal_events LIMIT 1",
+            "SELECT data FROM journal_captures WHERE kind = 'terminal_output'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
         .unwrap();
-    let terminal_output = terminal_output.expect("terminal output persisted by opt-in TTL");
-    let raw_capture = raw_capture.expect("raw capture persisted by opt-in TTL");
+    let raw_capture: String = connection
+        .query_row(
+            "SELECT data FROM journal_captures WHERE kind = 'raw_capture'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(!terminal_output.contains("sk-terminal-secret"));
     assert!(!raw_capture.contains("sk-raw-secret"));
 
     tokio::time::sleep(Duration::from_millis(5)).await;
     let pruned = writer.prune_expired().await.unwrap();
-    assert_eq!(pruned, 1);
+    assert_eq!(pruned, 2);
+    let remaining_events: i64 = connection
+        .query_row("SELECT COUNT(*) FROM journal_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        remaining_events, 1,
+        "core audit event must remain append-only"
+    );
     writer.shutdown().await.unwrap();
     let _ = std::fs::remove_file(&path);
 }

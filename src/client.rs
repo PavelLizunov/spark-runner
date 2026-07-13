@@ -40,6 +40,10 @@ pub enum ClientError {
     UnexpectedResponseWhileWaiting { id: u64 },
     #[error("protocol desync after an approval boundary; restart denied fail-closed")]
     UnresolvedApprovalRestart,
+    #[error("app-server account is not authenticated through the ChatGPT route")]
+    ChatGptAuthRequired,
+    #[error("app-server rate-limit response has no remaining quota")]
+    QuotaUnavailable,
 }
 
 impl ClientError {
@@ -119,16 +123,19 @@ impl CodexClient {
     }
 
     pub async fn initialize(&mut self) -> Result<Value, ClientError> {
-        self.rpc_call(
-            "initialize",
-            json!({
-                "clientInfo": {
-                    "name": "spark-runner",
-                    "version": env!("CARGO_PKG_VERSION"),
-                }
-            }),
-        )
-        .await
+        let initialized = self
+            .rpc_call(
+                "initialize",
+                json!({
+                    "clientInfo": {
+                        "name": "spark-runner",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    }
+                }),
+            )
+            .await?;
+        self.rpc.notify("initialized", json!({})).await?;
+        Ok(initialized)
     }
 
     pub async fn account_read(&mut self) -> Result<Value, ClientError> {
@@ -141,6 +148,49 @@ impl CodexClient {
 
     pub async fn rate_limits_read(&mut self) -> Result<Value, ClientError> {
         self.rpc_call("account/rateLimits/read", json!({})).await
+    }
+
+    /// Admission checks shared by every live turn. They run before the first
+    /// non-idempotent request, so a bad account/model/quota state consumes no
+    /// turn or approval capacity.
+    pub async fn admit_live_turn(&mut self) -> Result<Value, ClientError> {
+        let account = self.account_read().await?;
+        if account.get("accountType").and_then(Value::as_str) != Some("chatgpt") {
+            return Err(ClientError::ChatGptAuthRequired);
+        }
+        let models = self.model_list().await?;
+        let has_required_model = models
+            .get("data")
+            .or_else(|| models.get("models"))
+            .and_then(Value::as_array)
+            .is_some_and(|models| {
+                models
+                    .iter()
+                    .any(|model| model.get("id").and_then(Value::as_str) == Some(REQUIRED_MODEL))
+            });
+        if !has_required_model {
+            return Err(ClientError::FallbackModel {
+                observed: "missing-from-model-list".to_string(),
+                required: REQUIRED_MODEL,
+            });
+        }
+        let rate_limits = self.rate_limits_read().await?;
+        let has_quota = rate_limits
+            .pointer("/limits")
+            .and_then(Value::as_array)
+            .is_some_and(|limits| {
+                limits.iter().any(|limit| {
+                    limit
+                        .get("remaining")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default()
+                        > 0
+                })
+            });
+        if !has_quota {
+            return Err(ClientError::QuotaUnavailable);
+        }
+        Ok(rate_limits)
     }
 
     /// Start an ephemeral, read-only, on-request-approval thread pinned to

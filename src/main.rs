@@ -2,6 +2,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+use spark_runner::api::{serve, ApiConfig};
 use spark_runner::config::{Cli, Command};
 use spark_runner::orchestrator::{run_doctor, run_turn};
 
@@ -12,6 +13,13 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Command::Doctor { live } => run_doctor(live).await,
         Command::Run { prompt, live } => run_turn(prompt, live).await,
+        Command::Serve { live } => match ApiConfig::from_env(live) {
+            Ok(config) => serve(config)
+                .await
+                .map(|addr| format!("serve: listening on {addr}"))
+                .map_err(Into::into),
+            Err(err) => Err(err.into()),
+        },
     };
     match result {
         Ok(summary) => {

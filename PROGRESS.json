@@ -4,20 +4,14 @@
   "current_checkpoint": "CP6",
   "previous_checkpoint": "CP5",
   "state": "active",
-  "completed_checkpoints": [
-    "CP1",
-    "CP2",
-    "CP3",
-    "CP4",
-    "CP5"
-  ],
+  "completed_checkpoints": [],
   "blocker": null,
-  "updated_at": "2026-07-13T05:34:19Z",
-  "next_command": "Open CP6 after CP5 PR #5 is pushed, CI is green, PR #5 is squash merged, main is confirmed, and the CP5 branch is cleaned up.",
+  "updated_at": "2026-07-13T12:55:00Z",
+  "next_command": "Run the locked offline all-targets/all-features verification gates before recording a checkpoint as green.",
   "checkpoints": {
     "CP1": {
       "name": "Phase 0 bootstrap: raw app-server + Python SDK oracle",
-      "state": "green",
+      "state": "partial",
       "started_at": "2026-07-12T22:59:38Z",
       "completed_at": "2026-07-12T23:00:00Z",
       "evidence_file": "docs/evidence/cp/CP1.md",
@@ -43,36 +37,36 @@
     },
     "CP2": {
       "name": "Minimal Rust runner: app-server client + one full turn",
-      "state": "green",
+      "state": "partial",
       "started_at": "2026-07-12T23:45:00Z",
       "completed_at": "2026-07-13T02:09:24Z",
       "evidence_file": "docs/evidence/cp/CP2.md"
     },
     "CP3": {
       "name": "Resilient session: poison-on-desync with one controlled restart",
-      "state": "green",
+      "state": "partial",
       "started_at": "2026-07-13T02:14:00Z",
       "completed_at": "2026-07-13T03:03:43Z",
       "evidence_file": "docs/evidence/cp/CP3.md"
     },
     "CP4": {
       "name": "Stage 3 lifecycle and approvals fail closed",
-      "state": "green",
+      "state": "partial",
       "started_at": "2026-07-13T04:00:00Z",
       "completed_at": "2026-07-13T04:10:18Z",
       "evidence_file": "docs/evidence/cp/CP4.md"
     },
     "CP5": {
       "name": "Append-only journal and deterministic restart recovery",
-      "state": "green",
+      "state": "partial",
       "started_at": "2026-07-13T05:08:00Z",
       "completed_at": "2026-07-13T05:34:19Z",
       "evidence_file": "docs/evidence/cp/CP5.md"
     },
     "CP6": {
-      "name": "Pending",
-      "state": "pending",
-      "started_at": null,
+      "name": "Local loopback HTTP SSE API integrated with existing runner runtime",
+      "state": "active",
+      "started_at": "2026-07-13T06:33:37Z",
       "completed_at": null,
       "evidence_file": "docs/evidence/cp/CP6.md"
     },

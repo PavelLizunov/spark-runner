@@ -17,7 +17,7 @@ const EXPECTED_CODEX_SCHEMA_PATH: &str = "protocol/0.142.0/stable.schema.json";
 const PLACEHOLDER_SCHEMA_HASH: &str = "generated-after-implementation";
 
 #[derive(Parser, Debug)]
-#[command(name = "spark-runner", about = "Minimal Codex app-server runner (CP2)")]
+#[command(name = "spark-runner", about = "Minimal Codex app-server runner")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -35,6 +35,12 @@ pub enum Command {
     Run {
         #[arg(long)]
         prompt: String,
+        /// Use the pinned live `codex app-server` instead of the offline fake app-server.
+        #[arg(long)]
+        live: bool,
+    },
+    /// Serve the CP6 local loopback HTTP/SSE API.
+    Serve {
         /// Use the pinned live `codex app-server` instead of the offline fake app-server.
         #[arg(long)]
         live: bool,
