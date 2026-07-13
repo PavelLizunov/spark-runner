@@ -103,6 +103,10 @@ fn main() -> io::Result<()> {
     let fake_mode = arg_value(&args, "--fake-mode");
     let fail_marker = arg_value(&args, "--fail-marker").map(PathBuf::from);
     let approval_mode = arg_value(&args, "--approval-mode");
+    let approval_key =
+        arg_value(&args, "--approval-id").unwrap_or_else(|| "approval-1".to_string());
+    let approval_method = arg_value(&args, "--approval-method")
+        .unwrap_or_else(|| "item/commandExecution/requestApproval".to_string());
     if let Some(marker) = arg_value(&args, "--pid-marker") {
         std::fs::write(marker, std::process::id().to_string())?;
     }
@@ -175,6 +179,8 @@ fn main() -> io::Result<()> {
                         -9001,
                         "bootstrap-thread",
                         "bootstrap-turn",
+                        "bootstrap-approval",
+                        "item/commandExecution/requestApproval",
                     )?;
                     let response = read_server_message(&mut lines)?;
                     let decision = response
@@ -353,6 +359,8 @@ fn main() -> io::Result<()> {
                         mode,
                         &thread_id,
                         &turn_id,
+                        &approval_key,
+                        &approval_method,
                         wire_marker.as_deref(),
                     )?;
                 } else {
@@ -382,10 +390,19 @@ fn handle_approval_mode(
     mode: &str,
     thread_id: &str,
     turn_id: &str,
+    approval_key: &str,
+    approval_method: &str,
     wire_marker: Option<&Path>,
 ) -> io::Result<()> {
     let approval_id = 9001;
-    send_approval_request(stdout, approval_id, thread_id, turn_id)?;
+    send_approval_request(
+        stdout,
+        approval_id,
+        thread_id,
+        turn_id,
+        approval_key,
+        approval_method,
+    )?;
 
     if mode == "timeout" {
         std::process::exit(0);
@@ -426,15 +443,28 @@ fn handle_approval_mode(
             }
         }
         "duplicate" => {
-            send_approval_request(stdout, approval_id, thread_id, turn_id)?;
-            let _ = read_server_message(lines)?;
+            send_approval_request(
+                stdout,
+                approval_id,
+                thread_id,
+                turn_id,
+                approval_key,
+                approval_method,
+            )?;
+            let duplicate = read_server_message(lines)?;
+            record_wire(wire_marker, duplicate.as_ref())?;
         }
         "restart_unresolved" => {
             stdout.write_all(b"not-a-valid-jsonl-frame\n")?;
             stdout.flush()?;
         }
         _ => {
-            let status = if first_decision == "accept" {
+            let permissions_granted = first
+                .as_ref()
+                .and_then(|value| value.pointer("/result/permissions/network/enabled"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            let status = if first_decision == "accept" || permissions_granted {
                 "completed"
             } else {
                 "failed"
@@ -464,15 +494,21 @@ fn send_approval_request(
     id: i64,
     thread_id: &str,
     turn_id: &str,
+    approval_key: &str,
+    approval_method: &str,
 ) -> io::Result<()> {
     send(
         stdout,
         &json!({
             "id": id,
-            "method": "item/commandExecution/requestApproval",
+            "method": approval_method,
             "params": {
-                "approvalId": "approval-1",
+                "approvalId": approval_key,
                 "command": "echo deterministic-fake-approval",
+                "permissions": {
+                    "fileSystem": { "entries": [] },
+                    "network": { "enabled": true }
+                },
                 "itemId": "item-1",
                 "startedAtMs": 1,
                 "threadId": thread_id,

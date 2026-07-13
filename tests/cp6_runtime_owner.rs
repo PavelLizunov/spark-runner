@@ -156,6 +156,22 @@ async fn create_turn(router: axum::Router, thread_id: &str) -> String {
     turn["id"].as_str().expect("turn id").to_string()
 }
 
+async fn create_turn_with_timeout(
+    router: axum::Router,
+    thread_id: &str,
+    timeout_seconds: u64,
+) -> String {
+    let (status, turn) = request_json(
+        router,
+        "POST",
+        &format!("/v1/threads/{thread_id}/turns"),
+        json!({ "input": "owner deadline test", "timeout_seconds": timeout_seconds }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    turn["id"].as_str().expect("turn id").to_string()
+}
+
 /// T01/T04: an injected launcher boots the same live owner path, sends the
 /// original signed JSON-RPC approval id a schema-valid denial, awaits the
 /// interrupt RPC plus terminal notification, reaps the child, journals one
@@ -233,6 +249,10 @@ async fn t01_injected_live_owner_interrupts_reaps_and_releases_admission() {
         .iter()
         .position(|row| row.contains("approval_requested"))
         .expect("durable requested");
+    let bootstrap_admission = rows
+        .iter()
+        .position(|row| row.contains("rate_limit_snapshot") && row.contains("bootstrap"))
+        .expect("bootstrap admission snapshot");
     let decided = rows
         .iter()
         .position(|row| row.contains("approval_decided"))
@@ -240,6 +260,10 @@ async fn t01_injected_live_owner_interrupts_reaps_and_releases_admission() {
     assert!(
         requested < decided,
         "approval audit ordering must be append-only"
+    );
+    assert!(
+        bootstrap_admission < requested,
+        "the owner writes admission before it accepts a turn"
     );
     assert_eq!(
         rows.iter()
@@ -358,6 +382,241 @@ async fn t03_controller_drop_uses_the_owner_cancel_path() {
     assert!(wire
         .iter()
         .any(|message| message["method"] == "turn/interrupt"));
+    cleanup(&[wire_marker]);
+}
+
+/// T03: approval expiry is not a detached client timeout. The owner first
+/// durably denies the original request, then sends turn/interrupt and waits
+/// for its RPC acknowledgement plus turn/completed before releasing the PID.
+#[cfg(unix)]
+#[tokio::test]
+async fn t03_approval_timeout_uses_the_same_ordered_cancel_path() {
+    let _environment = environment_lock().lock().await;
+    let journal = unique_path("timeout", "sqlite3");
+    let pid_marker = unique_path("timeout-pid", "marker");
+    let wire_marker = unique_path("timeout-wire", "jsonl");
+    std::env::set_var("SPARK_RUNNER_JOURNAL_PATH", &journal);
+    let router = app_with_launcher(
+        config(true),
+        RuntimeLauncher::Fake {
+            args: vec![
+                "--approval-mode".to_string(),
+                "wait_interrupt".to_string(),
+                "--pid-marker".to_string(),
+                pid_marker.display().to_string(),
+                "--wire-marker".to_string(),
+                wire_marker.display().to_string(),
+            ],
+        },
+    );
+    wait_ready(router.clone()).await;
+    let thread = create_thread(router.clone()).await;
+    let turn = create_turn_with_timeout(router.clone(), &thread, 1).await;
+    wait_event(router.clone(), &turn, "approval.requested").await;
+    wait_event(router.clone(), &turn, "turn.failed").await;
+
+    let wire: Vec<Value> = std::fs::read_to_string(&wire_marker)
+        .expect("captured timeout cancellation")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("wire JSON"))
+        .collect();
+    assert_eq!(
+        wire.iter()
+            .filter(|message| message["id"] == 9001 && message["result"]["decision"] == "cancel")
+            .count(),
+        1,
+        "one schema-valid response on the original approval id"
+    );
+    assert_eq!(
+        wire.iter()
+            .filter(|message| message["method"] == "turn/interrupt")
+            .count(),
+        1,
+        "one interrupt after the denial acknowledgement"
+    );
+    let pid: i32 = std::fs::read_to_string(&pid_marker)
+        .expect("child pid")
+        .parse()
+        .expect("pid number");
+    wait_for_pid_exit(pid).await;
+
+    let connection = Connection::open(&journal).expect("journal");
+    let rows: Vec<String> = connection
+        .prepare("SELECT payload_json FROM journal_events ORDER BY id")
+        .expect("statement")
+        .query_map([], |row| row.get(0))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("payload rows");
+    let requested = rows
+        .iter()
+        .position(|row| row.contains("approval_requested"))
+        .expect("durable requested");
+    let decided = rows
+        .iter()
+        .position(|row| row.contains("approval_decided"))
+        .expect("durable timeout denial");
+    assert!(requested < decided);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("turn_completed"))
+            .count(),
+        1,
+        "one authoritative terminal result"
+    );
+    std::env::remove_var("SPARK_RUNNER_JOURNAL_PATH");
+    cleanup(&[journal, pid_marker, wire_marker]);
+}
+
+/// Child approval keys are bounded opaque handles at every owner boundary.
+/// The duplicate request gets a second fail-closed wire response but never a
+/// second audit request or an unbounded SSE/SQLite payload.
+#[tokio::test]
+async fn repeated_oversized_child_approval_ids_are_opaque_and_bounded() {
+    let _environment = environment_lock().lock().await;
+    let journal = unique_path("oversized-approval", "sqlite3");
+    let wire_marker = unique_path("oversized-wire", "jsonl");
+    let child_id = "CHILD_APPROVAL_CANARY_".repeat(2048);
+    std::env::set_var("SPARK_RUNNER_JOURNAL_PATH", &journal);
+    let router = app_with_launcher(
+        config(true),
+        RuntimeLauncher::Fake {
+            args: vec![
+                "--approval-mode".to_string(),
+                "duplicate".to_string(),
+                "--approval-id".to_string(),
+                child_id.clone(),
+                "--wire-marker".to_string(),
+                wire_marker.display().to_string(),
+            ],
+        },
+    );
+    wait_ready(router.clone()).await;
+    let thread = create_thread(router.clone()).await;
+    let turn = create_turn(router.clone(), &thread).await;
+    wait_event(router.clone(), &turn, "approval.requested").await;
+    let (status, decision) = request_json(
+        router.clone(),
+        "POST",
+        "/v1/approvals/approval_1/deny",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(decision["status"], "denied");
+    wait_event(router, &turn, "turn.failed").await;
+
+    let rows: Vec<String> = Connection::open(&journal)
+        .expect("journal")
+        .prepare("SELECT payload_json FROM journal_events ORDER BY id")
+        .expect("statement")
+        .query_map([], |row| row.get(0))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("payload rows");
+    assert!(rows
+        .iter()
+        .all(|row| !row.contains("CHILD_APPROVAL_CANARY_")));
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("approval_requested"))
+            .count(),
+        1,
+        "duplicate source request must not create a second audit request"
+    );
+    assert!(rows.iter().all(|row| row.len() < 2_048));
+    let wire: Vec<Value> = std::fs::read_to_string(&wire_marker)
+        .expect("wire responses")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("wire JSON"))
+        .collect();
+    let denial_count = wire
+        .iter()
+        .filter(|message| message["id"] == 9001 && message["result"]["decision"] == "cancel")
+        .count();
+    // The owner may reap immediately after the duplicate is rejected, before
+    // the fixture persists that second response.  Its retained state remains
+    // bounded either way; the source duplicate never creates a second audit
+    // request and it can never produce more than one extra wire response.
+    assert!((1..=2).contains(&denial_count));
+    std::env::remove_var("SPARK_RUNNER_JOURNAL_PATH");
+    cleanup(&[journal, wire_marker]);
+}
+
+/// A reroute invalidates the owner snapshot, not merely a temporary client.
+#[tokio::test]
+async fn reroute_failure_clears_owner_ready_model_and_quota_snapshot() {
+    let _environment = environment_lock().lock().await;
+    let router = app_with_launcher(
+        config(true),
+        RuntimeLauncher::Fake {
+            args: vec!["--fake-mode".to_string(), "model_rerouted".to_string()],
+        },
+    );
+    wait_ready(router.clone()).await;
+    let thread = create_thread(router.clone()).await;
+    let turn = create_turn(router.clone(), &thread).await;
+    wait_event(router.clone(), &turn, "turn.failed").await;
+    assert_eq!(
+        request_json(router.clone(), "GET", "/ready", json!({}))
+            .await
+            .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let (_, models) = request_json(router.clone(), "GET", "/v1/models", json!({})).await;
+    assert_eq!(models["data"], json!([]));
+    let (_, limits) = request_json(router, "GET", "/v1/rate-limits", json!({})).await;
+    assert_eq!(limits["quota_available"], false);
+}
+
+/// 0.144.3 permission approvals carry a granted profile rather than a
+/// decision string. The injected owner preserves the exact in-flight request
+/// profile for an authenticated Allow and does not fabricate a command shape.
+#[tokio::test]
+async fn permissions_allow_uses_the_generated_profile_shape() {
+    let _environment = environment_lock().lock().await;
+    let wire_marker = unique_path("permissions-wire", "jsonl");
+    let router = app_with_launcher(
+        config(true),
+        RuntimeLauncher::Fake {
+            args: vec![
+                "--approval-mode".to_string(),
+                "command".to_string(),
+                "--approval-method".to_string(),
+                "item/permissions/requestApproval".to_string(),
+                "--wire-marker".to_string(),
+                wire_marker.display().to_string(),
+            ],
+        },
+    );
+    wait_ready(router.clone()).await;
+    let thread = create_thread(router.clone()).await;
+    let turn = create_turn(router.clone(), &thread).await;
+    wait_event(router.clone(), &turn, "approval.requested").await;
+    let (status, decision) = request_json(
+        router.clone(),
+        "POST",
+        "/v1/approvals/approval_1/approve",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(decision["status"], "approved");
+    wait_event(router, &turn, "turn.completed").await;
+    let wire: Vec<Value> = std::fs::read_to_string(&wire_marker)
+        .expect("permission response")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("wire JSON"))
+        .collect();
+    let response = wire
+        .iter()
+        .find(|message| message["id"] == 9001)
+        .expect("original permission response");
+    assert_eq!(
+        response["result"]["permissions"]["network"]["enabled"],
+        true
+    );
+    assert_eq!(response["result"]["scope"], "turn");
     cleanup(&[wire_marker]);
 }
 
