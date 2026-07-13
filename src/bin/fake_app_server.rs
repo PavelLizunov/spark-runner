@@ -114,6 +114,8 @@ fn main() -> io::Result<()> {
         arg_value(&args, "--approval-id").unwrap_or_else(|| "approval-1".to_string());
     let approval_method = arg_value(&args, "--approval-method")
         .unwrap_or_else(|| "item/commandExecution/requestApproval".to_string());
+    let barrier_phase = arg_value(&args, "--barrier-phase");
+    let barrier_marker = arg_value(&args, "--barrier-marker").map(PathBuf::from);
     if let Some(marker) = arg_value(&args, "--pid-marker") {
         std::fs::write(marker, std::process::id().to_string())?;
     }
@@ -145,6 +147,18 @@ fn main() -> io::Result<()> {
         let id = request.get("id").and_then(Value::as_u64);
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let params = request.get("params").cloned().unwrap_or(Value::Null);
+
+        // Deterministic cancellation split point: the parent has already
+        // flushed this request, but this fixture deliberately withholds the
+        // response until the parent either cancels or releases stdin. Tests
+        // synchronize on the marker rather than sleeping.
+        if barrier_phase.as_deref() == Some(method) {
+            if let Some(marker) = barrier_marker.as_ref() {
+                std::fs::write(marker, method)?;
+            }
+            let _ = read_server_message(&mut lines)?;
+            continue;
+        }
 
         if awaiting_initialized {
             if method != "initialized" || request.get("id").is_some() {
@@ -503,23 +517,65 @@ fn send_approval_request(
     approval_key: &str,
     approval_method: &str,
 ) -> io::Result<()> {
+    let params = match approval_method {
+        "item/fileChange/requestApproval" => json!({
+            "approvalId": approval_key,
+            "grantRoot": "/tmp/fake-write-root",
+            "reason": "deterministic fake file change",
+            "itemId": "item-1",
+            "startedAtMs": 1,
+            "threadId": thread_id,
+            "turnId": turn_id,
+        }),
+        "item/permissions/requestApproval" => json!({
+            "approvalId": approval_key,
+            "cwd": "/tmp/fake-cwd",
+            "reason": "deterministic fake permission request",
+            "permissions": {
+                "fileSystem": { "entries": [] },
+                "network": { "enabled": true }
+            },
+            "itemId": "item-1",
+            "startedAtMs": 1,
+            "threadId": thread_id,
+            "turnId": turn_id,
+        }),
+        "execCommandApproval" => json!({
+            "approvalId": approval_key,
+            "callId": "call-1",
+            "command": ["echo", "deterministic-fake-approval"],
+            "conversationId": thread_id,
+            "cwd": "/tmp/fake-cwd",
+            "parsedCmd": [],
+            "reason": "deterministic fake command",
+        }),
+        "applyPatchApproval" => json!({
+            "callId": "call-1",
+            "conversationId": thread_id,
+            "fileChanges": { "/tmp/fake-file": { "type": "update", "unified_diff": "[suppressed fixture diff]" } },
+            "reason": "deterministic fake patch",
+        }),
+        _ => json!({
+            "approvalId": approval_key,
+            "command": "echo deterministic-fake-approval",
+            "cwd": "/tmp/fake-cwd",
+            "reason": "deterministic fake command",
+            "permissions": {
+                "fileSystem": { "entries": [] },
+                "network": { "enabled": true }
+            },
+            "itemId": "item-1",
+            "startedAtMs": 1,
+            "threadId": thread_id,
+            "turnId": turn_id
+        }),
+    };
     send(
         stdout,
         &json!({
             "id": id,
             "method": approval_method,
-            "params": {
-                "approvalId": approval_key,
-                "command": "echo deterministic-fake-approval",
-                "permissions": {
-                    "fileSystem": { "entries": [] },
-                    "network": { "enabled": true }
-                },
-                "itemId": "item-1",
-                "startedAtMs": 1,
-                "threadId": thread_id,
-                "turnId": turn_id
-            }
+            "params": params,
         }),
     )
 }

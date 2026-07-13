@@ -17,6 +17,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::config::VerifiedSubscriptionAuth;
+
 pub const STDERR_TAIL_BYTES: usize = 16 * 1024;
 /// Upper bound on kill/wait and stderr-task join during shutdown, so cleanup
 /// can never hang even if a process-group kill somehow fails to land.
@@ -77,7 +79,11 @@ impl StderrTail {
     }
 }
 
-fn configure_environment(command: &mut Command, cwd: Option<&Path>) -> Result<(), ProcessError> {
+fn configure_environment(
+    command: &mut Command,
+    cwd: Option<&Path>,
+    subscription_auth: Option<&mut VerifiedSubscriptionAuth>,
+) -> Result<(), ProcessError> {
     command.env_clear();
     for name in ["LANG", "LC_ALL", "TZ"] {
         if let Some(value) = std::env::var_os(name) {
@@ -93,7 +99,14 @@ fn configure_environment(command: &mut Command, cwd: Option<&Path>) -> Result<()
             std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o700))
                 .map_err(ProcessError::CodexHome)?;
         }
+        if let Some(subscription_auth) = subscription_auth {
+            subscription_auth
+                .provision_into(&codex_home.join("auth.json"))
+                .map_err(ProcessError::SubscriptionAuth)?;
+        }
         command.env("CODEX_HOME", codex_home);
+    } else if subscription_auth.is_some() {
+        return Err(ProcessError::MissingCodexHome);
     }
     Ok(())
 }
@@ -108,6 +121,10 @@ pub enum ProcessError {
     },
     #[error("failed to prepare private CODEX_HOME: {0}")]
     CodexHome(std::io::Error),
+    #[error("failed to provision selected subscription auth file: {0}")]
+    SubscriptionAuth(crate::config::ConfigError),
+    #[error("selected subscription auth requires a private CODEX_HOME")]
+    MissingCodexHome,
     #[error("child process did not expose a piped {0} handle")]
     MissingHandle(&'static str),
 }
@@ -134,12 +151,24 @@ impl ChildProcess {
         args: &[String],
         cwd: Option<&Path>,
     ) -> Result<SpawnedChild, ProcessError> {
+        Self::spawn_with_subscription_auth(program, args, cwd, None)
+    }
+
+    /// Spawn using only the caller-selected, already-validated subscription
+    /// credential. The source path is never passed to the child and no
+    /// ambient Codex configuration is inherited.
+    pub fn spawn_with_subscription_auth(
+        program: &str,
+        args: &[String],
+        cwd: Option<&Path>,
+        subscription_auth: Option<&mut VerifiedSubscriptionAuth>,
+    ) -> Result<SpawnedChild, ProcessError> {
         let mut command = Command::new(program);
         command.args(args);
         if let Some(dir) = cwd {
             command.current_dir(dir);
         }
-        configure_environment(&mut command, cwd)?;
+        configure_environment(&mut command, cwd, subscription_auth)?;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

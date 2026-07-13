@@ -1,7 +1,7 @@
 //! CLI definition, pinned `codex.lock` loading, and small filesystem helpers.
 
 use std::env;
-use std::io::{self, Read, Seek};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,6 +10,10 @@ use clap::{Parser, Subcommand};
 use serde::Deserialize;
 
 pub const DEFAULT_CODEX_LOCK: &str = "codex.lock";
+/// Live authentication is opt-in and never inferred from HOME, CODEX_HOME,
+/// or any ambient Codex configuration.  Operators select this one file
+/// explicitly; the launcher retains its verified handle through provisioning.
+pub const SUBSCRIPTION_AUTH_FILE_ENV: &str = "SPARK_RUNNER_SUBSCRIPTION_AUTH_FILE";
 const EXPECTED_CODEX_TRANSPORT: &str = "stdio";
 const EXPECTED_CODEX_VERSION: &str = "0.144.3";
 const EXPECTED_CODEX_SCHEMA_PATH: &str =
@@ -23,6 +27,40 @@ pub struct VerifiedExecutable {
     path: PathBuf,
     #[cfg(target_os = "linux")]
     file: std::fs::File,
+}
+
+/// An owner-only subscription-auth file that has been validated without
+/// parsing its contents.  The file handle, rather than its pathname, is used
+/// when provisioning a child home so a replacement race cannot change the
+/// credential selected by the operator.
+pub struct VerifiedSubscriptionAuth {
+    file: std::fs::File,
+}
+
+impl VerifiedSubscriptionAuth {
+    /// Copy the already-open credential bytes into the one private child
+    /// `CODEX_HOME`.  This deliberately treats the file as opaque: no auth
+    /// value is parsed, logged, returned, or retained by the runner.
+    pub fn provision_into(&mut self, destination: &Path) -> Result<(), ConfigError> {
+        self.file.rewind().map_err(ConfigError::SubscriptionAuth)?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .map_err(ConfigError::SubscriptionAuth)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))
+                .map_err(ConfigError::SubscriptionAuth)?;
+        }
+        if let Err(error) = io::copy(&mut self.file, &mut output) {
+            let _ = std::fs::remove_file(destination);
+            return Err(ConfigError::SubscriptionAuth(error));
+        }
+        output.flush().map_err(ConfigError::SubscriptionAuth)?;
+        Ok(())
+    }
 }
 
 impl VerifiedExecutable {
@@ -151,6 +189,10 @@ pub enum ConfigError {
     VersionCheck(io::Error),
     #[error("failed to retain verified runtime handle: {0}")]
     VerifiedHandle(io::Error),
+    #[error("{SUBSCRIPTION_AUTH_FILE_ENV} must select an absolute owner-only regular file")]
+    InvalidSubscriptionAuthFile,
+    #[error("failed to provision selected subscription auth file: {0}")]
+    SubscriptionAuth(io::Error),
 }
 
 impl CodexLock {
@@ -279,6 +321,65 @@ impl CodexLock {
         }
         Ok(VerifiedExecutable { path: native, file })
     }
+}
+
+/// Select and open the sole live subscription-auth file.  Nothing falls back
+/// to the host `CODEX_HOME` or home directory: an absent, symlinked,
+/// non-regular, or group/world-readable source fails closed before spawning.
+pub fn selected_subscription_auth() -> Result<VerifiedSubscriptionAuth, ConfigError> {
+    let path = env::var_os(SUBSCRIPTION_AUTH_FILE_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or(ConfigError::InvalidSubscriptionAuthFile)?;
+    let metadata =
+        std::fs::symlink_metadata(&path).map_err(|_| ConfigError::InvalidSubscriptionAuthFile)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ConfigError::InvalidSubscriptionAuthFile);
+    }
+    let file = open_subscription_auth(&path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| ConfigError::InvalidSubscriptionAuthFile)?;
+    if !metadata.is_file() || !owner_only(&metadata) {
+        return Err(ConfigError::InvalidSubscriptionAuthFile);
+    }
+    Ok(VerifiedSubscriptionAuth { file })
+}
+
+#[cfg(target_os = "linux")]
+fn open_subscription_auth(path: &Path) -> Result<std::fs::File, ConfigError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // O_NOFOLLOW prevents a replacement between the metadata check and open
+    // from redirecting this explicit capability through a symlink.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0o400000)
+        .open(path)
+        .map_err(ConfigError::SubscriptionAuth)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_subscription_auth(path: &Path) -> Result<std::fs::File, ConfigError> {
+    std::fs::File::open(path).map_err(ConfigError::SubscriptionAuth)
+}
+
+#[cfg(unix)]
+fn owner_only(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    metadata.permissions().mode() & 0o077 == 0 && metadata.uid() == unsafe { geteuid() }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn geteuid() -> u32;
+}
+
+#[cfg(not(unix))]
+fn owner_only(_metadata: &std::fs::Metadata) -> bool {
+    true
 }
 
 fn verify_hash_file(

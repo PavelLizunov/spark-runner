@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,7 +13,14 @@ use axum::http::{header, Request, StatusCode};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use spark_runner::api::{app, app_with_launcher, ApiConfig};
-use spark_runner::orchestrator::RuntimeLauncher;
+use spark_runner::client::ApprovalPolicy;
+use spark_runner::config::{selected_subscription_auth, SUBSCRIPTION_AUTH_FILE_ENV};
+use spark_runner::orchestrator::{
+    run_turn_with_launcher_controlled_with_journal, ControlOutcome, RuntimeControl, RuntimeLauncher,
+};
+use spark_runner::process::ChildProcess;
+use tokio::io::AsyncReadExt;
+use tokio::sync::{mpsc, oneshot};
 use tower::ServiceExt;
 
 fn environment_lock() -> &'static tokio::sync::Mutex<()> {
@@ -81,7 +88,7 @@ async fn wait_ready(router: axum::Router) {
     .expect("injected bootstrap ready");
 }
 
-async fn wait_event(router: axum::Router, turn_id: &str, expected: &str) {
+async fn wait_event(router: axum::Router, turn_id: &str, expected: &str) -> Value {
     let request = Request::builder()
         .uri(format!("/v1/turns/{turn_id}/events"))
         .header(header::AUTHORIZATION, "Bearer test-token")
@@ -91,18 +98,38 @@ async fn wait_event(router: axum::Router, turn_id: &str, expected: &str) {
     let response = router.oneshot(request).await.expect("events response");
     let mut stream = response.into_body().into_data_stream();
     tokio::time::timeout(Duration::from_secs(3), async {
+        let mut buffered = String::new();
         while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
-            if std::str::from_utf8(&chunk.expect("chunk"))
-                .expect("utf8")
-                .contains(expected)
-            {
-                return;
+            let chunk = chunk.expect("chunk");
+            let text = std::str::from_utf8(&chunk).expect("utf8");
+            buffered.push_str(text);
+            while let Some(end) = buffered.find("\n\n") {
+                let event = buffered.drain(..end + 2).collect::<String>();
+                if !event.contains(expected) {
+                    continue;
+                }
+                let payload = event
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data:").map(str::trim))
+                    .and_then(|payload| serde_json::from_str(payload).ok())
+                    .unwrap_or_else(|| json!({}));
+                return payload;
             }
         }
         panic!("SSE ended before {expected}");
     })
     .await
-    .expect("SSE synchronization barrier");
+    .expect("SSE synchronization barrier")
+}
+
+async fn wait_for_marker(path: &Path) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !path.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fixture write boundary");
 }
 
 async fn controlling_stream_after_event(
@@ -267,9 +294,16 @@ async fn t01_injected_live_owner_interrupts_reaps_and_releases_admission() {
     );
     assert_eq!(
         rows.iter()
-            .filter(|row| row.contains("interrupted"))
+            .filter(|row| row.contains("turn_completed") && row.contains("interrupted"))
             .count(),
         1
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("execution_completed") && row.contains("interrupted"))
+            .count(),
+        1,
+        "cancellation is an execution interruption, never a completed execution"
     );
 
     let second_thread = create_thread(router.clone()).await;
@@ -593,7 +627,19 @@ async fn permissions_allow_uses_the_generated_profile_shape() {
     wait_ready(router.clone()).await;
     let thread = create_thread(router.clone()).await;
     let turn = create_turn(router.clone(), &thread).await;
-    wait_event(router.clone(), &turn, "approval.requested").await;
+    let approval_event = wait_event(router.clone(), &turn, "approval.requested").await;
+    assert_eq!(
+        approval_event["payload"]["descriptor"]["kind"], "permissions",
+        "approval event: {approval_event}"
+    );
+    assert_eq!(
+        approval_event["payload"]["descriptor"]["cwd"],
+        "/tmp/fake-cwd"
+    );
+    assert_eq!(
+        approval_event["payload"]["descriptor"]["requested_permissions"]["network_enabled"],
+        true
+    );
     let (status, decision) = request_json(
         router.clone(),
         "POST",
@@ -671,6 +717,145 @@ async fn token_file_permissions_and_api_thread_capacity_are_enforced() {
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(body["error"]["code"], "THREAD_CAPACITY");
     cleanup(&[token]);
+}
+
+/// T08 follow-up: only an explicit owner-only fake auth file is copied into
+/// the per-spawn private home. The test never refers to a real auth location
+/// or value, and the selected source path itself is not inherited by the
+/// child environment.
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_fake_subscription_auth_is_private_and_rejected_when_unsafe() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _environment = environment_lock().lock().await;
+    let auth_file = unique_path("fake-subscription-auth", "json");
+    let cwd = unique_path("private-auth-home", "dir");
+    let canary = b"{\"fake_auth\":\"AUTH_FILE_CANARY\"}";
+    std::fs::write(&auth_file, canary).expect("write fake auth");
+    std::fs::set_permissions(&auth_file, std::fs::Permissions::from_mode(0o600))
+        .expect("owner-only fake auth");
+    std::env::set_var(SUBSCRIPTION_AUTH_FILE_ENV, &auth_file);
+    let mut selected = selected_subscription_auth().expect("select fake auth");
+    std::fs::create_dir_all(&cwd).expect("private cwd");
+
+    let spawned = ChildProcess::spawn_with_subscription_auth(
+        "/usr/bin/env",
+        &[],
+        Some(&cwd),
+        Some(&mut selected),
+    )
+    .expect("spawn with fake auth");
+    let mut stdout = spawned.stdout;
+    let mut output = Vec::new();
+    stdout.read_to_end(&mut output).await.expect("read env");
+    let mut process = spawned.process;
+    process.shutdown().await;
+    let output = String::from_utf8(output).expect("env utf8");
+    assert!(!output.contains(auth_file.to_string_lossy().as_ref()));
+    let codex_home = output
+        .lines()
+        .find_map(|line| line.strip_prefix("CODEX_HOME="))
+        .expect("private CODEX_HOME");
+    let provisioned = std::path::Path::new(codex_home).join("auth.json");
+    assert_eq!(std::fs::read(&provisioned).expect("fake auth copy"), canary);
+    assert_eq!(
+        std::fs::metadata(&provisioned)
+            .expect("fake auth permissions")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    std::fs::set_permissions(&auth_file, std::fs::Permissions::from_mode(0o640))
+        .expect("make fake auth unsafe");
+    assert!(selected_subscription_auth().is_err());
+    std::env::remove_var(SUBSCRIPTION_AUTH_FILE_ENV);
+    let _ = std::fs::remove_file(auth_file);
+    let _ = std::fs::remove_dir_all(cwd);
+}
+
+/// Deterministic split/race coverage for cancellation before initialize,
+/// during admission, and after non-idempotent thread/turn writes. The fake
+/// fixture writes a barrier only after consuming the request; no sleeps are
+/// used. A post-write control is Unknown and leaves durable ambiguity rather
+/// than an execution-completed success.
+#[tokio::test]
+async fn control_races_are_interrupted_or_unknown_at_the_correct_boundary() {
+    let _environment = environment_lock().lock().await;
+    for (phase, ambiguous) in [
+        ("initialize", false),
+        ("account/read", false),
+        ("thread/start", true),
+        ("turn/start", true),
+    ] {
+        let phase_label = phase.replace('/', "-");
+        let journal = unique_path(&format!("control-{phase_label}"), "sqlite3");
+        let marker = unique_path(&format!("control-{phase_label}"), "marker");
+        std::env::set_var("SPARK_RUNNER_JOURNAL_PATH", &journal);
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let task = tokio::spawn({
+            let marker = marker.clone();
+            let phase = phase.to_string();
+            async move {
+                run_turn_with_launcher_controlled_with_journal(
+                    "deterministic control split".to_string(),
+                    RuntimeLauncher::Fake {
+                        args: vec![
+                            "--barrier-phase".to_string(),
+                            phase,
+                            "--barrier-marker".to_string(),
+                            marker.display().to_string(),
+                        ],
+                    },
+                    ApprovalPolicy::Deny,
+                    Duration::from_secs(30),
+                    &mut control_rx,
+                    None,
+                )
+                .await
+            }
+        });
+        wait_for_marker(&marker).await;
+        let (ack_tx, ack_rx) = oneshot::channel();
+        control_tx
+            .send(RuntimeControl::Interrupt(ack_tx))
+            .await
+            .expect("control accepted");
+        let result = task.await.expect("controlled task");
+        let acknowledgement = ack_rx.await.expect("cleanup acknowledgement");
+        let rows: Vec<String> = Connection::open(&journal)
+            .expect("journal")
+            .prepare("SELECT payload_json FROM journal_events ORDER BY id")
+            .expect("statement")
+            .query_map([], |row| row.get(0))
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("payloads");
+        if ambiguous {
+            assert!(result.is_err(), "{phase} write must be ambiguous");
+            assert_eq!(acknowledgement, ControlOutcome::Unknown);
+            assert!(rows.iter().any(|row| row.contains("delivery_ambiguous")));
+            assert!(
+                rows.iter().all(|row| !row.contains("execution_completed")),
+                "unknown delivery must not manufacture execution completion"
+            );
+        } else {
+            assert!(result
+                .expect("pre-write cancellation")
+                .contains("turn_status=interrupted"));
+            assert_eq!(acknowledgement, ControlOutcome::Interrupted);
+            assert!(rows
+                .iter()
+                .any(|row| { row.contains("execution_completed") && row.contains("interrupted") }));
+            assert!(rows.iter().all(|row| {
+                !(row.contains("execution_completed") && row.contains("\"status\":\"completed\""))
+            }));
+        }
+        std::env::remove_var("SPARK_RUNNER_JOURNAL_PATH");
+        cleanup(&[journal, marker]);
+    }
 }
 
 #[cfg(unix)]

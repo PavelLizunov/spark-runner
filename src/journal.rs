@@ -151,6 +151,7 @@ impl JournalEvent {
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionTerminalStatus {
     Completed,
+    Interrupted,
     Failed,
 }
 
@@ -497,6 +498,7 @@ pub struct RecoveryProjection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionRecoveryState {
     Completed,
+    Interrupted,
     Failed,
     UnknownAfterRestart,
 }
@@ -537,6 +539,7 @@ pub fn project_recovery(path: &Path) -> JournalResult<RecoveryProjection> {
                     execution_id,
                     Some(match status {
                         ExecutionTerminalStatus::Completed => ExecutionRecoveryState::Completed,
+                        ExecutionTerminalStatus::Interrupted => ExecutionRecoveryState::Interrupted,
                         ExecutionTerminalStatus::Failed => ExecutionRecoveryState::Failed,
                     }),
                 );

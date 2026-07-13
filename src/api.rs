@@ -32,7 +32,7 @@ use crate::client::{
 use crate::journal::{JournalConfig, JournalEvent, JournalWriter};
 use crate::orchestrator::{
     bootstrap_runtime, recover_before_readiness, run_turn_with_launcher_controlled_with_journal,
-    RuntimeControl, RuntimeLauncher,
+    ControlOutcome, RuntimeControl, RuntimeLauncher,
 };
 use crate::state::ApprovalDecision;
 
@@ -194,6 +194,7 @@ struct ApprovalRecord {
     id: String,
     turn_id: String,
     status: ApprovalStatus,
+    allow_permitted: bool,
     decision: Option<oneshot::Sender<ApprovalCommand>>,
 }
 
@@ -730,6 +731,8 @@ async fn owner_register_pending(
     let PendingApproval {
         request_key,
         method,
+        descriptor,
+        allow_permitted,
         deadline,
         decision,
     } = pending;
@@ -764,6 +767,7 @@ async fn owner_register_pending(
             id: id.clone(),
             turn_id: turn_id.to_string(),
             status: ApprovalStatus::Pending,
+            allow_permitted,
             decision: Some(decision),
         },
     );
@@ -774,7 +778,12 @@ async fn owner_register_pending(
         state,
         turn_id,
         "approval.requested",
-        serde_json::json!({ "approval_id": id, "request_key": request_key, "method": method }),
+        serde_json::json!({
+            "approval_id": id,
+            "request_key": request_key,
+            "method": method,
+            "descriptor": descriptor,
+        }),
         false,
     );
     let timeout_tx = owner_tx.clone();
@@ -797,8 +806,13 @@ async fn owner_decide(
     id: &str,
     decision: ApprovalStatus,
 ) -> Result<ApprovalResponse, ApiRejection> {
-    let (approval_id, turn_id, sender) = claim_approval(state, id)?;
-    let protocol_decision = match decision {
+    let (approval_id, turn_id, allow_permitted, sender) = claim_approval(state, id)?;
+    let delivered_status = if decision == ApprovalStatus::Approved && !allow_permitted {
+        ApprovalStatus::Denied
+    } else {
+        decision
+    };
+    let protocol_decision = match delivered_status {
         ApprovalStatus::Approved => ApprovalDecision::Allow,
         ApprovalStatus::Denied | ApprovalStatus::Pending | ApprovalStatus::Delivering => {
             ApprovalDecision::Deny
@@ -813,18 +827,18 @@ async fn owner_decide(
             true,
         ));
     }
-    set_approval_status(state, id, decision);
+    set_approval_status(state, id, delivered_status);
     push_event(
         state,
         &turn_id,
         "approval.decided",
-        serde_json::json!({ "approval_id": approval_id, "decision": decision }),
+        serde_json::json!({ "approval_id": approval_id, "decision": delivered_status }),
         false,
     );
     Ok(ApprovalResponse {
         id: id.to_string(),
         turn_id,
-        status: decision,
+        status: delivered_status,
     })
 }
 
@@ -918,7 +932,17 @@ async fn owner_interrupt(
         return turn_response(state, turn_id);
     }
     match tokio::time::timeout(OWNER_DEADLINE, response).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(ControlOutcome::Interrupted)) => {}
+        Ok(Ok(ControlOutcome::Unknown)) => {
+            terminalize(
+                state,
+                turn_id,
+                TurnStatus::Failed,
+                "turn.failed",
+                serde_json::json!({ "status": "failed", "error": { "class": "delivery_ambiguous" } }),
+            );
+            return turn_response(state, turn_id);
+        }
         Ok(Err(_)) => {
             // See the closed-control case above: the server terminalized on
             // the durable denial before the queued interrupt could be
@@ -966,7 +990,7 @@ fn cancellation_terminal(authority: &str) -> (TurnStatus, &'static str) {
 fn claim_approval(
     state: &mut OwnerState,
     id: &str,
-) -> Result<(String, String, oneshot::Sender<ApprovalCommand>), ApiRejection> {
+) -> Result<(String, String, bool, oneshot::Sender<ApprovalCommand>), ApiRejection> {
     let approval = state.approvals.get_mut(id).ok_or_else(|| {
         rejection(
             StatusCode::NOT_FOUND,
@@ -992,7 +1016,12 @@ fn claim_approval(
             false,
         )
     })?;
-    Ok((approval.id.clone(), approval.turn_id.clone(), sender))
+    Ok((
+        approval.id.clone(),
+        approval.turn_id.clone(),
+        approval.allow_permitted,
+        sender,
+    ))
 }
 
 fn set_approval_status(state: &mut OwnerState, id: &str, status: ApprovalStatus) {

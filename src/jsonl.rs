@@ -18,7 +18,8 @@ use std::future::Future;
 use std::time::Duration;
 
 use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
@@ -34,6 +35,28 @@ const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
 const MAX_PENDING_MESSAGES: usize = 128;
 const MAX_PENDING_BYTES: usize = 2 * MAX_FRAME_LEN;
+
+/// Shared with the runtime owner around a non-idempotent request. Once a
+/// flushed JSONL line may have reached the child, cancellation cannot safely
+/// assume the request was not delivered even if its response was not seen.
+#[derive(Clone, Default)]
+pub struct RequestDelivery {
+    written: Arc<AtomicBool>,
+}
+
+impl RequestDelivery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn was_written(&self) -> bool {
+        self.written.load(Ordering::SeqCst)
+    }
+
+    fn mark_written(&self) {
+        self.written.store(true, Ordering::SeqCst);
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum JsonlError {
@@ -153,6 +176,24 @@ impl JsonlClient {
         &self,
         method: &str,
         params: Value,
+        handler: F,
+    ) -> Result<Value, JsonlError>
+    where
+        F: FnMut(Value) -> Fut,
+        Fut: Future<Output = Result<(), JsonlError>>,
+    {
+        self.call_with_server_request_handler_and_delivery(method, params, None, handler)
+            .await
+    }
+
+    /// As [`Self::call_with_server_request_handler`], while exposing the
+    /// irreversible write boundary to the runtime owner for non-idempotent
+    /// cancellation classification.
+    pub async fn call_with_server_request_handler_and_delivery<F, Fut>(
+        &self,
+        method: &str,
+        params: Value,
+        delivery: Option<&RequestDelivery>,
         mut handler: F,
     ) -> Result<Value, JsonlError>
     where
@@ -175,6 +216,9 @@ impl JsonlClient {
             stdin.write_all(line.as_bytes()).await?;
             stdin.write_all(b"\n").await?;
             stdin.flush().await?;
+        }
+        if let Some(delivery) = delivery {
+            delivery.mark_written();
         }
 
         let response = tokio::time::timeout(

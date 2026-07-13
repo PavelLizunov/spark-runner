@@ -7,11 +7,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::journal::{JournalEvent, JournalWriter};
-use crate::jsonl::{JsonlClient, JsonlError};
+use crate::jsonl::{JsonlClient, JsonlError, RequestDelivery};
 use crate::process::ChildProcess;
 use crate::state::{ApprovalDecision, ApprovalSource, InternalEvent, SessionState, StateError};
 
@@ -179,11 +180,123 @@ pub enum AuthRefreshPolicy {
 pub struct PendingApproval {
     pub request_key: String,
     pub method: String,
+    pub descriptor: ApprovalDescriptor,
+    /// A permission grant is permitted only when the exact requested profile
+    /// passed the bounded 0.144.3-shaped validation below.
+    pub allow_permitted: bool,
     /// The owner, not a detached client future, owns expiry.  This lets the
     /// same cancellation command deny, interrupt, await terminal completion,
     /// and reap the process group in one ordered path.
     pub deadline: Duration,
     pub decision: oneshot::Sender<ApprovalCommand>,
+}
+
+/// Bounded, schema-aware context shown only to the authenticated local
+/// approval authority. It contains no original request id, opaque child id,
+/// raw patch content, or raw permission profile.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalDescriptor {
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub file_changes: Vec<ApprovalFileChange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_permissions: Option<RequestedPermissions>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalFileChange {
+    pub path: String,
+    pub operation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RequestedPermissions {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub file_system: Vec<RequestedFileSystemPermission>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RequestedFileSystemPermission {
+    pub access: String,
+    pub path: String,
+}
+
+impl ApprovalDescriptor {
+    fn from_request(method: &str, params: &Value) -> (Self, bool) {
+        let text = |name, limit| {
+            params
+                .get(name)
+                .and_then(Value::as_str)
+                .map(|value| sanitize_approval_text(value, limit))
+        };
+        let mut descriptor = Self {
+            kind: approval_kind(method),
+            command: None,
+            cwd: text("cwd", MAX_APPROVAL_TEXT),
+            reason: text("reason", MAX_APPROVAL_TEXT),
+            file_changes: Vec::new(),
+            requested_permissions: None,
+        };
+        match method {
+            "item/commandExecution/requestApproval" => {
+                descriptor.command = text("command", MAX_APPROVAL_COMMAND);
+            }
+            "execCommandApproval" => {
+                descriptor.command = params
+                    .get("command")
+                    .and_then(Value::as_array)
+                    .map(|parts| {
+                        let joined = parts
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .take(MAX_APPROVAL_LIST_ITEMS)
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        sanitize_approval_text(&joined, MAX_APPROVAL_COMMAND)
+                    });
+            }
+            "item/fileChange/requestApproval" => {
+                if let Some(root) = text("grantRoot", MAX_APPROVAL_TEXT) {
+                    descriptor.file_changes.push(ApprovalFileChange {
+                        path: root,
+                        operation: "grant_root".to_string(),
+                    });
+                }
+            }
+            "applyPatchApproval" => {
+                if let Some(changes) = params.get("fileChanges").and_then(Value::as_object) {
+                    for (path, change) in changes.iter().take(MAX_APPROVAL_LIST_ITEMS) {
+                        descriptor.file_changes.push(ApprovalFileChange {
+                            path: sanitize_approval_text(path, MAX_APPROVAL_TEXT),
+                            operation: change
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .filter(|kind| matches!(*kind, "add" | "update" | "delete"))
+                                .unwrap_or("unknown")
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+            "item/permissions/requestApproval" => {
+                if let Some(profile) = validated_requested_permissions(params) {
+                    descriptor.requested_permissions = Some(describe_permissions(&profile));
+                    return (descriptor, true);
+                }
+                return (descriptor, false);
+            }
+            _ => {}
+        }
+        (descriptor, true)
+    }
 }
 
 /// An approval is not considered decided by the HTTP adapter until the owner
@@ -268,6 +381,15 @@ impl CodexClient {
     /// so every direct `CodexClient` caller observes the poison, not just
     /// the higher-level doctor/run orchestration.
     async fn rpc_call(&mut self, method: &str, params: Value) -> Result<Value, ClientError> {
+        self.rpc_call_with_delivery(method, params, None).await
+    }
+
+    async fn rpc_call_with_delivery(
+        &mut self,
+        method: &str,
+        params: Value,
+        delivery: Option<&RequestDelivery>,
+    ) -> Result<Value, ClientError> {
         // JsonlClient delegates server requests back to this owner even while
         // an ordinary response is awaited. The cloned policy is an owner
         // capability (the external channel leads to the authenticated API),
@@ -277,22 +399,27 @@ impl CodexClient {
         let auth_refresh_policy = self.auth_refresh_policy.clone();
         let seen_approvals = Arc::clone(&self.seen_approvals);
         match rpc
-            .call_with_server_request_handler(method, params, move |message| {
-                let approval_policy = approval_policy.clone();
-                let auth_refresh_policy = auth_refresh_policy.clone();
-                let seen_approvals = Arc::clone(&seen_approvals);
-                async move {
-                    Self::dispatch_server_request_during_call(
-                        rpc,
-                        &approval_policy,
-                        &auth_refresh_policy,
-                        &seen_approvals,
-                        message,
-                    )
-                    .await
-                    .map_err(|_| JsonlError::ServerRequestDuringCall)
-                }
-            })
+            .call_with_server_request_handler_and_delivery(
+                method,
+                params,
+                delivery,
+                move |message| {
+                    let approval_policy = approval_policy.clone();
+                    let auth_refresh_policy = auth_refresh_policy.clone();
+                    let seen_approvals = Arc::clone(&seen_approvals);
+                    async move {
+                        Self::dispatch_server_request_during_call(
+                            rpc,
+                            &approval_policy,
+                            &auth_refresh_policy,
+                            &seen_approvals,
+                            message,
+                        )
+                        .await
+                        .map_err(|_| JsonlError::ServerRequestDuringCall)
+                    }
+                },
+            )
             .await
         {
             Ok(value) => Ok(value),
@@ -386,6 +513,14 @@ impl CodexClient {
     /// Start an ephemeral, read-only, on-request-approval thread pinned to
     /// `REQUIRED_MODEL`. Fails closed if the server reports a different model.
     pub async fn thread_start(&mut self, cwd: &Path) -> Result<ThreadStarted, ClientError> {
+        self.thread_start_with_delivery(cwd, None).await
+    }
+
+    pub async fn thread_start_with_delivery(
+        &mut self,
+        cwd: &Path,
+        delivery: Option<&RequestDelivery>,
+    ) -> Result<ThreadStarted, ClientError> {
         let params = json!({
             "sandbox": "read-only",
             "approvalPolicy": "on-request",
@@ -393,7 +528,9 @@ impl CodexClient {
             "model": REQUIRED_MODEL,
             "cwd": cwd.to_string_lossy(),
         });
-        let result = self.rpc_call("thread/start", params).await?;
+        let result = self
+            .rpc_call_with_delivery("thread/start", params, delivery)
+            .await?;
 
         let thread_id = result
             .get("thread")
@@ -421,11 +558,22 @@ impl CodexClient {
         thread_id: &str,
         prompt: &str,
     ) -> Result<String, ClientError> {
+        self.turn_start_with_delivery(thread_id, prompt, None).await
+    }
+
+    pub async fn turn_start_with_delivery(
+        &mut self,
+        thread_id: &str,
+        prompt: &str,
+        delivery: Option<&RequestDelivery>,
+    ) -> Result<String, ClientError> {
         let params = json!({
             "threadId": thread_id,
             "input": [{ "type": "text", "text": prompt }],
         });
-        let result = self.rpc_call("turn/start", params).await?;
+        let result = self
+            .rpc_call_with_delivery("turn/start", params, delivery)
+            .await?;
         self.state.on_turn_started()?;
         result
             .get("turn")
@@ -570,6 +718,7 @@ impl CodexClient {
         }
 
         state.on_approval_requested(request_key.clone(), method.to_string())?;
+        let (descriptor, allow_permitted) = ApprovalDescriptor::from_request(method, params);
         let (decision, acknowledgement) = match approval_policy {
             ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, None),
             ApprovalPolicy::Deny => (ApprovalDecision::Deny, None),
@@ -582,6 +731,8 @@ impl CodexClient {
                 let pending_approval = PendingApproval {
                     request_key: request_key.clone(),
                     method: method.to_string(),
+                    descriptor,
+                    allow_permitted,
                     deadline: *timeout,
                     decision: decision_tx,
                 };
@@ -617,6 +768,11 @@ impl CodexClient {
                     }
                 }
             }
+        };
+        let decision = if decision == ApprovalDecision::Allow && !allow_permitted {
+            ApprovalDecision::Deny
+        } else {
+            decision
         };
         // Persist the decision before placing an Allow on the wire.  A
         // journal failure can therefore never leave an unrecorded grant in
@@ -684,6 +840,7 @@ impl CodexClient {
             .await?;
             return Err(ClientError::DuplicateApproval { request_key });
         }
+        let (descriptor, allow_permitted) = ApprovalDescriptor::from_request(method, params);
         let (decision, acknowledgement) = match approval_policy {
             ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, None),
             ApprovalPolicy::Deny => (ApprovalDecision::Deny, None),
@@ -708,6 +865,8 @@ impl CodexClient {
                     .send(PendingApproval {
                         request_key: request_key.clone(),
                         method: method.to_string(),
+                        descriptor,
+                        allow_permitted,
                         deadline: *timeout,
                         decision: decision_tx,
                     })
@@ -732,6 +891,11 @@ impl CodexClient {
                     }
                 }
             }
+        };
+        let decision = if decision == ApprovalDecision::Allow && !allow_permitted {
+            ApprovalDecision::Deny
+        } else {
+            decision
         };
         append_external_approval_decision(approval_policy, &request_key, method, decision).await?;
         if let Err(error) = rpc
@@ -960,6 +1124,279 @@ fn is_request_id(value: &&Value) -> bool {
     value.as_str().is_some() || value.as_i64().is_some()
 }
 
+// Keep the complete serialized descriptor well below the API's 16 KiB event
+// ceiling, so a child cannot make the one approval event silently disappear.
+const MAX_APPROVAL_TEXT: usize = 160;
+const MAX_APPROVAL_COMMAND: usize = 512;
+const MAX_APPROVAL_LIST_ITEMS: usize = 16;
+const MAX_PERMISSION_PROFILE_BYTES: usize = 8 * 1024;
+const MAX_PERMISSION_ENTRIES: usize = 16;
+
+fn approval_kind(method: &str) -> &'static str {
+    match method {
+        "item/commandExecution/requestApproval" | "execCommandApproval" => "command",
+        "item/fileChange/requestApproval" | "applyPatchApproval" => "file_change",
+        "item/permissions/requestApproval" => "permissions",
+        _ => "unknown",
+    }
+}
+
+/// Render only a bounded, human-reviewable summary.  Commands and reasons
+/// are untrusted child text, so likely credential-bearing words, common token
+/// prefixes, and test canaries are redacted before any authenticated SSE
+/// recipient can observe them.
+fn sanitize_approval_text(value: &str, limit: usize) -> String {
+    let mut output = Vec::new();
+    let mut redact_next = false;
+    for word in value.split_whitespace() {
+        let lower = word.to_ascii_lowercase();
+        let sensitive = redact_next
+            || lower.contains("token")
+            || lower.contains("secret")
+            || lower.contains("password")
+            || lower.contains("authorization")
+            || lower.contains("canary")
+            || lower.starts_with("sk-")
+            || lower.starts_with("ghp_")
+            || lower.starts_with("github_pat_")
+            || lower.starts_with("xoxb-");
+        redact_next = lower == "bearer" || lower.ends_with("bearer:");
+        output.push(if sensitive {
+            "[REDACTED]".to_string()
+        } else {
+            word.chars()
+                .filter(|character| !character.is_control())
+                .collect()
+        });
+    }
+    let mut bounded = output.join(" ");
+    if bounded.chars().count() > limit {
+        bounded = bounded.chars().take(limit.saturating_sub(1)).collect();
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn validated_requested_permissions(params: &Value) -> Option<Value> {
+    let profile = params.get("permissions")?;
+    let encoded = serde_json::to_vec(profile).ok()?;
+    if encoded.len() > MAX_PERMISSION_PROFILE_BYTES {
+        return None;
+    }
+    let profile = profile.as_object()?;
+    if profile
+        .keys()
+        .any(|key| key != "fileSystem" && key != "network")
+    {
+        return None;
+    }
+    if !profile
+        .get("fileSystem")
+        .is_none_or(valid_file_system_permissions)
+        || !profile.get("network").is_none_or(valid_network_permissions)
+    {
+        return None;
+    }
+    Some(Value::Object(profile.clone()))
+}
+
+fn valid_file_system_permissions(value: &Value) -> bool {
+    if value.is_null() {
+        return true;
+    }
+    let Some(file_system) = value.as_object() else {
+        return false;
+    };
+    if file_system.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "entries" | "globScanMaxDepth" | "read" | "write"
+        )
+    }) {
+        return false;
+    }
+    if !file_system
+        .get("entries")
+        .is_none_or(|entries| entries.is_null() || valid_permission_entries(entries))
+    {
+        return false;
+    }
+    if !file_system
+        .get("globScanMaxDepth")
+        .is_none_or(|depth| depth.is_null() || depth.as_u64().is_some_and(|depth| depth > 0))
+    {
+        return false;
+    }
+    ["read", "write"].into_iter().all(|kind| {
+        file_system.get(kind).is_none_or(|paths| {
+            paths.is_null()
+                || paths.as_array().is_some_and(|paths| {
+                    paths.len() <= MAX_PERMISSION_ENTRIES
+                        && paths.iter().all(|path| {
+                            path.as_str()
+                                .is_some_and(|path| path.chars().count() <= MAX_APPROVAL_TEXT)
+                        })
+                })
+        })
+    })
+}
+
+fn valid_permission_entries(value: &Value) -> bool {
+    value.as_array().is_some_and(|entries| {
+        entries.len() <= MAX_PERMISSION_ENTRIES
+            && entries.iter().all(|entry| {
+                let Some(entry) = entry.as_object() else {
+                    return false;
+                };
+                if entry.keys().any(|key| key != "access" && key != "path")
+                    || !matches!(
+                        entry.get("access").and_then(Value::as_str),
+                        Some("read" | "write" | "deny")
+                    )
+                {
+                    return false;
+                }
+                valid_permission_path(entry.get("path").unwrap_or(&Value::Null))
+            })
+    })
+}
+
+fn valid_permission_path(value: &Value) -> bool {
+    let Some(path) = value.as_object() else {
+        return false;
+    };
+    let Some(kind) = path.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    match kind {
+        "path" => {
+            path.keys().all(|key| key == "type" || key == "path")
+                && path
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| path.chars().count() <= MAX_APPROVAL_TEXT)
+        }
+        "glob_pattern" => {
+            path.keys().all(|key| key == "type" || key == "pattern")
+                && path
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .is_some_and(|pattern| pattern.chars().count() <= MAX_APPROVAL_TEXT)
+        }
+        "special" => {
+            path.keys().all(|key| key == "type" || key == "value")
+                && path.get("value").is_some_and(valid_special_permission_path)
+        }
+        _ => false,
+    }
+}
+
+fn valid_special_permission_path(value: &Value) -> bool {
+    let Some(path) = value.as_object() else {
+        return false;
+    };
+    let Some(kind) = path.get("kind").and_then(Value::as_str) else {
+        return false;
+    };
+    match kind {
+        "root" | "minimal" | "tmpdir" | "slash_tmp" => path.len() == 1,
+        "project_roots" => {
+            path.keys().all(|key| key == "kind" || key == "subpath")
+                && path.get("subpath").is_none_or(|subpath| {
+                    subpath.is_null()
+                        || subpath
+                            .as_str()
+                            .is_some_and(|value| value.chars().count() <= MAX_APPROVAL_TEXT)
+                })
+        }
+        "unknown" => {
+            path.keys()
+                .all(|key| matches!(key.as_str(), "kind" | "path" | "subpath"))
+                && path
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.chars().count() <= MAX_APPROVAL_TEXT)
+                && path.get("subpath").is_none_or(|subpath| {
+                    subpath.is_null()
+                        || subpath
+                            .as_str()
+                            .is_some_and(|value| value.chars().count() <= MAX_APPROVAL_TEXT)
+                })
+        }
+        _ => false,
+    }
+}
+
+fn valid_network_permissions(value: &Value) -> bool {
+    value.is_null()
+        || value.as_object().is_some_and(|network| {
+            network.keys().all(|key| key == "enabled")
+                && network
+                    .get("enabled")
+                    .is_none_or(|enabled| enabled.is_null() || enabled.is_boolean())
+        })
+}
+
+fn describe_permissions(profile: &Value) -> RequestedPermissions {
+    let mut file_system = Vec::new();
+    let file_system_profile = profile.get("fileSystem").and_then(Value::as_object);
+    if let Some(file_system_profile) = file_system_profile {
+        if let Some(entries) = file_system_profile.get("entries").and_then(Value::as_array) {
+            for entry in entries.iter().take(MAX_PERMISSION_ENTRIES) {
+                if let (Some(access), Some(path)) = (
+                    entry.get("access").and_then(Value::as_str),
+                    describe_permission_path(entry.get("path").unwrap_or(&Value::Null)),
+                ) {
+                    file_system.push(RequestedFileSystemPermission {
+                        access: access.to_string(),
+                        path,
+                    });
+                }
+            }
+        }
+        for (access, key) in [("read", "read"), ("write", "write")] {
+            if let Some(paths) = file_system_profile.get(key).and_then(Value::as_array) {
+                for path in paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .take(MAX_PERMISSION_ENTRIES)
+                {
+                    file_system.push(RequestedFileSystemPermission {
+                        access: access.to_string(),
+                        path: sanitize_approval_text(path, MAX_APPROVAL_TEXT),
+                    });
+                }
+            }
+        }
+    }
+    RequestedPermissions {
+        file_system,
+        network_enabled: profile.pointer("/network/enabled").and_then(Value::as_bool),
+    }
+}
+
+fn describe_permission_path(value: &Value) -> Option<String> {
+    let path = value.as_object()?;
+    match path.get("type").and_then(Value::as_str)? {
+        "path" => path
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| sanitize_approval_text(path, MAX_APPROVAL_TEXT)),
+        "glob_pattern" => path.get("pattern").and_then(Value::as_str).map(|pattern| {
+            format!(
+                "glob:{}",
+                sanitize_approval_text(pattern, MAX_APPROVAL_TEXT)
+            )
+        }),
+        "special" => path
+            .get("value")
+            .and_then(|value| value.get("kind"))
+            .and_then(Value::as_str)
+            .map(|kind| format!("special:{kind}")),
+        _ => None,
+    }
+}
+
 fn approval_request_key(method: &str, id: &Value, params: &Value) -> String {
     let stable = params
         .get("approvalId")
@@ -1009,8 +1446,7 @@ fn approval_response(method: &str, decision: ApprovalDecision, params: Option<&V
             // persisted or exposed through SSE.
             let permissions = match decision {
                 ApprovalDecision::Allow => params
-                    .and_then(|params| params.get("permissions"))
-                    .cloned()
+                    .and_then(validated_requested_permissions)
                     .unwrap_or_else(empty_permission_profile),
                 ApprovalDecision::Deny | ApprovalDecision::Timeout => empty_permission_profile(),
             };
@@ -1034,6 +1470,68 @@ fn empty_permission_profile() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Approval context is enough to review the requested action, but it is
+    /// bounded and redacted before it crosses the authenticated API/SSE
+    /// boundary. Raw patch content and secret-shaped command text never join
+    /// that descriptor.
+    #[test]
+    fn approval_descriptor_is_schema_aware_bounded_and_redacted() {
+        let canary = "APPROVAL_SECRET_CANARY_DO_NOT_EXPOSE";
+        let (command, allowed) = ApprovalDescriptor::from_request(
+            "item/commandExecution/requestApproval",
+            &json!({
+                "command": format!("deploy --token {canary}"),
+                "cwd": "/tmp/repo",
+                "reason": "needs network access",
+            }),
+        );
+        assert!(allowed);
+        assert_eq!(command.kind, "command");
+        assert_eq!(command.cwd.as_deref(), Some("/tmp/repo"));
+        assert_eq!(command.reason.as_deref(), Some("needs network access"));
+        let encoded = serde_json::to_string(&command).expect("descriptor json");
+        assert!(!encoded.contains(canary));
+        assert!(encoded.len() <= 2 * MAX_APPROVAL_COMMAND);
+
+        let (permissions, allowed) = ApprovalDescriptor::from_request(
+            "item/permissions/requestApproval",
+            &json!({
+                "cwd": "/tmp/repo",
+                "permissions": {
+                    "fileSystem": { "entries": [{
+                        "access": "write",
+                        "path": { "type": "path", "path": "/tmp/repo/output" }
+                    }] },
+                    "network": { "enabled": true }
+                }
+            }),
+        );
+        assert!(allowed);
+        assert_eq!(permissions.kind, "permissions");
+        assert_eq!(
+            permissions
+                .requested_permissions
+                .as_ref()
+                .expect("permission descriptor")
+                .file_system[0]
+                .access,
+            "write"
+        );
+
+        let invalid =
+            json!({ "permissions": { "network": { "enabled": true, "host": "unbounded" } } });
+        let (invalid_descriptor, allowed) =
+            ApprovalDescriptor::from_request("item/permissions/requestApproval", &invalid);
+        assert!(!allowed);
+        assert!(invalid_descriptor.requested_permissions.is_none());
+        let response = approval_response(
+            "item/permissions/requestApproval",
+            ApprovalDecision::Allow,
+            Some(&invalid),
+        );
+        assert_eq!(response["permissions"], empty_permission_profile());
+    }
 
     /// T10: canonical 0.144.3 quota admission is fail-closed.  An available
     /// secondary window never overrides an exhausted primary or an explicit

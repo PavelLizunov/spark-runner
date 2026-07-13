@@ -21,6 +21,7 @@ use crate::journal::{
     project_recovery, ApprovalTerminalDecision, ExecutionTerminalStatus, JournalConfig,
     JournalEvent, JournalWriter, TurnTerminalStatus,
 };
+use crate::jsonl::RequestDelivery;
 use crate::process::{ChildProcess, ProcessError};
 use crate::state::{ApprovalDecision, InternalEventKind};
 
@@ -50,17 +51,47 @@ pub enum AppError {
 /// never aborts a task: it asks this owner to deliver protocol cancellation,
 /// journal the terminal transition, and reap the process group first.
 pub enum RuntimeControl {
-    Interrupt(oneshot::Sender<()>),
+    Interrupt(oneshot::Sender<ControlOutcome>),
 }
 
-fn interrupted_by_control(
+/// What the process owner learned after requested cancellation and bounded
+/// cleanup. An ambiguous delivery cannot be recast as an ordinary interrupt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlOutcome {
+    Interrupted,
+    Unknown,
+}
+
+struct ControlledCompletion {
+    acknowledgement: Option<oneshot::Sender<ControlOutcome>>,
+    acknowledgement_outcome: ControlOutcome,
+    status: String,
+    execution_status: ExecutionTerminalStatus,
+}
+
+fn control_received(
     control: Option<RuntimeControl>,
-) -> Result<(Option<oneshot::Sender<()>>, String), AppError> {
+    acknowledgement: &mut Option<oneshot::Sender<ControlOutcome>>,
+) -> Result<(), AppError> {
     match control {
-        Some(RuntimeControl::Interrupt(ack)) => Ok((Some(ack), "interrupted".to_string())),
+        Some(RuntimeControl::Interrupt(ack)) => {
+            *acknowledgement = Some(ack);
+            Ok(())
+        }
         // Losing the command authority is fail-closed. The final cleanup
         // below still owns the child process and releases admission once.
         None => Err(AppError::Client(ClientError::TurnDeadlineExceeded)),
+    }
+}
+
+fn interrupted_completion(
+    acknowledgement: Option<oneshot::Sender<ControlOutcome>>,
+) -> ControlledCompletion {
+    ControlledCompletion {
+        acknowledgement,
+        acknowledgement_outcome: ControlOutcome::Interrupted,
+        status: "interrupted".to_string(),
+        execution_status: ExecutionTerminalStatus::Interrupted,
     }
 }
 
@@ -104,6 +135,7 @@ impl RuntimeLauncher {
 enum LaunchSpec {
     Live {
         executable: crate::config::VerifiedExecutable,
+        subscription_auth: crate::config::VerifiedSubscriptionAuth,
         args: Vec<String>,
     },
     Fake {
@@ -125,6 +157,15 @@ impl LaunchSpec {
             Self::Live { args, .. } | Self::Fake { args, .. } => args,
         }
     }
+
+    fn subscription_auth_mut(&mut self) -> Option<&mut crate::config::VerifiedSubscriptionAuth> {
+        match self {
+            Self::Live {
+                subscription_auth, ..
+            } => Some(subscription_auth),
+            Self::Fake { .. } => None,
+        }
+    }
 }
 
 fn launch_spec(launcher: &RuntimeLauncher) -> Result<LaunchSpec, AppError> {
@@ -133,6 +174,7 @@ fn launch_spec(launcher: &RuntimeLauncher) -> Result<LaunchSpec, AppError> {
             let lock = CodexLock::load(Path::new(DEFAULT_CODEX_LOCK))?;
             Ok(LaunchSpec::Live {
                 executable: lock.verified_for_spawn()?,
+                subscription_auth: config::selected_subscription_auth()?,
                 args: LIVE_ARGS.iter().map(|arg| arg.to_string()).collect(),
             })
         }
@@ -165,12 +207,24 @@ async fn spawn_client_with_launcher(
     launcher: &RuntimeLauncher,
     approval_policy: ApprovalPolicy,
 ) -> Result<(CodexClient, PathBuf), AppError> {
-    let launch = launch_spec(launcher)?;
+    let mut launch = launch_spec(launcher)?;
     let cwd = config::ephemeral_cwd()?;
     // `launch` stays alive across spawn. On Linux its program is an inherited
     // `/proc/self/fd/N` handle to the inode whose bytes were just verified.
     let program = launch.program();
-    let spawned = ChildProcess::spawn(&program, launch.args(), Some(&cwd))?;
+    let args = launch.args().to_vec();
+    let spawned = match ChildProcess::spawn_with_subscription_auth(
+        &program,
+        &args,
+        Some(&cwd),
+        launch.subscription_auth_mut(),
+    ) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&cwd);
+            return Err(error.into());
+        }
+    };
     let client = CodexClient::with_approval_policy(
         spawned.process,
         spawned.stdin,
@@ -670,16 +724,41 @@ pub async fn run_turn_with_launcher_controlled_with_journal(
     let approval_events_are_synchronous =
         matches!(&approval_policy, ApprovalPolicy::External { .. });
     let approval_policy = with_approval_receipt(approval_policy, journal.as_ref(), &execution_id);
-    let (mut client, cwd) = spawn_client_with_launcher(&launcher, approval_policy).await?;
-    let result = 'flow: {
+    let (mut client, cwd) = match spawn_client_with_launcher(&launcher, approval_policy).await {
+        Ok(client) => client,
+        Err(error) => {
+            append_journal(
+                journal.as_ref(),
+                JournalEvent::ExecutionCompleted {
+                    execution_id,
+                    status: ExecutionTerminalStatus::Failed,
+                },
+            )
+            .await?;
+            if owns_journal {
+                if let Some(journal) = journal {
+                    journal.shutdown().await?;
+                }
+            }
+            return Err(error);
+        }
+    };
+    let mut control_acknowledgement = None;
+    let result: Result<ControlledCompletion, AppError> = 'flow: {
         let initialized = tokio::select! {
             result = client.initialize() => result,
-            control = controls.recv() => break 'flow interrupted_by_control(control),
+            control = controls.recv() => {
+                control_received(control, &mut control_acknowledgement)?;
+                break 'flow Ok(interrupted_completion(control_acknowledgement.take()));
+            }
         };
         initialized?;
         let rate_limits = tokio::select! {
             result = client.admit_live_turn() => result,
-            control = controls.recv() => break 'flow interrupted_by_control(control),
+            control = controls.recv() => {
+                control_received(control, &mut control_acknowledgement)?;
+                break 'flow Ok(interrupted_completion(control_acknowledgement.take()));
+            }
         }?;
         append_journal(
             journal.as_ref(),
@@ -689,13 +768,27 @@ pub async fn run_turn_with_launcher_controlled_with_journal(
             },
         )
         .await?;
+        let thread_delivery = RequestDelivery::new();
         let thread = tokio::select! {
-            result = client.thread_start(&cwd) => result.map_err(non_idempotent("thread/start")),
-            control = controls.recv() => break 'flow interrupted_by_control(control),
+            result = client.thread_start_with_delivery(&cwd, Some(&thread_delivery)) => result.map_err(non_idempotent("thread/start")),
+            control = controls.recv() => {
+                control_received(control, &mut control_acknowledgement)?;
+                if thread_delivery.was_written() {
+                    break 'flow Err(AppError::Client(ClientError::AmbiguousNonIdempotent { method: "thread/start" }));
+                }
+                break 'flow Ok(interrupted_completion(control_acknowledgement.take()));
+            }
         }?;
+        let turn_delivery = RequestDelivery::new();
         let turn_id = tokio::select! {
-            result = client.turn_start(&thread.thread_id, &prompt) => result.map_err(non_idempotent("turn/start")),
-            control = controls.recv() => break 'flow interrupted_by_control(control),
+            result = client.turn_start_with_delivery(&thread.thread_id, &prompt, Some(&turn_delivery)) => result.map_err(non_idempotent("turn/start")),
+            control = controls.recv() => {
+                control_received(control, &mut control_acknowledgement)?;
+                if turn_delivery.was_written() {
+                    break 'flow Err(AppError::Client(ClientError::AmbiguousNonIdempotent { method: "turn/start" }));
+                }
+                break 'flow Ok(interrupted_completion(control_acknowledgement.take()));
+            }
         }?;
         append_journal(
             journal.as_ref(),
@@ -710,8 +803,8 @@ pub async fn run_turn_with_launcher_controlled_with_journal(
         tokio::pin!(deadline);
         tokio::select! {
             biased;
-            control = controls.recv() => match control {
-                Some(RuntimeControl::Interrupt(ack)) => {
+            control = controls.recv() => {
+                control_received(control, &mut control_acknowledgement)?;
                     // Both ids come from accepted 0.144.3 responses; do not
                     // synthesize a terminal state if delivery failed or its
                     // result was rejected. That boundary is ambiguous and is
@@ -743,9 +836,12 @@ pub async fn run_turn_with_launcher_controlled_with_journal(
                         },
                     )
                     .await?;
-                    Ok((Some(ack), terminal.status))
-                }
-                None => Err(AppError::Client(ClientError::TurnDeadlineExceeded)),
+                    Ok(ControlledCompletion {
+                        acknowledgement: control_acknowledgement.take(),
+                        acknowledgement_outcome: ControlOutcome::Interrupted,
+                        status: terminal.status,
+                        execution_status: ExecutionTerminalStatus::Interrupted,
+                    })
             },
             completed = client.wait_turn_completed() => {
                 let turn = completed.map_err(non_idempotent("turn/completed"))?;
@@ -757,7 +853,16 @@ pub async fn run_turn_with_launcher_controlled_with_journal(
                         status: turn_status(&turn.status),
                     },
                 ).await?;
-                Ok((None, turn.status))
+                Ok(ControlledCompletion {
+                    acknowledgement: None,
+                    acknowledgement_outcome: ControlOutcome::Interrupted,
+                    execution_status: if turn.status == "completed" {
+                        ExecutionTerminalStatus::Completed
+                    } else {
+                        ExecutionTerminalStatus::Failed
+                    },
+                    status: turn.status,
+                })
             },
             _ = &mut deadline => Err(AppError::Client(ClientError::TurnDeadlineExceeded)),
         }
@@ -805,43 +910,39 @@ pub async fn run_turn_with_launcher_controlled_with_journal(
             journal.as_ref(),
             JournalEvent::ExecutionCompleted {
                 execution_id: execution_id.clone(),
-                status: if result.is_ok() {
-                    ExecutionTerminalStatus::Completed
-                } else {
-                    ExecutionTerminalStatus::Failed
-                },
+                status: result
+                    .as_ref()
+                    .map(|completion| completion.execution_status)
+                    .unwrap_or(ExecutionTerminalStatus::Failed),
             },
         )
         .await?;
     }
-    let interrupt_ack = result.as_ref().ok().and_then(|(ack, _)| ack.as_ref());
     client.shutdown().await?;
     let _ = std::fs::remove_dir_all(&cwd);
-    if let Some(ack) = interrupt_ack {
-        // `ack` is borrowed only to show the ordering; it is sent below from
-        // the owned result after process-group cleanup has completed.
-        let _ = ack;
-    }
     if owns_journal {
         if let Some(journal) = journal {
             journal.shutdown().await?;
         }
     }
     match result {
-        Ok((Some(ack), status)) => {
-            let _ = ack.send(());
+        Ok(completion) => {
+            if let Some(acknowledgement) = completion.acknowledgement {
+                let _ = acknowledgement.send(completion.acknowledgement_outcome);
+            }
             Ok(format!(
                 "run: mode={} model={} turn_status={status}",
                 mode_label(live),
-                REQUIRED_MODEL
+                REQUIRED_MODEL,
+                status = completion.status,
             ))
         }
-        Ok((None, status)) => Ok(format!(
-            "run: mode={} model={} turn_status={status}",
-            mode_label(live),
-            REQUIRED_MODEL
-        )),
-        Err(error) => Err(error),
+        Err(error) => {
+            if let Some(acknowledgement) = control_acknowledgement {
+                let _ = acknowledgement.send(ControlOutcome::Unknown);
+            }
+            Err(error)
+        }
     }
 }
 
