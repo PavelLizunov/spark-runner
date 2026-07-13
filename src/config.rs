@@ -10,9 +10,6 @@ use clap::{Parser, Subcommand};
 use serde::Deserialize;
 
 pub const DEFAULT_CODEX_LOCK: &str = "codex.lock";
-const EXPECTED_CODEX_VERSION: &str = "0.142.0";
-const EXPECTED_CODEX_SHA256: &str =
-    "d3be844c45c4fd89392536e56e1010963f94785592596b50cd0c45bb8a341406";
 const EXPECTED_CODEX_TRANSPORT: &str = "stdio";
 const EXPECTED_CODEX_SCHEMA_PATH: &str = "protocol/0.142.0/stable.schema.json";
 const PLACEHOLDER_SCHEMA_HASH: &str = "generated-after-implementation";
@@ -53,6 +50,11 @@ pub struct CodexLock {
     pub binary_path: String,
     pub version: String,
     pub sha256: String,
+    /// The JavaScript entry point is only a launcher.  The app-server is the
+    /// platform-native executable selected by its installed package layout;
+    /// both artifacts are pinned because the latter is what we execute.
+    pub native_path: String,
+    pub native_sha256: String,
     pub transport: String,
     pub required_model: String,
     pub schema_path: String,
@@ -108,8 +110,6 @@ impl CodexLock {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        validate_lock_field("version", EXPECTED_CODEX_VERSION, &self.version)?;
-        validate_lock_field("sha256", EXPECTED_CODEX_SHA256, &self.sha256)?;
         validate_lock_field("transport", EXPECTED_CODEX_TRANSPORT, &self.transport)?;
         validate_lock_field(
             "required_model",
@@ -119,6 +119,11 @@ impl CodexLock {
         validate_lock_field("schema_path", EXPECTED_CODEX_SCHEMA_PATH, &self.schema_path)?;
         if self.schema_hash.is_empty() || self.schema_hash == PLACEHOLDER_SCHEMA_HASH {
             return Err(ConfigError::InvalidSchemaHash(self.schema_hash.clone()));
+        }
+        if self.sha256.len() != 64 || self.native_sha256.len() != 64 {
+            return Err(ConfigError::InvalidSchemaHash(
+                "invalid runtime hash".to_string(),
+            ));
         }
         Ok(())
     }
@@ -148,7 +153,26 @@ impl CodexLock {
                 host,
             });
         }
-        verify_hash("runtime", &canonical, &self.sha256)?;
+        verify_hash("launcher", &canonical, &self.sha256)?;
+
+        let native = Path::new(&self.native_path);
+        if !native.is_absolute() {
+            return Err(ConfigError::InvalidExecutable(self.native_path.clone()));
+        }
+        let native = std::fs::canonicalize(native)
+            .map_err(|_| ConfigError::InvalidExecutable(self.native_path.clone()))?;
+        let native_metadata = std::fs::metadata(&native)
+            .map_err(|_| ConfigError::InvalidExecutable(native.display().to_string()))?;
+        if !native_metadata.is_file() || !is_executable(&native_metadata) {
+            return Err(ConfigError::InvalidExecutable(native.display().to_string()));
+        }
+        // The checked-in lock records the native executable resolved by the
+        // installed Codex launcher's documented vendor layout.  Refuse an
+        // unrelated executable even if its bytes happen to be pinned.
+        if !native.components().any(|part| part.as_os_str() == "vendor") {
+            return Err(ConfigError::InvalidExecutable(native.display().to_string()));
+        }
+        verify_hash("native runtime", &native, &self.native_sha256)?;
 
         let schema = Path::new(&self.schema_path);
         let schema = std::fs::canonicalize(schema).map_err(|_| ConfigError::HashMismatch {
@@ -165,7 +189,7 @@ impl CodexLock {
         }
         verify_hash("schema", &schema, &self.schema_hash)?;
 
-        let output = ProcessCommand::new(&canonical)
+        let output = ProcessCommand::new(&native)
             .arg("--version")
             .output()
             .map_err(ConfigError::VersionCheck)?;
@@ -176,7 +200,7 @@ impl CodexLock {
                 expected: self.version.clone(),
             });
         }
-        Ok(canonical)
+        Ok(native)
     }
 }
 
@@ -346,7 +370,10 @@ pub fn ephemeral_cwd() -> Result<PathBuf, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::sha256_hex;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{sha256_hex, CodexLock, ConfigError};
 
     #[test]
     fn sha256_matches_the_standard_test_vector() {
@@ -354,5 +381,51 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    /// T09: the launcher is not treated as the executable.  A changed native
+    /// payload is rejected before its version command can be invoked.
+    #[cfg(unix)]
+    #[test]
+    fn native_runtime_bytes_are_pinned_before_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("spark-runner-pin-{unique}"));
+        let vendor = root.join("vendor/test/bin");
+        fs::create_dir_all(&vendor).expect("vendor");
+        let launcher = root.join("launcher");
+        let native = vendor.join("codex");
+        fs::write(&launcher, b"#!/bin/sh\necho codex-cli 0.142.0\n").expect("launcher");
+        fs::write(&native, b"#!/bin/sh\necho codex-cli 0.142.0\n").expect("native");
+        for path in [&launcher, &native] {
+            let mut permissions = fs::metadata(path).expect("metadata").permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(path, permissions).expect("chmod");
+        }
+        let schema = std::path::Path::new("protocol/0.142.0/stable.schema.json");
+        let lock = CodexLock {
+            binary_path: launcher.display().to_string(),
+            version: "0.142.0".to_string(),
+            sha256: sha256_hex(&fs::read(&launcher).expect("launcher bytes")),
+            native_path: native.display().to_string(),
+            native_sha256: "0".repeat(64),
+            transport: "stdio".to_string(),
+            required_model: crate::client::REQUIRED_MODEL.to_string(),
+            schema_path: schema.display().to_string(),
+            schema_hash: sha256_hex(&fs::read(schema).expect("schema bytes")),
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        };
+        assert!(matches!(
+            lock.verify_for_spawn(),
+            Err(ConfigError::HashMismatch {
+                kind: "native runtime",
+                ..
+            })
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 }

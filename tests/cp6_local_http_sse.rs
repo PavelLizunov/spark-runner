@@ -3,9 +3,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use spark_runner::api::{app, ApiConfig};
-use tokio::time::{sleep, Duration};
 use tower::ServiceExt;
 
 fn config() -> ApiConfig {
@@ -170,7 +170,27 @@ async fn fake_child_sse_resume_keeps_approval_and_terminal_events() {
     assert_eq!(status, StatusCode::OK);
     let turn_id = turn["id"].as_str().unwrap();
 
-    sleep(Duration::from_millis(300)).await;
+    // The SSE stream is the synchronization barrier: the real app-server
+    // approval request must be observed before an HTTP decision is sent.
+    let events_request = Request::builder()
+        .uri(format!("/v1/turns/{turn_id}/events"))
+        .header(header::AUTHORIZATION, "Bearer test-token")
+        .body(Body::empty())
+        .unwrap();
+    let events_response = router.clone().oneshot(events_request).await.unwrap();
+    let mut events = events_response.into_body().into_data_stream();
+    let mut saw_approval = false;
+    while let Some(chunk) = events.next().await {
+        let chunk = chunk.unwrap();
+        if std::str::from_utf8(&chunk)
+            .unwrap()
+            .contains("approval.requested")
+        {
+            saw_approval = true;
+            break;
+        }
+    }
+    assert!(saw_approval, "SSE must report a genuine pending approval");
     let (status, approval) = request_json(
         router.clone(),
         "POST",

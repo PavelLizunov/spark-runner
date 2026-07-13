@@ -4,8 +4,10 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
 use serde_json::{json, Value};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::jsonl::{JsonlClient, JsonlError};
 use crate::process::ChildProcess;
@@ -46,6 +48,8 @@ pub enum ClientError {
     ChatGptAuthRequired,
     #[error("app-server rate-limit response has no remaining quota")]
     QuotaUnavailable,
+    #[error("runtime turn deadline elapsed; execution cancelled")]
+    TurnDeadlineExceeded,
 }
 
 impl ClientError {
@@ -59,10 +63,27 @@ impl ClientError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ApprovalPolicy {
     Deny,
     AllowForTests,
+    /// The sole runtime owner relays a genuine server request to an
+    /// authenticated adapter.  The original JSON-RPC id never leaves this
+    /// client; the adapter receives only an opaque pending handle.
+    External {
+        pending: mpsc::Sender<PendingApproval>,
+        timeout: Duration,
+    },
+}
+
+/// A decision channel for one real app-server request.  It is deliberately
+/// one-shot: duplicate HTTP decisions, disconnects and owner shutdown cannot
+/// result in two JSON-RPC responses for the same request id.
+#[derive(Debug)]
+pub struct PendingApproval {
+    pub request_key: String,
+    pub method: String,
+    pub decision: oneshot::Sender<ApprovalDecision>,
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +298,24 @@ impl CodexClient {
                     return self
                         .handle_turn_completed(message.get("params").unwrap_or(&Value::Null));
                 }
+                if method == "model/rerouted" {
+                    self.state.poison();
+                    let observed = message
+                        .get("params")
+                        .and_then(|params| {
+                            params
+                                .get("model")
+                                .or_else(|| params.get("toModel"))
+                                .or_else(|| params.get("newModel"))
+                        })
+                        .and_then(Value::as_str)
+                        .unwrap_or("rerouted")
+                        .to_string();
+                    return Err(ClientError::FallbackModel {
+                        observed,
+                        required: REQUIRED_MODEL,
+                    });
+                }
                 tracing::debug!(method, "ignoring non-terminal app-server notification");
                 continue;
             }
@@ -339,9 +378,25 @@ impl CodexClient {
 
         self.state
             .on_approval_requested(request_key.clone(), method.to_string())?;
-        let decision = match self.approval_policy {
+        let decision = match &self.approval_policy {
             ApprovalPolicy::AllowForTests => ApprovalDecision::Allow,
             ApprovalPolicy::Deny => ApprovalDecision::Deny,
+            ApprovalPolicy::External { pending, timeout } => {
+                let (decision_tx, decision_rx) = oneshot::channel();
+                let pending_approval = PendingApproval {
+                    request_key: request_key.clone(),
+                    method: method.to_string(),
+                    decision: decision_tx,
+                };
+                if pending.send(pending_approval).await.is_err() {
+                    ApprovalDecision::Deny
+                } else {
+                    match tokio::time::timeout(*timeout, decision_rx).await {
+                        Ok(Ok(decision)) => decision,
+                        Ok(Err(_)) | Err(_) => ApprovalDecision::Timeout,
+                    }
+                }
+            }
         };
         self.state.on_approval_decided(
             request_key,

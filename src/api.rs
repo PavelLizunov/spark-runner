@@ -21,11 +21,16 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
-use crate::client::{ApprovalPolicy, REQUIRED_MODEL};
-use crate::orchestrator::run_turn_with_fake_server_args_and_approval_policy;
+use crate::client::{ApprovalPolicy, PendingApproval, REQUIRED_MODEL};
+use crate::config::{CodexLock, DEFAULT_CODEX_LOCK};
+use crate::orchestrator::{
+    recover_before_readiness, run_turn_with_approval_policy,
+    run_turn_with_fake_server_args_and_approval_policy,
+};
+use crate::state::ApprovalDecision;
 
 const DEFAULT_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8787);
 const MAX_BODY_BYTES: usize = 16 * 1024;
@@ -34,6 +39,10 @@ const MAX_EVENTS_PER_TURN: usize = 256;
 const MAX_EVENT_BYTES: usize = 16 * 1024;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const MAX_CONCURRENT_TURNS: usize = 1;
+const MAX_THREADS: usize = 128;
+const MAX_TURNS: usize = 256;
+const MAX_APPROVALS: usize = 256;
+const DEFAULT_TURN_TIMEOUT_SECONDS: u64 = 120;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
@@ -139,7 +148,34 @@ pub struct AppState {
 
 struct Inner {
     config: ApiConfig,
+    owner: RuntimeOwner,
     data: Mutex<StateData>,
+}
+
+/// The one runtime authority used by the HTTP adapter.  It decides the launch
+/// mode at construction, validates live bytes before reporting readiness, and
+/// is the only route from a turn to the orchestrator.
+struct RuntimeOwner {
+    live: bool,
+    ready: bool,
+}
+
+impl RuntimeOwner {
+    fn new(live: bool) -> Self {
+        let ready = !live
+            || CodexLock::load(std::path::Path::new(DEFAULT_CODEX_LOCK))
+                .and_then(|lock| lock.verify_for_spawn())
+                .is_ok();
+        Self { live, ready }
+    }
+
+    fn mode(&self) -> &'static str {
+        if self.live {
+            "live"
+        } else {
+            "offline-fake-app-server"
+        }
+    }
 }
 
 struct StateData {
@@ -171,7 +207,7 @@ struct ApprovalRecord {
     id: String,
     turn_id: String,
     status: ApprovalStatus,
-    decision: Option<oneshot::Sender<ApprovalStatus>>,
+    decision: Option<oneshot::Sender<ApprovalDecision>>,
 }
 
 #[derive(Clone, Copy, Serialize, PartialEq, Eq)]
@@ -323,6 +359,7 @@ impl IntoResponse for ApiRejection {
 pub fn app(config: ApiConfig) -> Router {
     let state = AppState {
         inner: Arc::new(Inner {
+            owner: RuntimeOwner::new(config.live),
             config,
             data: Mutex::new(StateData {
                 next_thread: 1,
@@ -390,7 +427,7 @@ async fn health() -> Json<HealthResponse<'static>> {
 async fn ready(
     State(state): State<AppState>,
 ) -> Result<Json<HealthResponse<'static>>, ApiRejection> {
-    if state.inner.config.live {
+    if !state.inner.owner.ready {
         return Err(rejection(
             StatusCode::SERVICE_UNAVAILABLE,
             "RUNTIME_NOT_READY",
@@ -412,11 +449,7 @@ async fn runtime(State(state): State<AppState>) -> Json<RuntimeResponse> {
     aliases.sort();
     Json(RuntimeResponse {
         runtime: "spark-runner",
-        mode: if state.inner.config.live {
-            "live"
-        } else {
-            "offline-fake-app-server"
-        },
+        mode: state.inner.owner.mode(),
         public_access: false,
         full_access: false,
         chat_completions: false,
@@ -487,6 +520,14 @@ async fn create_thread(
     }
 
     let mut data = state.inner.data.lock().expect("state mutex poisoned");
+    if data.threads.len() >= MAX_THREADS {
+        return Err(rejection(
+            StatusCode::TOO_MANY_REQUESTS,
+            "THREAD_CAPACITY",
+            "thread capacity is full",
+            true,
+        ));
+    }
     let id = format!("thread_{}", data.next_thread);
     data.next_thread += 1;
     data.threads.insert(
@@ -510,7 +551,7 @@ async fn create_turn(
     Json(req): Json<CreateTurnRequest>,
 ) -> Result<Json<TurnResponse>, ApiRejection> {
     reject_payload_token(req.bearer_token.as_deref())?;
-    if state.inner.config.live {
+    if !state.inner.owner.ready {
         return Err(rejection(
             StatusCode::SERVICE_UNAVAILABLE,
             "RUNTIME_NOT_READY",
@@ -545,6 +586,14 @@ async fn create_turn(
                 StatusCode::TOO_MANY_REQUESTS,
                 "SATURATED",
                 "turn queue is full",
+                true,
+            ));
+        }
+        if data.turns.len() >= MAX_TURNS {
+            return Err(rejection(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TURN_CAPACITY",
+                "terminal turn retention is full",
                 true,
             ));
         }
@@ -589,8 +638,10 @@ async fn create_turn(
 
     let child_state = state.clone();
     let child_turn_id = turn_id.clone();
+    let approval_timeout =
+        std::time::Duration::from_secs(req.timeout_seconds.unwrap_or(DEFAULT_TURN_TIMEOUT_SECONDS));
     let task = tokio::spawn(async move {
-        run_fake_child_turn(child_state, child_turn_id, req.input).await;
+        run_runtime_owner_turn(child_state, child_turn_id, req.input, approval_timeout).await;
     });
     if let Some(turn) = state
         .inner
@@ -611,7 +662,15 @@ async fn create_turn(
     }))
 }
 
-async fn run_fake_child_turn(state: AppState, turn_id: String, prompt: String) {
+/// Offline construction is an explicit test fixture.  The HTTP layer never
+/// creates approvals itself: it only receives real app-server requests from
+/// this owner and returns exactly one caller decision to the original RPC id.
+async fn run_runtime_owner_turn(
+    state: AppState,
+    turn_id: String,
+    prompt: String,
+    timeout: std::time::Duration,
+) {
     push_event(
         &state,
         &turn_id,
@@ -619,45 +678,49 @@ async fn run_fake_child_turn(state: AppState, turn_id: String, prompt: String) {
         serde_json::json!({}),
         false,
     );
-    let (approval_id, approval_rx) = create_approval(&state, &turn_id);
-    set_turn_status(&state, &turn_id, TurnStatus::WaitingApproval);
-    push_event(
-        &state,
-        &turn_id,
-        "approval.requested",
-        serde_json::json!({ "approval_id": approval_id }),
-        false,
-    );
-    let decision = match approval_rx.await {
-        Ok(decision) => decision,
-        Err(_) => return,
+    let (pending_tx, mut pending_rx) = mpsc::channel(1);
+    let live = state.inner.owner.live;
+    let mut deadline = Box::pin(tokio::time::sleep(timeout));
+    let mut run = Box::pin(async move {
+        let policy = ApprovalPolicy::External {
+            pending: pending_tx,
+            timeout,
+        };
+        if live {
+            run_turn_with_approval_policy(prompt, true, policy).await
+        } else {
+            let fixture_args = vec!["--approval-mode".to_string(), "command".to_string()];
+            run_turn_with_fake_server_args_and_approval_policy(prompt, &fixture_args, policy).await
+        }
+    });
+
+    let result = loop {
+        tokio::select! {
+            result = &mut run => break result,
+            _ = &mut deadline => break Err(crate::orchestrator::AppError::Client(
+                crate::client::ClientError::TurnDeadlineExceeded,
+            )),
+            pending = pending_rx.recv() => if let Some(pending) = pending {
+                if register_runtime_approval(&state, &turn_id, pending).is_err() {
+                    break Err(crate::orchestrator::AppError::Client(
+                        crate::client::ClientError::SessionPoisoned,
+                    ));
+                }
+            }
+        }
     };
-    if decision == ApprovalStatus::Denied {
-        let _ = update_turn_terminal(
-            &state,
-            &turn_id,
-            TurnStatus::Interrupted,
-            "turn.denied",
-            serde_json::json!({ "status": "denied" }),
-        );
-        return;
-    }
-    let result = run_turn_with_fake_server_args_and_approval_policy(
-        prompt,
-        &["--approval-mode".to_string(), "command".to_string()],
-        ApprovalPolicy::AllowForTests,
-    )
-    .await;
     let (status, kind, payload) = match result {
         Ok(summary) => (
             TurnStatus::Completed,
             "turn.completed",
             serde_json::json!({ "status": "completed", "summary": summary }),
         ),
-        Err(err) => (
+        Err(_err) => (
             TurnStatus::Failed,
             "turn.failed",
-            serde_json::json!({ "status": "failed", "error": err.to_string() }),
+            // AppError Display may contain local paths or child-controlled
+            // text.  HTTP/SSE exports a bounded allowlisted class only.
+            serde_json::json!({ "status": "failed", "error": { "class": "runtime_failure" } }),
         ),
     };
     let _ = update_turn_terminal(&state, &turn_id, status, kind, payload);
@@ -796,21 +859,59 @@ fn validate_workspace(state: &AppState, alias: &str) -> Result<(), ApiRejection>
     Ok(())
 }
 
-fn create_approval(state: &AppState, turn_id: &str) -> (String, oneshot::Receiver<ApprovalStatus>) {
+fn register_runtime_approval(
+    state: &AppState,
+    turn_id: &str,
+    pending: PendingApproval,
+) -> Result<(), ApiRejection> {
     let mut data = state.inner.data.lock().expect("state mutex poisoned");
+    if data.approvals.len() >= MAX_APPROVALS {
+        let _ = pending.decision.send(ApprovalDecision::Deny);
+        return Err(rejection(
+            StatusCode::TOO_MANY_REQUESTS,
+            "APPROVAL_CAPACITY",
+            "approval capacity is full",
+            true,
+        ));
+    }
+    let turn = data
+        .turns
+        .get(turn_id)
+        .ok_or_else(|| rejection(StatusCode::NOT_FOUND, "NOT_FOUND", "turn not found", false))?;
+    if is_terminal(turn.status) {
+        let _ = pending.decision.send(ApprovalDecision::Deny);
+        return Err(rejection(
+            StatusCode::BAD_REQUEST,
+            "TURN_TERMINAL",
+            "turn is already terminal",
+            false,
+        ));
+    }
     let id = format!("approval_{}", data.next_approval);
     data.next_approval += 1;
-    let (decision, receiver) = oneshot::channel();
     data.approvals.insert(
         id.clone(),
         ApprovalRecord {
             id: id.clone(),
             turn_id: turn_id.to_string(),
             status: ApprovalStatus::Pending,
-            decision: Some(decision),
+            decision: Some(pending.decision),
         },
     );
-    (id, receiver)
+    drop(data);
+    set_turn_status(state, turn_id, TurnStatus::WaitingApproval);
+    push_event(
+        state,
+        turn_id,
+        "approval.requested",
+        serde_json::json!({
+            "approval_id": id,
+            "request_key": pending.request_key,
+            "method": pending.method,
+        }),
+        false,
+    );
+    Ok(())
 }
 
 fn decide_approval(
@@ -852,7 +953,11 @@ fn decide_approval(
         false,
     );
     if let Some(sender) = sender {
-        let _ = sender.send(status);
+        let protocol_decision = match status {
+            ApprovalStatus::Approved => ApprovalDecision::Allow,
+            ApprovalStatus::Denied | ApprovalStatus::Pending => ApprovalDecision::Deny,
+        };
+        let _ = sender.send(protocol_decision);
     }
     Ok(Json(ApprovalResponse {
         id: id.to_string(),
@@ -892,9 +997,37 @@ fn update_turn_terminal(
         (response, finished_now)
     };
     if transitioned {
+        close_pending_approvals(state, id);
         push_event(state, id, kind, payload, true);
     }
     Ok(response)
+}
+
+/// Terminalisation owns approval closure.  This makes a stale URL unable to
+/// approve after interrupt, timeout, shutdown, or another terminal outcome.
+fn close_pending_approvals(state: &AppState, turn_id: &str) {
+    let mut closed = Vec::new();
+    {
+        let mut data = state.inner.data.lock().expect("state mutex poisoned");
+        for approval in data.approvals.values_mut() {
+            if approval.turn_id == turn_id && approval.status == ApprovalStatus::Pending {
+                approval.status = ApprovalStatus::Denied;
+                if let Some(sender) = approval.decision.take() {
+                    let _ = sender.send(ApprovalDecision::Deny);
+                }
+                closed.push(approval.id.clone());
+            }
+        }
+    }
+    for approval_id in closed {
+        push_event(
+            state,
+            turn_id,
+            "approval.decided",
+            serde_json::json!({ "approval_id": approval_id, "decision": "denied" }),
+            false,
+        );
+    }
 }
 
 fn set_turn_status(state: &AppState, id: &str, status: TurnStatus) {
@@ -982,6 +1115,11 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 pub async fn serve(config: ApiConfig) -> Result<SocketAddr, ApiError> {
+    // Recovery is complete (or startup fails) before the listener can expose
+    // readiness or accept a turn.  Its detailed errors never cross HTTP.
+    recover_before_readiness()
+        .await
+        .map_err(|error| ApiError::Serve(std::io::Error::other(error.to_string())))?;
     let bind = config.bind;
     let listener = tokio::net::TcpListener::bind(bind)
         .await

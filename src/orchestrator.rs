@@ -126,7 +126,13 @@ async fn run_flow_body(
                 },
             )
             .await?;
-            let turn = client.wait_turn_completed().await?;
+            // Once turn/start acknowledged, every later protocol ambiguity is
+            // after an irreversible request.  Never restart the flow and risk
+            // replaying it.
+            let turn = client
+                .wait_turn_completed()
+                .await
+                .map_err(non_idempotent("turn/completed"))?;
             append_journal(
                 journal,
                 JournalEvent::TurnCompleted {
@@ -176,7 +182,12 @@ async fn run_flow_body(
                 },
             )
             .await?;
-            let turn = client.wait_turn_completed().await?;
+            // See the doctor flow above: terminal observation is after the
+            // non-idempotent turn/start boundary.
+            let turn = client
+                .wait_turn_completed()
+                .await
+                .map_err(non_idempotent("turn/completed"))?;
             append_journal(
                 journal,
                 JournalEvent::TurnCompleted {
@@ -286,7 +297,7 @@ async fn run_with_restart(
         &flow,
         live,
         fake_server_args,
-        approval_policy,
+        approval_policy.clone(),
         journal.as_ref(),
     )
     .await
@@ -422,6 +433,28 @@ pub async fn run_doctor(live: bool) -> Result<String, AppError> {
 
 pub async fn run_turn(prompt: String, live: bool) -> Result<String, AppError> {
     run_with_restart(Flow::Run(prompt), live, &[], ApprovalPolicy::Deny).await
+}
+
+/// Runtime-owner entry point.  HTTP adapters use this rather than selecting a
+/// launcher or inventing an approval path of their own.
+pub async fn run_turn_with_approval_policy(
+    prompt: String,
+    live: bool,
+    approval_policy: ApprovalPolicy,
+) -> Result<String, AppError> {
+    run_with_restart(Flow::Run(prompt), live, &[], approval_policy).await
+}
+
+/// Perform durable restart projection before an HTTP listener becomes ready.
+/// This never starts a process and never replays a prior turn.
+pub async fn recover_before_readiness() -> Result<(), AppError> {
+    if let Some(config) = JournalConfig::from_env() {
+        let projection = project_recovery(&config.path)?;
+        let writer = JournalWriter::open(config)?;
+        persist_recovery(&writer, projection).await?;
+        writer.shutdown().await?;
+    }
+    Ok(())
 }
 
 /// Test-support/API entry point for the offline fake app-server only: same as

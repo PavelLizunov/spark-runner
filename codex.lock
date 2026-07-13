@@ -2,6 +2,8 @@
   "binary_path": "/home/uap/.local/bin/codex",
   "version": "0.142.0",
   "sha256": "d3be844c45c4fd89392536e56e1010963f94785592596b50cd0c45bb8a341406",
+  "native_path": "/home/uap/.local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+  "native_sha256": "37e6f5953f191b04f7b62cb07dae90f51d0947ad89f0355665b421fbde28700b",
   "transport": "stdio",
   "required_model": "gpt-5.3-codex-spark",
   "schema_path": "protocol/0.142.0/stable.schema.json",

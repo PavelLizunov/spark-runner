@@ -35,6 +35,47 @@ async fn oversized_frame_poisons_session_and_fails_closed() {
     );
 }
 
+/// T06: an unterminated frame is rejected at MAX_FRAME_LEN+1 without waiting
+/// for a newline or retaining the untrusted payload.
+#[tokio::test]
+async fn t06_oversized_no_newline_frame_fails_closed() {
+    let args = vec![
+        "--fake-mode".to_string(),
+        "oversized_no_newline".to_string(),
+    ];
+    let error = run_doctor_with_fake_server_args(&args)
+        .await
+        .expect_err("unterminated oversized frame must fail");
+    assert!(error.to_string().contains("oversized protocol frame"));
+}
+
+/// T05: after turn/start has succeeded, a later desync is ambiguous and must
+/// not trigger the complete-flow restart that would replay the turn.
+#[tokio::test]
+async fn t05_non_idempotent_retry_ambiguity_never_replays_turn() {
+    let marker = unique_marker_path("post-turn-desync");
+    let _ = std::fs::remove_file(&marker);
+    let args = vec![
+        "--fake-mode".to_string(),
+        "desync_after_turn_start".to_string(),
+        "--fail-marker".to_string(),
+        marker.to_string_lossy().to_string(),
+    ];
+    let error = run_doctor_with_fake_server_args(&args)
+        .await
+        .expect_err("post-turn desync is ambiguous");
+    assert!(error.to_string().contains("automatic replay denied"));
+    assert_eq!(
+        std::fs::read_to_string(&marker)
+            .expect("single fixture invocation")
+            .lines()
+            .count(),
+        1,
+        "turn/start must never be replayed"
+    );
+    let _ = std::fs::remove_file(&marker);
+}
+
 #[tokio::test]
 async fn malformed_frame_poisons_session_and_fails_closed() {
     let args = vec!["--fake-mode".to_string(), "malformed_frame".to_string()];

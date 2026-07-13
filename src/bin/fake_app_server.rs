@@ -55,6 +55,13 @@ fn maybe_apply_fault(
             stdout.flush()?;
             Ok(true)
         }
+        "oversized_no_newline" => {
+            // Exercise the pre-allocation frame limit: keep stdout open after
+            // writing an unterminated payload.
+            stdout.write_all(&vec![b'x'; MAX_FRAME_LEN + 1])?;
+            stdout.flush()?;
+            Ok(true)
+        }
         "malformed_frame" => {
             stdout.write_all(b"not-a-valid-jsonl-frame\n")?;
             stdout.flush()?;
@@ -221,6 +228,11 @@ fn main() -> io::Result<()> {
                         "result": { "turnId": turn_id, "status": "started" }
                     }),
                 )?;
+                if fake_mode.as_deref() == Some("desync_after_turn_start") {
+                    stdout.write_all(b"not-a-valid-jsonl-frame\n")?;
+                    stdout.flush()?;
+                    continue;
+                }
                 send(
                     &mut stdout,
                     &json!({
