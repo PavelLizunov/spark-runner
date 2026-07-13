@@ -223,3 +223,43 @@ async fn opt_in_capture_is_redacted_and_pruned_by_ttl() {
     writer.shutdown().await.unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+#[tokio::test]
+async fn legacy_event_capture_is_migrated_without_deleting_audit_event() {
+    let path = unique_journal("legacy-capture");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE journal_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_ms INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                execution_id TEXT,
+                turn_id TEXT,
+                approval_key TEXT,
+                payload_json TEXT NOT NULL,
+                terminal_output TEXT,
+                raw_capture_json TEXT,
+                expires_at_ms INTEGER
+            );
+            INSERT INTO journal_events VALUES (1, 0, 'incident', NULL, NULL, NULL, '{}', 'legacy output', '{\"safe\":true}', 1);",
+        )
+        .unwrap();
+    drop(connection);
+
+    let writer = JournalWriter::open(JournalConfig::new(&path)).unwrap();
+    let migrated = Connection::open(&path).unwrap();
+    let captures: i64 = migrated
+        .query_row("SELECT COUNT(*) FROM journal_captures", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(captures, 2);
+    writer.prune_expired().await.unwrap();
+    let events: i64 = migrated
+        .query_row("SELECT COUNT(*) FROM journal_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(events, 1);
+    writer.shutdown().await.unwrap();
+    let _ = std::fs::remove_file(&path);
+}

@@ -21,7 +21,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::client::{ApprovalPolicy, REQUIRED_MODEL};
@@ -31,6 +31,7 @@ const DEFAULT_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST)
 const MAX_BODY_BYTES: usize = 16 * 1024;
 const MAX_INPUT_CHARS: usize = 8 * 1024;
 const MAX_EVENTS_PER_TURN: usize = 256;
+const MAX_EVENT_BYTES: usize = 16 * 1024;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const MAX_CONCURRENT_TURNS: usize = 1;
 
@@ -42,6 +43,8 @@ pub enum ApiError {
     BindParse(String),
     #[error("failed to read SPARK_RUNNER_BEARER_TOKEN_FILE: {0}")]
     TokenFile(std::io::Error),
+    #[error("SPARK_RUNNER_BEARER_TOKEN_FILE must not be group/world-readable")]
+    InsecureTokenFile,
     #[error("set only one of SPARK_RUNNER_BEARER_TOKEN or SPARK_RUNNER_BEARER_TOKEN_FILE")]
     DuplicateTokenSources,
     #[error("configure a non-empty SPARK_RUNNER_BEARER_TOKEN or SPARK_RUNNER_BEARER_TOKEN_FILE")]
@@ -81,12 +84,13 @@ fn load_token() -> Result<String, ApiError> {
         .ok()
         .filter(|value| !value.is_empty());
     let from_file = match env::var("SPARK_RUNNER_BEARER_TOKEN_FILE") {
-        Ok(path) if !path.is_empty() => Some(
+        Ok(path) if !path.is_empty() => Some({
+            validate_token_file_permissions(&path)?;
             fs::read_to_string(path)
                 .map_err(ApiError::TokenFile)?
                 .trim()
-                .to_string(),
-        ),
+                .to_string()
+        }),
         _ => None,
     };
     match (from_env, from_file) {
@@ -94,6 +98,25 @@ fn load_token() -> Result<String, ApiError> {
         (Some(token), None) | (None, Some(token)) if !token.is_empty() => Ok(token),
         _ => Err(ApiError::MissingBearerToken),
     }
+}
+
+#[cfg(unix)]
+fn validate_token_file_permissions(path: &str) -> Result<(), ApiError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(path)
+        .map_err(ApiError::TokenFile)?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        Err(ApiError::InsecureTokenFile)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+fn validate_token_file_permissions(_path: &str) -> Result<(), ApiError> {
+    Ok(())
 }
 
 fn workspace_aliases() -> HashSet<String> {
@@ -141,13 +164,14 @@ struct TurnRecord {
     status: TurnStatus,
     events: Vec<TurnEvent>,
     sender: broadcast::Sender<TurnEvent>,
+    task: Option<tokio::task::AbortHandle>,
 }
 
-#[derive(Clone)]
 struct ApprovalRecord {
     id: String,
     turn_id: String,
     status: ApprovalStatus,
+    decision: Option<oneshot::Sender<ApprovalStatus>>,
 }
 
 #[derive(Clone, Copy, Serialize, PartialEq, Eq)]
@@ -557,6 +581,7 @@ async fn create_turn(
                 status: TurnStatus::Running,
                 events: Vec::new(),
                 sender,
+                task: None,
             },
         );
         (turn_id, workspace_alias)
@@ -564,9 +589,19 @@ async fn create_turn(
 
     let child_state = state.clone();
     let child_turn_id = turn_id.clone();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         run_fake_child_turn(child_state, child_turn_id, req.input).await;
     });
+    if let Some(turn) = state
+        .inner
+        .data
+        .lock()
+        .expect("state mutex poisoned")
+        .turns
+        .get_mut(&turn_id)
+    {
+        turn.task = Some(task.abort_handle());
+    }
 
     Ok(Json(TurnResponse {
         id: turn_id,
@@ -584,7 +619,7 @@ async fn run_fake_child_turn(state: AppState, turn_id: String, prompt: String) {
         serde_json::json!({}),
         false,
     );
-    let approval_id = create_approval(&state, &turn_id);
+    let (approval_id, approval_rx) = create_approval(&state, &turn_id);
     set_turn_status(&state, &turn_id, TurnStatus::WaitingApproval);
     push_event(
         &state,
@@ -593,20 +628,26 @@ async fn run_fake_child_turn(state: AppState, turn_id: String, prompt: String) {
         serde_json::json!({ "approval_id": approval_id }),
         false,
     );
+    let decision = match approval_rx.await {
+        Ok(decision) => decision,
+        Err(_) => return,
+    };
+    if decision == ApprovalStatus::Denied {
+        let _ = update_turn_terminal(
+            &state,
+            &turn_id,
+            TurnStatus::Interrupted,
+            "turn.denied",
+            serde_json::json!({ "status": "denied" }),
+        );
+        return;
+    }
     let result = run_turn_with_fake_server_args_and_approval_policy(
         prompt,
         &["--approval-mode".to_string(), "command".to_string()],
         ApprovalPolicy::AllowForTests,
     )
     .await;
-    mark_approval(&state, &approval_id, ApprovalStatus::Approved);
-    push_event(
-        &state,
-        &turn_id,
-        "approval.decided",
-        serde_json::json!({ "approval_id": approval_id, "decision": "approved" }),
-        false,
-    );
     let (status, kind, payload) = match result {
         Ok(summary) => (
             TurnStatus::Completed,
@@ -680,6 +721,24 @@ async fn interrupt_turn(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<TurnResponse>, ApiRejection> {
+    let task = {
+        let mut data = state.inner.data.lock().expect("state mutex poisoned");
+        let turn = data.turns.get_mut(&id).ok_or_else(|| {
+            rejection(StatusCode::NOT_FOUND, "NOT_FOUND", "turn not found", false)
+        })?;
+        if is_terminal(turn.status) {
+            return Err(rejection(
+                StatusCode::BAD_REQUEST,
+                "TURN_TERMINAL",
+                "turn is already terminal",
+                false,
+            ));
+        }
+        turn.task.take()
+    };
+    if let Some(task) = task {
+        task.abort();
+    }
     let response = update_turn_terminal(
         &state,
         &id,
@@ -737,32 +796,21 @@ fn validate_workspace(state: &AppState, alias: &str) -> Result<(), ApiRejection>
     Ok(())
 }
 
-fn create_approval(state: &AppState, turn_id: &str) -> String {
+fn create_approval(state: &AppState, turn_id: &str) -> (String, oneshot::Receiver<ApprovalStatus>) {
     let mut data = state.inner.data.lock().expect("state mutex poisoned");
     let id = format!("approval_{}", data.next_approval);
     data.next_approval += 1;
+    let (decision, receiver) = oneshot::channel();
     data.approvals.insert(
         id.clone(),
         ApprovalRecord {
             id: id.clone(),
             turn_id: turn_id.to_string(),
             status: ApprovalStatus::Pending,
+            decision: Some(decision),
         },
     );
-    id
-}
-
-fn mark_approval(state: &AppState, id: &str, status: ApprovalStatus) {
-    if let Some(approval) = state
-        .inner
-        .data
-        .lock()
-        .expect("state mutex poisoned")
-        .approvals
-        .get_mut(id)
-    {
-        approval.status = status;
-    }
+    (id, receiver)
 }
 
 fn decide_approval(
@@ -770,7 +818,7 @@ fn decide_approval(
     id: &str,
     decision: ApprovalStatus,
 ) -> Result<Json<ApprovalResponse>, ApiRejection> {
-    let (approval_id, turn_id, status) = {
+    let (approval_id, turn_id, status, sender) = {
         let mut data = state.inner.data.lock().expect("state mutex poisoned");
         let approval = data.approvals.get_mut(id).ok_or_else(|| {
             rejection(
@@ -793,6 +841,7 @@ fn decide_approval(
             approval.id.clone(),
             approval.turn_id.clone(),
             approval.status,
+            approval.decision.take(),
         )
     };
     push_event(
@@ -802,18 +851,9 @@ fn decide_approval(
         serde_json::json!({ "approval_id": approval_id, "decision": status }),
         false,
     );
-    let (terminal_kind, terminal_status) = match decision {
-        ApprovalStatus::Approved => ("turn.completed", TurnStatus::Completed),
-        ApprovalStatus::Denied => ("turn.denied", TurnStatus::Interrupted),
-        ApprovalStatus::Pending => unreachable!(),
-    };
-    let _ = update_turn_terminal(
-        state,
-        &turn_id,
-        terminal_status,
-        terminal_kind,
-        serde_json::json!({ "status": terminal_kind }),
-    )?;
+    if let Some(sender) = sender {
+        let _ = sender.send(status);
+    }
     Ok(Json(ApprovalResponse {
         id: id.to_string(),
         turn_id,
@@ -828,7 +868,7 @@ fn update_turn_terminal(
     kind: &str,
     payload: serde_json::Value,
 ) -> Result<TurnResponse, ApiRejection> {
-    let response = {
+    let (response, transitioned) = {
         let mut data = state.inner.data.lock().expect("state mutex poisoned");
         let mut finished_now = false;
         let response = {
@@ -849,9 +889,11 @@ fn update_turn_terminal(
         if finished_now {
             data.active_turns = data.active_turns.saturating_sub(1);
         }
-        response
+        (response, finished_now)
     };
-    push_event(state, id, kind, payload, true);
+    if transitioned {
+        push_event(state, id, kind, payload, true);
+    }
     Ok(response)
 }
 
@@ -890,6 +932,9 @@ fn push_event(
         payload,
         terminal,
     };
+    if serde_json::to_vec(&event).map_or(true, |encoded| encoded.len() > MAX_EVENT_BYTES) {
+        return;
+    }
     turn.events.push(event.clone());
     if turn.events.len() > MAX_EVENTS_PER_TURN {
         let overflow = turn.events.len() - MAX_EVENTS_PER_TURN;

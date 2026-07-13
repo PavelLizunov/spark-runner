@@ -5,5 +5,6 @@
   "transport": "stdio",
   "required_model": "gpt-5.3-codex-spark",
   "schema_path": "protocol/0.142.0/stable.schema.json",
-  "schema_hash": "efdc3e4ef848db9543c29d7f150820fe80e970720cc887e17e6f3c196bc37259"
+  "schema_hash": "efdc3e4ef848db9543c29d7f150820fe80e970720cc887e17e6f3c196bc37259",
+  "platform": "linux-x86_64"
 }

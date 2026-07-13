@@ -30,16 +30,18 @@ pub enum ClientError {
     MissingTurnStatus,
     #[error("session state was poisoned by a protocol desync")]
     SessionPoisoned,
-    #[error("server approval request missing numeric id")]
+    #[error("server approval request missing a string or signed-integer id")]
     MissingServerRequestId,
     #[error("unknown server request method {method:?}; session poisoned")]
     UnknownServerRequest { method: String },
     #[error("duplicate approval request {request_key}; session poisoned")]
     DuplicateApproval { request_key: String },
-    #[error("unexpected response id {id} while waiting for terminal turn notification")]
-    UnexpectedResponseWhileWaiting { id: u64 },
+    #[error("unexpected response while waiting for terminal turn notification")]
+    UnexpectedResponseWhileWaiting,
     #[error("protocol desync after an approval boundary; restart denied fail-closed")]
     UnresolvedApprovalRestart,
+    #[error("protocol state is ambiguous after non-idempotent {method}; automatic replay denied")]
+    AmbiguousNonIdempotent { method: &'static str },
     #[error("app-server account is not authenticated through the ChatGPT route")]
     ChatGptAuthRequired,
     #[error("app-server rate-limit response has no remaining quota")]
@@ -279,9 +281,9 @@ impl CodexClient {
                 continue;
             }
 
-            if let Some(id) = message.get("id").and_then(Value::as_u64) {
+            if message.get("id").is_some() {
                 self.state.poison();
-                return Err(ClientError::UnexpectedResponseWhileWaiting { id });
+                return Err(ClientError::UnexpectedResponseWhileWaiting);
             }
         }
     }
@@ -310,9 +312,11 @@ impl CodexClient {
     ) -> Result<(), ClientError> {
         let id = message
             .get("id")
-            .and_then(Value::as_u64)
+            .filter(is_request_id)
+            .cloned()
             .ok_or(ClientError::MissingServerRequestId)?;
         if !is_known_approval_method(method) {
+            let _ = self.rpc.respond_error(id, -32601, "method not found").await;
             self.state.poison();
             return Err(ClientError::UnknownServerRequest {
                 method: method.to_string(),
@@ -320,11 +324,14 @@ impl CodexClient {
         }
 
         let params = message.get("params").unwrap_or(&Value::Null);
-        let request_key = approval_request_key(method, id, params);
+        let request_key = approval_request_key(method, &id, params);
         if !self.seen_approvals.insert(request_key.clone()) {
             let _ = self
                 .rpc
-                .respond(id, approval_response(method, ApprovalDecision::Deny))
+                .respond(
+                    id.clone(),
+                    approval_response(method, ApprovalDecision::Deny),
+                )
                 .await;
             self.state.poison();
             return Err(ClientError::DuplicateApproval { request_key });
@@ -380,7 +387,11 @@ fn is_known_approval_method(method: &str) -> bool {
     )
 }
 
-fn approval_request_key(method: &str, id: u64, params: &Value) -> String {
+fn is_request_id(value: &&Value) -> bool {
+    value.as_str().is_some() || value.as_i64().is_some()
+}
+
+fn approval_request_key(method: &str, id: &Value, params: &Value) -> String {
     let stable = params
         .get("approvalId")
         .and_then(Value::as_str)

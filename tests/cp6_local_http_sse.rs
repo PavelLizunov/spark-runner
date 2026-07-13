@@ -171,6 +171,15 @@ async fn fake_child_sse_resume_keeps_approval_and_terminal_events() {
     let turn_id = turn["id"].as_str().unwrap();
 
     sleep(Duration::from_millis(300)).await;
+    let (status, approval) = request_json(
+        router.clone(),
+        "POST",
+        "/v1/approvals/approval_1/approve",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(approval["status"], "approved");
     let resumed = fetch_sse(router, &format!("/v1/turns/{turn_id}/events"), Some(1)).await;
     let event_types: Vec<&str> = resumed
         .iter()

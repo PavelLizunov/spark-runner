@@ -42,8 +42,10 @@ pub enum JsonlError {
     Serde(#[from] serde_json::Error),
     #[error("app-server stdout closed while waiting for a response or notification")]
     StreamClosed,
-    #[error("app-server returned an error for id {id}: {message}")]
-    Remote { id: u64, message: String },
+    #[error(
+        "app-server returned a remote error for request id {id} (diagnostic payload suppressed)"
+    )]
+    Remote { id: u64 },
     #[error("timed out after {0:?} waiting for an app-server response or notification")]
     Timeout(Duration),
     #[error(
@@ -135,10 +137,8 @@ impl JsonlClient {
         let response = self.wait_for(WaitTarget::ResponseId(id)).await?;
 
         if let Some(error) = response.get("error") {
-            return Err(JsonlError::Remote {
-                id,
-                message: error.to_string(),
-            });
+            let _ = error;
+            return Err(JsonlError::Remote { id });
         }
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -155,7 +155,7 @@ impl JsonlClient {
     }
 
     /// Send a JSON-RPC response to a request initiated by the app-server.
-    pub async fn respond(&self, id: u64, result: Value) -> Result<(), JsonlError> {
+    pub async fn respond(&self, id: Value, result: Value) -> Result<(), JsonlError> {
         let response = serde_json::json!({ "id": id, "result": result });
         let line = serde_json::to_string(&response)?;
         let mut stdin = self.stdin.lock().await;
@@ -166,6 +166,25 @@ impl JsonlClient {
 ",
             )
             .await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    /// Reply to a server-initiated request before failing the session. The
+    /// request id is echoed unchanged because the stable protocol accepts
+    /// both strings and signed integers.
+    pub async fn respond_error(
+        &self,
+        id: Value,
+        code: i64,
+        message: &str,
+    ) -> Result<(), JsonlError> {
+        let response =
+            serde_json::json!({ "id": id, "error": { "code": code, "message": message } });
+        let line = serde_json::to_string(&response)?;
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
         stdin.flush().await?;
         Ok(())
     }
@@ -208,7 +227,7 @@ impl JsonlClient {
             .iter()
             .position(|value| target.matches(value))
         {
-            return Ok(reader.pending.remove(pos));
+            return Ok(remove_pending(&mut reader, pos));
         }
 
         loop {
@@ -255,7 +274,7 @@ impl JsonlClient {
     async fn read_next_message(&self) -> Result<Value, JsonlError> {
         let mut reader = self.reader.lock().await;
         if !reader.pending.is_empty() {
-            return Ok(reader.pending.remove(0));
+            return Ok(remove_pending(&mut reader, 0));
         }
 
         loop {
@@ -269,6 +288,15 @@ impl JsonlClient {
             return serde_json::from_slice(trimmed).map_err(|_| JsonlError::MalformedFrame);
         }
     }
+}
+
+fn remove_pending(reader: &mut ReaderState, index: usize) -> Value {
+    let value = reader.pending.remove(index);
+    // Serialize exactly as `push_pending` did. This makes the accounting
+    // represent retained bytes rather than cumulative traffic.
+    let bytes = serde_json::to_vec(&value).map_or(0, |bytes| bytes.len());
+    reader.pending_bytes = reader.pending_bytes.saturating_sub(bytes);
+    value
 }
 
 async fn read_bounded_frame(

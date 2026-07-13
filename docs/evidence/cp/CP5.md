@@ -1,6 +1,6 @@
 # CP5 - Journal and restart recovery
 
-Status: **green**
+Status: **partial**. Startup persistence and legacy-capture migration are validated by the current CP6 remediation gates.
 
 Completed at: `2026-07-13T05:34:19Z`
 

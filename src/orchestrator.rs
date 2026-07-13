@@ -13,8 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::client::{ApprovalPolicy, ClientError, CodexClient};
 use crate::config::{self, CodexLock, ConfigError, DEFAULT_CODEX_LOCK};
 use crate::journal::{
-    ApprovalTerminalDecision, ExecutionTerminalStatus, JournalConfig, JournalEvent, JournalWriter,
-    TurnTerminalStatus,
+    project_recovery, ApprovalRecoveryState, ApprovalTerminalDecision, ExecutionRecoveryState,
+    ExecutionTerminalStatus, JournalConfig, JournalEvent, JournalWriter, TurnTerminalStatus,
 };
 use crate::process::{ChildProcess, ProcessError};
 use crate::state::{ApprovalDecision, InternalEventKind};
@@ -50,9 +50,9 @@ enum Flow {
 fn launch_spec(live: bool, fake_server_args: &[String]) -> Result<(String, Vec<String>), AppError> {
     if live {
         let lock = CodexLock::load(Path::new(DEFAULT_CODEX_LOCK))?;
-        lock.validate()?;
+        let verified = lock.verify_for_spawn()?;
         Ok((
-            lock.binary_path,
+            verified.to_string_lossy().to_string(),
             LIVE_ARGS.iter().map(|arg| arg.to_string()).collect(),
         ))
     } else {
@@ -110,10 +110,14 @@ async fn run_flow_body(
             )
             .await?;
 
-            let thread = client.thread_start(cwd).await?;
+            let thread = client
+                .thread_start(cwd)
+                .await
+                .map_err(non_idempotent("thread/start"))?;
             let turn_id = client
                 .turn_start(&thread.thread_id, "spark-runner doctor readiness check")
-                .await?;
+                .await
+                .map_err(non_idempotent("turn/start"))?;
             append_journal(
                 journal,
                 JournalEvent::TurnStarted {
@@ -156,8 +160,14 @@ async fn run_flow_body(
                 },
             )
             .await?;
-            let thread = client.thread_start(cwd).await?;
-            let turn_id = client.turn_start(&thread.thread_id, prompt).await?;
+            let thread = client
+                .thread_start(cwd)
+                .await
+                .map_err(non_idempotent("thread/start"))?;
+            let turn_id = client
+                .turn_start(&thread.thread_id, prompt)
+                .await
+                .map_err(non_idempotent("turn/start"))?;
             append_journal(
                 journal,
                 JournalEvent::TurnStarted {
@@ -226,13 +236,15 @@ async fn execute_flow_once(
         },
     )
     .await?;
-    if let Err(error) = &outcome {
+    if outcome.is_err() {
         append_journal(
             journal,
             JournalEvent::Incident {
                 execution_id: Some(execution_id.clone()),
                 class: "flow_error".to_string(),
-                message: error.to_string(),
+                // Remote protocol errors are intentionally not persisted:
+                // their JSON may contain prompts, paths, or credentials.
+                message: "flow failed; diagnostic payload suppressed".to_string(),
             },
         )
         .await?;
@@ -240,6 +252,16 @@ async fn execute_flow_once(
     let _ = client.shutdown().await;
     let _ = std::fs::remove_dir_all(&cwd);
     outcome
+}
+
+fn non_idempotent(method: &'static str) -> impl FnOnce(ClientError) -> AppError {
+    move |error| {
+        if error.is_recoverable_desync() {
+            AppError::Client(ClientError::AmbiguousNonIdempotent { method })
+        } else {
+            AppError::Client(error)
+        }
+    }
 }
 
 /// Run `flow` once; on a recoverable protocol desync, start one fresh
@@ -252,7 +274,12 @@ async fn run_with_restart(
     approval_policy: ApprovalPolicy,
 ) -> Result<String, AppError> {
     let journal = match JournalConfig::from_env() {
-        Some(config) => Some(JournalWriter::open(config)?),
+        Some(config) => {
+            let projection = project_recovery(&config.path)?;
+            let writer = JournalWriter::open(config)?;
+            persist_recovery(&writer, projection).await?;
+            Some(writer)
+        }
         None => None,
     };
     let result = match execute_flow_once(
@@ -285,6 +312,31 @@ async fn run_with_restart(
         journal.shutdown().await?;
     }
     result
+}
+
+async fn persist_recovery(
+    journal: &JournalWriter,
+    projection: crate::journal::RecoveryProjection,
+) -> Result<(), AppError> {
+    for (execution_id, state) in projection.executions {
+        if state == ExecutionRecoveryState::UnknownAfterRestart {
+            journal
+                .append(JournalEvent::RecoveryExecutionUnknown { execution_id })
+                .await?;
+        }
+    }
+    for (request_key, state) in projection.approvals {
+        if state == ApprovalRecoveryState::DeniedOnRestart {
+            journal
+                .append(JournalEvent::RecoveryApprovalDenied {
+                    execution_id: "recovery".to_string(),
+                    request_key,
+                    method: "unknown".to_string(),
+                })
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn append_journal(

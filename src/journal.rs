@@ -79,6 +79,14 @@ pub enum JournalEvent {
         method: String,
         decision: ApprovalTerminalDecision,
     },
+    RecoveryExecutionUnknown {
+        execution_id: String,
+    },
+    RecoveryApprovalDenied {
+        execution_id: String,
+        request_key: String,
+        method: String,
+    },
     Incident {
         execution_id: Option<String>,
         class: String,
@@ -93,9 +101,13 @@ pub enum JournalEvent {
 impl JournalEvent {
     fn event_type(&self) -> &'static str {
         match self {
-            Self::ExecutionStarted { .. } | Self::ExecutionCompleted { .. } => "execution",
+            Self::ExecutionStarted { .. }
+            | Self::ExecutionCompleted { .. }
+            | Self::RecoveryExecutionUnknown { .. } => "execution",
             Self::TurnStarted { .. } | Self::TurnCompleted { .. } => "turn",
-            Self::ApprovalRequested { .. } | Self::ApprovalDecided { .. } => "approval",
+            Self::ApprovalRequested { .. }
+            | Self::ApprovalDecided { .. }
+            | Self::RecoveryApprovalDenied { .. } => "approval",
             Self::Incident { .. } => "incident",
             Self::RateLimitSnapshot { .. } => "rate_limit_snapshot",
         }
@@ -110,6 +122,8 @@ impl JournalEvent {
             | Self::ApprovalRequested { execution_id, .. }
             | Self::ApprovalDecided { execution_id, .. }
             | Self::RateLimitSnapshot { execution_id, .. } => Some(execution_id),
+            Self::RecoveryExecutionUnknown { execution_id }
+            | Self::RecoveryApprovalDenied { execution_id, .. } => Some(execution_id),
             Self::Incident { execution_id, .. } => execution_id.as_deref(),
         }
     }
@@ -126,7 +140,8 @@ impl JournalEvent {
     fn approval_key(&self) -> Option<&str> {
         match self {
             Self::ApprovalRequested { request_key, .. }
-            | Self::ApprovalDecided { request_key, .. } => Some(request_key),
+            | Self::ApprovalDecided { request_key, .. }
+            | Self::RecoveryApprovalDenied { request_key, .. } => Some(request_key),
             _ => None,
         }
     }
@@ -340,7 +355,35 @@ fn prepare_connection(connection: &Connection) -> rusqlite::Result<()> {
             PRIMARY KEY(event_id, kind)
         );
         CREATE INDEX IF NOT EXISTS idx_journal_captures_expiry ON journal_captures(expires_at_ms);",
-    )
+    )?;
+    migrate_legacy_captures(connection)
+}
+
+/// CP5 originally kept expiring captures on the append-only event row. Move
+/// those values once into the side table and clear the legacy cells, so the
+/// normal expiry job can never delete lifecycle history.
+fn migrate_legacy_captures(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT OR IGNORE INTO journal_captures (event_id, kind, data, expires_at_ms)
+         SELECT id, 'terminal_output', terminal_output, expires_at_ms
+         FROM journal_events
+         WHERE terminal_output IS NOT NULL AND expires_at_ms IS NOT NULL",
+        [],
+    )?;
+    connection.execute(
+        "INSERT OR IGNORE INTO journal_captures (event_id, kind, data, expires_at_ms)
+         SELECT id, 'raw_capture', raw_capture_json, expires_at_ms
+         FROM journal_events
+         WHERE raw_capture_json IS NOT NULL AND expires_at_ms IS NOT NULL",
+        [],
+    )?;
+    connection.execute(
+        "UPDATE journal_events
+         SET terminal_output = NULL, raw_capture_json = NULL, expires_at_ms = NULL
+         WHERE expires_at_ms IS NOT NULL",
+        [],
+    )?;
+    Ok(())
 }
 
 fn append_record(
@@ -489,6 +532,12 @@ pub fn project_recovery(path: &Path) -> JournalResult<RecoveryProjection> {
                     }),
                 );
             }
+            JournalEvent::RecoveryExecutionUnknown { execution_id } => {
+                executions.insert(
+                    execution_id,
+                    Some(ExecutionRecoveryState::UnknownAfterRestart),
+                );
+            }
             JournalEvent::ApprovalRequested { request_key, .. } => {
                 approvals.entry(request_key).or_insert(None);
             }
@@ -505,6 +554,9 @@ pub fn project_recovery(path: &Path) -> JournalResult<RecoveryProjection> {
                         ApprovalTerminalDecision::TimedOut => ApprovalRecoveryState::TimedOut,
                     }),
                 );
+            }
+            JournalEvent::RecoveryApprovalDenied { request_key, .. } => {
+                approvals.insert(request_key, Some(ApprovalRecoveryState::DeniedOnRestart));
             }
             JournalEvent::TurnStarted { .. }
             | JournalEvent::TurnCompleted { .. }

@@ -1,6 +1,6 @@
-# CP1: Phase 0 bootstrap evidence — GREEN
+# CP1: Phase 0 bootstrap evidence — PARTIAL
 
-Status: **green**. Proceed to CP2. No fallback model was used at any point.
+Status: **partial**. This historical capture predates the currently locked runtime verification and is not release evidence.
 
 ## Environment
 
