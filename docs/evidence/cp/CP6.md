@@ -1,6 +1,6 @@
 # CP6 — local HTTP/SSE adapter
 
-Status: **cycle 13 remediation gate-verified offline**. All evidence below is deterministic and offline: no OAuth, network request, credential value, or model turn was used.
+Status: **cycle 15 remediation gate-verified offline**. All evidence below is deterministic and offline: no OAuth, network request, credential value, or model turn was used.
 
 Code SHA evidence: `8aa051f9f2214883ad22ac7c2490090f08d69c3a` (`fix(cp6): harden auth approval and cancellation`). This evidence commit is separate metadata, not a claim that its own SHA is the code SHA.
 
@@ -28,18 +28,33 @@ Code SHA evidence: `8aa051f9f2214883ad22ac7c2490090f08d69c3a` (`fix(cp6): harden
 
 The live bootstrap is intentionally not exercised against real credentials or a real model in this repository. The selected-file provisioning path was tested only with fake canary data; operational deployment still needs a separately authorized live-account smoke test. The injected fixture cannot select the production live executable path. A forced process-group kill after a protocol acknowledgement/terminal timeout is deliberately treated as a conservative failed/unknown operational boundary, never as a successful model result.
 
-## Cycle 14 offline correction timeline
+## Cycle 14 offline correction timeline (superseded)
 
 Code SHA: `a337d10450bb767a621003c61f4a7d91591c4781` (`fix(cp6): close auth approval and cancellation gaps`). This section records deterministic local verification only; no OAuth credential value, account request, network request, or model turn was performed.
 
 - The live launcher still accepts only the explicit owner-only `SPARK_RUNNER_SUBSCRIPTION_AUTH_FILE` capability and provisions it opaquely into the fresh `0700` `CODEX_HOME` as `auth.json` with `0600` permissions. Every spawned-flow epilogue now reaps the process, explicitly unlinks that child auth copy, removes the private home, and closes an owned journal before replying. Fake-canary tests cover provisioning, unsafe-source rejection, and cleanup; they do not read a real auth file.
-- Approval descriptors now mark unreviewable requests as deny-only instead of silently abbreviating grant scope. They carry bounded command, cwd, reason, file-change path/type, and schema-shaped permission detail; `project_roots.subpath` and `unknown.path`/`subpath` are exposed when valid. A permission Allow returns only the same bounded, validated in-flight profile; Deny and Timeout keep their distinct fail-closed responses.
-- The non-idempotent delivery boundary is set immediately before the first JSONL write attempt. A deterministic pending-writer test covers cancellation after that attempt but before newline/flush/response. Initialize, admission, thread-start, and turn-start controls all return through one cleanup epilogue; post-write control records `delivery_ambiguous` and Unknown, while protocol interrupt is attempted only after accepted real thread and turn identifiers exist. The phase fixtures use markers/channels rather than sleeps and assert private-home removal.
-- Cancellation approval delivery is held at its wire acknowledgement until the owner has queued the real-ID control request. A closed or ambiguous control acknowledgement is represented as a failed unknown boundary, not as a fabricated interrupt or completed execution.
+- The descriptors were bounded and redacted, but this cycle did not yet provide a lossless review of every allowed permission field or preserve repeated whitespace. Cycle 15 resolves those remaining approval-review gaps.
+- `thread/start` and `turn/start` writes were tracked from their first attempt, but the select blocks did not prioritize a control command already queued before initialize, admission, thread start, or turn start. Cycle 15 resolves that ordering gap.
+- Cancellation approval delivery was held at its wire acknowledgement, but `turn/interrupt` did not yet track its own first write attempt. Cycle 15 resolves the timeout-after-write ambiguity classification.
 
-## Cycle 14 serial gates (code SHA above)
+## Cycle 14 reported gates (timings withdrawn)
 
-- `cargo fmt --all -- --check` — exit 0; wall duration 0.04s.
-- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-14 CARGO_NET_OFFLINE=true cargo test --locked --all-targets --all-features` — exit 0; wall duration 25.73s; 70 tests.
-- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-14 CARGO_NET_OFFLINE=true cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0; wall duration under 0.01s (cached target; Cargo reported 0.08s).
-- `git diff --check` — exit 0; wall duration under 0.01s.
+The cycle-14 duration values conflict across its records and are not relied upon as timing evidence. The exact measured replacement run is recorded below.
+
+## Cycle 15 offline remediation and exact measurement
+
+Code SHA: `45294513b8faca38f71dba2780c5699bf789e37c` (`fix(cp6): fail closed at approval and control boundaries`). This code-only commit was verified using fake fixtures only; no OAuth, account API, credential value, network request, or model turn was used.
+
+- Permission approval descriptors carry the exact bounded validated profile that Allow returns, including `fileSystem.globScanMaxDepth`; an Allow is denied if text would be redacted, truncated, or whitespace-normalized. Array command arguments are kept as separate arguments rather than joined.
+- Queued control has deterministic priority before initialize, admission, `thread/start`, and `turn/start`. A pre-write queued-control regression proves the initialize request is never written.
+- `turn/interrupt` is tracked from its first write attempt. The timeout-after-write fixture proves it journals `delivery_ambiguous` and leaves the execution unresolved rather than recording `TurnDeadlineExceeded`/failed completion.
+- The JSONL unterminated-frame limit remains fail-closed even if the writer closes at the limit boundary, and the existing owner command queue now boxes only its pending-approval payload to retain warning-denied Clippy compatibility.
+
+## Cycle 15 serial gates (code SHA above)
+
+These durations are outer measurements from this exact serial run, rounded to milliseconds except the near-zero diff check.
+
+- `cargo fmt --all -- --check` — exit 0; duration 0.043s.
+- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-15 CARGO_NET_OFFLINE=true cargo test --locked --all-targets --all-features` — exit 0; duration 26.703s; 73 tests.
+- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-15 CARGO_NET_OFFLINE=true cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0; duration 0.149s.
+- `git diff --check` — exit 0; duration 0.000013s.
