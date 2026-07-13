@@ -30,6 +30,8 @@ pub enum ClientError {
     MissingThreadId,
     #[error("turn/completed notification missing turn.status field")]
     MissingTurnStatus,
+    #[error("turn/start response missing turn.id")]
+    MissingTurnId,
     #[error("session state was poisoned by a protocol desync")]
     SessionPoisoned,
     #[error("server approval request missing a string or signed-integer id")]
@@ -178,7 +180,7 @@ impl CodexClient {
     /// turn or approval capacity.
     pub async fn admit_live_turn(&mut self) -> Result<Value, ClientError> {
         let account = self.account_read().await?;
-        if account.get("accountType").and_then(Value::as_str) != Some("chatgpt") {
+        if account.pointer("/account/type").and_then(Value::as_str) != Some("chatgpt") {
             return Err(ClientError::ChatGptAuthRequired);
         }
         let models = self.model_list().await?;
@@ -198,18 +200,12 @@ impl CodexClient {
             });
         }
         let rate_limits = self.rate_limits_read().await?;
-        let has_quota = rate_limits
-            .pointer("/limits")
-            .and_then(Value::as_array)
-            .is_some_and(|limits| {
-                limits.iter().any(|limit| {
-                    limit
-                        .get("remaining")
-                        .and_then(Value::as_i64)
-                        .unwrap_or_default()
-                        > 0
-                })
-            });
+        let has_quota = rate_limit_windows(&rate_limits).into_iter().any(|window| {
+            window
+                .get("usedPercent")
+                .and_then(Value::as_i64)
+                .is_some_and(|used| used < 100)
+        });
         if !has_quota {
             return Err(ClientError::QuotaUnavailable);
         }
@@ -232,7 +228,6 @@ impl CodexClient {
             .get("thread")
             .and_then(|thread| thread.get("id"))
             .and_then(Value::as_str)
-            .or_else(|| result.get("threadId").and_then(Value::as_str))
             .ok_or(ClientError::MissingThreadId)?
             .to_string();
         let model = result
@@ -264,11 +259,12 @@ impl CodexClient {
         });
         let result = self.rpc_call("turn/start", params).await?;
         self.state.on_turn_started()?;
-        Ok(result
-            .get("turnId")
+        result
+            .get("turn")
+            .and_then(|turn| turn.get("id"))
             .and_then(Value::as_str)
-            .unwrap_or("unknown-turn")
-            .to_string())
+            .map(ToOwned::to_owned)
+            .ok_or(ClientError::MissingTurnId)
     }
 
     /// Wait for the terminal `turn/completed` notification while the same
@@ -429,6 +425,45 @@ impl CodexClient {
         self.process.shutdown().await;
         Ok(())
     }
+
+    /// Interrupt the exact live turn before process cleanup.  The generated
+    /// 0.144.3 shape requires both identifiers; callers must not fabricate a
+    /// terminal state without making this protocol attempt.
+    pub async fn turn_interrupt(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<(), ClientError> {
+        self.rpc_call(
+            "turn/interrupt",
+            json!({ "threadId": thread_id, "turnId": turn_id }),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+fn rate_limit_windows(rate_limits: &Value) -> Vec<&Value> {
+    fn collect<'a>(windows: &mut Vec<&'a Value>, snapshot: &'a Value) {
+        for key in ["primary", "secondary"] {
+            if let Some(window) = snapshot.get(key).filter(|window| !window.is_null()) {
+                windows.push(window);
+            }
+        }
+    }
+    let mut windows = Vec::new();
+    if let Some(snapshot) = rate_limits.get("rateLimits") {
+        collect(&mut windows, snapshot);
+    }
+    if let Some(by_id) = rate_limits
+        .get("rateLimitsByLimitId")
+        .and_then(Value::as_object)
+    {
+        for snapshot in by_id.values() {
+            collect(&mut windows, snapshot);
+        }
+    }
+    windows
 }
 
 fn is_known_approval_method(method: &str) -> bool {

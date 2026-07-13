@@ -119,6 +119,9 @@ impl JsonlClient {
     /// buffer forever (ADR-004: poison-on-desync); unrelated notifications
     /// are still tolerated.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, JsonlError> {
+        // Server requests are dispatched while this ordinary request is
+        // pending. A conforming app-server may wait for that response before
+        // returning ours; buffering it would deadlock both peers.
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let request = serde_json::json!({
             "id": id,
@@ -134,13 +137,104 @@ impl JsonlClient {
             stdin.flush().await?;
         }
 
-        let response = self.wait_for(WaitTarget::ResponseId(id)).await?;
+        let response = tokio::time::timeout(
+            self.wait_timeout,
+            self.read_response_dispatching_requests(id),
+        )
+        .await
+        .map_err(|_| JsonlError::Timeout(self.wait_timeout))??;
 
         if let Some(error) = response.get("error") {
             let _ = error;
             return Err(JsonlError::Remote { id });
         }
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    async fn read_response_dispatching_requests(&self, expected: u64) -> Result<Value, JsonlError> {
+        loop {
+            let next = {
+                let mut reader = self.reader.lock().await;
+                if let Some(pos) = reader
+                    .pending
+                    .iter()
+                    .position(|value| WaitTarget::ResponseId(expected).matches(value))
+                {
+                    Some(Ok::<Value, JsonlError>(remove_pending(&mut reader, pos)))
+                } else {
+                    reader
+                        .pending
+                        .iter()
+                        .position(is_server_request)
+                        .map(|pos| Ok::<Value, JsonlError>(remove_pending(&mut reader, pos)))
+                }
+            };
+
+            let value = match next {
+                Some(value) => value?,
+                None => self.read_raw_message().await?,
+            };
+            if WaitTarget::ResponseId(expected).matches(&value) {
+                return Ok(value);
+            }
+            if is_server_request(&value) {
+                self.dispatch_pending_server_request(value).await?;
+                continue;
+            }
+            if value.get("method").is_none() {
+                if let Some(actual) = value.get("id").and_then(Value::as_u64) {
+                    return Err(JsonlError::UnexpectedResponseId { expected, actual });
+                }
+            }
+            let mut reader = self.reader.lock().await;
+            push_pending(&mut reader, value)?;
+        }
+    }
+
+    async fn dispatch_pending_server_request(&self, request: Value) -> Result<(), JsonlError> {
+        let id = request
+            .get("id")
+            .cloned()
+            .ok_or(JsonlError::MalformedFrame)?;
+        if id.as_str().is_none() && id.as_i64().is_none() {
+            return Err(JsonlError::MalformedFrame);
+        }
+        let method = request
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let result = match method {
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+                Some(serde_json::json!({ "decision": "cancel" }))
+            }
+            "execCommandApproval" | "applyPatchApproval" => {
+                Some(serde_json::json!({ "decision": "abort" }))
+            }
+            "item/permissions/requestApproval" => Some(serde_json::json!({
+                "permissions": { "fileSystem": { "entries": [] }, "network": { "enabled": false } },
+                "scope": "turn",
+                "strictAutoReview": true
+            })),
+            _ => None,
+        };
+        match result {
+            Some(result) => self.respond(id, result).await,
+            None => self.respond_error(id, -32601, "method not found").await,
+        }
+    }
+
+    async fn read_raw_message(&self) -> Result<Value, JsonlError> {
+        let mut reader = self.reader.lock().await;
+        loop {
+            let Some(line) = read_bounded_frame(&mut reader.stdout).await? else {
+                return Err(JsonlError::StreamClosed);
+            };
+            let trimmed = trim_ascii(&line);
+            if trimmed.is_empty() {
+                continue;
+            }
+            return serde_json::from_slice(trimmed).map_err(|_| JsonlError::MalformedFrame);
+        }
     }
 
     /// Wait for the next notification (no `id`) matching `method`, tolerating
@@ -290,6 +384,10 @@ impl JsonlClient {
     }
 }
 
+fn is_server_request(value: &Value) -> bool {
+    value.get("id").is_some() && value.get("method").is_some()
+}
+
 fn remove_pending(reader: &mut ReaderState, index: usize) -> Value {
     let value = reader.pending.remove(index);
     // Serialize exactly as `push_pending` did. This makes the accounting
@@ -377,6 +475,7 @@ impl WaitTarget<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     fn client_with_canned_stdout(lines: &[Value], wait_timeout: Duration) -> JsonlClient {
         let (mut server_write, client_read) = tokio::io::duplex(64 * 1024);
@@ -554,5 +653,76 @@ mod tests {
             }
             other => panic!("expected OversizedFrame, got {other:?}"),
         }
+    }
+
+    /// T11: a server request can precede the response to an ordinary RPC.
+    /// The client must respond immediately, preserve both legal request-id
+    /// forms, and then complete the original call without a timing race.
+    #[tokio::test]
+    async fn dispatches_server_requests_while_an_rpc_response_is_awaited() {
+        let (client_write, server_read) = tokio::io::duplex(16 * 1024);
+        let (server_write, client_read) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let mut reader = BufReader::new(server_read);
+            let mut writer = server_write;
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).unwrap()["method"],
+                "account/read"
+            );
+
+            writer
+                .write_all(
+                    serde_json::to_string(&json!({
+                        "id": "server-unknown",
+                        "method": "extension/unknown",
+                        "params": {}
+                    }))
+                    .unwrap()
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            writer.flush().await.unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let unknown = serde_json::from_str::<Value>(&line).unwrap();
+            assert_eq!(unknown["id"], "server-unknown");
+            assert_eq!(unknown["error"]["code"], -32601);
+
+            writer
+                .write_all(
+                    serde_json::to_string(&json!({
+                        "id": -7,
+                        "method": "item/commandExecution/requestApproval",
+                        "params": { "approvalId": "a", "itemId": "i", "threadId": "t", "turnId": "u", "command": "true", "startedAtMs": 1 }
+                    }))
+                    .unwrap()
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            writer.flush().await.unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let denial = serde_json::from_str::<Value>(&line).unwrap();
+            assert_eq!(denial["id"], -7);
+            assert_eq!(denial["result"]["decision"], "cancel");
+
+            writer
+                .write_all(b"{\"id\":1,\"result\":{\"ok\":true}}\n")
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+        });
+        let client = JsonlClient::with_timeout(client_write, client_read, Duration::from_secs(1));
+        assert_eq!(
+            client.call("account/read", json!({})).await.unwrap()["ok"],
+            true
+        );
+        server.await.unwrap();
     }
 }

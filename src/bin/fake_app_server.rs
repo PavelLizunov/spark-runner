@@ -143,7 +143,7 @@ fn main() -> io::Result<()> {
                 &json!({
                     "id": id,
                     "result": {
-                        "serverInfo": { "name": "fake-codex-app-server", "version": "0.142.0" }
+                        "serverInfo": { "name": "fake-codex-app-server", "version": "0.144.3" }
                     }
                 }),
             )?,
@@ -152,9 +152,12 @@ fn main() -> io::Result<()> {
                 &json!({
                     "id": id,
                     "result": {
-                        "planType": "pro",
-                        "accountType": "chatgpt",
-                        "requiresOpenaiAuth": true
+                        "account": {
+                            "type": "chatgpt",
+                            "email": "offline@example.invalid",
+                            "planType": "pro"
+                        },
+                        "requiresOpenaiAuth": false
                     }
                 }),
             )?,
@@ -164,7 +167,16 @@ fn main() -> io::Result<()> {
                     "id": id,
                     "result": {
                         "data": [
-                            { "id": REQUIRED_MODEL, "provider": "openai" }
+                            {
+                                "id": REQUIRED_MODEL,
+                                "model": REQUIRED_MODEL,
+                                "displayName": "Spark",
+                                "description": "deterministic offline fixture",
+                                "hidden": false,
+                                "isDefault": true,
+                                "defaultReasoningEffort": "medium",
+                                "supportedReasoningEfforts": []
+                            }
                         ]
                     }
                 }),
@@ -174,9 +186,28 @@ fn main() -> io::Result<()> {
                 &json!({
                     "id": id,
                     "result": {
-                        "limits": [
-                            { "id": "spark-primary", "remaining": 100 }
-                        ]
+                        "rateLimits": {
+                            "limitId": "codex",
+                            "limitName": "Codex",
+                            "planType": "pro",
+                            "primary": { "usedPercent": 0, "resetsAt": null, "windowDurationMins": null },
+                            "secondary": null,
+                            "credits": null,
+                            "individualLimit": null,
+                            "rateLimitReachedType": null
+                        },
+                        "rateLimitsByLimitId": {
+                            "codex": {
+                                "limitId": "codex",
+                                "limitName": "Codex",
+                                "planType": "pro",
+                                "primary": { "usedPercent": 0, "resetsAt": null, "windowDurationMins": null },
+                                "secondary": null,
+                                "credits": null,
+                                "individualLimit": null,
+                                "rateLimitReachedType": null
+                            }
+                        }
                     }
                 }),
             )?,
@@ -193,12 +224,26 @@ fn main() -> io::Result<()> {
                     &json!({
                         "id": id,
                         "result": {
-                            "thread": { "id": thread_id },
-                            "threadId": thread_id,
+                            "thread": {
+                                "id": thread_id,
+                                "cliVersion": "0.144.3",
+                                "createdAt": 1,
+                                "updatedAt": 1,
+                                "cwd": "/tmp",
+                                "ephemeral": true,
+                                "modelProvider": "openai",
+                                "preview": "",
+                                "sessionId": "offline-session",
+                                "source": "appServer",
+                                "status": { "type": "idle" },
+                                "turns": []
+                            },
                             "model": model,
                             "modelProvider": "openai",
                             "approvalPolicy": "on-request",
-                            "status": "idle"
+                            "approvalsReviewer": "user",
+                            "cwd": "/tmp",
+                            "sandbox": "read-only"
                         }
                     }),
                 )?;
@@ -207,8 +252,20 @@ fn main() -> io::Result<()> {
                     &json!({
                         "method": "thread/started",
                         "params": {
-                            "thread": { "id": thread_id },
-                            "threadId": thread_id
+                            "thread": {
+                                "id": thread_id,
+                                "cliVersion": "0.144.3",
+                                "createdAt": 1,
+                                "updatedAt": 1,
+                                "cwd": "/tmp",
+                                "ephemeral": true,
+                                "modelProvider": "openai",
+                                "preview": "",
+                                "sessionId": "offline-session",
+                                "source": "appServer",
+                                "status": { "type": "idle" },
+                                "turns": []
+                            }
                         }
                     }),
                 )?;
@@ -225,7 +282,7 @@ fn main() -> io::Result<()> {
                     &mut stdout,
                     &json!({
                         "id": id,
-                        "result": { "turnId": turn_id, "status": "started" }
+                        "result": { "turn": { "id": turn_id, "status": "inProgress", "items": [] } }
                     }),
                 )?;
                 if fake_mode.as_deref() == Some("desync_after_turn_start") {
@@ -236,9 +293,9 @@ fn main() -> io::Result<()> {
                 send(
                     &mut stdout,
                     &json!({
-                        "method": "turn/started",
-                        "params": { "threadId": thread_id, "turnId": turn_id }
-                    }),
+                                "method": "turn/started",
+                    "params": { "threadId": thread_id, "turn": { "id": turn_id, "status": "inProgress", "items": [] } }
+                            }),
                 )?;
                 if let Some(mode) = approval_mode.as_deref() {
                     handle_approval_mode(&mut lines, &mut stdout, mode, &thread_id, &turn_id)?;
@@ -350,7 +407,7 @@ fn send_turn_completed(
         stdout,
         &json!({
             "method": "turn/completed",
-            "params": { "threadId": thread_id, "turnId": turn_id, "status": status }
+            "params": { "threadId": thread_id, "turn": { "id": turn_id, "status": status, "items": [] } }
         }),
     )
 }

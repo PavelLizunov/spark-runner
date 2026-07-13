@@ -82,7 +82,7 @@ async fn fake_app_server_completes_one_ephemeral_turn() {
 
     send(&mut stdin, 2, "account/read", json!({})).await;
     let account_response = wait_for_response(&mut reader, 2).await;
-    assert_eq!(account_response["result"]["planType"], "pro");
+    assert_eq!(account_response["result"]["account"]["type"], "chatgpt");
 
     send(&mut stdin, 3, "model/list", json!({})).await;
     let model_list_response = wait_for_response(&mut reader, 3).await;
@@ -93,7 +93,11 @@ async fn fake_app_server_completes_one_ephemeral_turn() {
 
     send(&mut stdin, 4, "account/rateLimits/read", json!({})).await;
     let rate_limits_response = wait_for_response(&mut reader, 4).await;
-    assert!(rate_limits_response["result"]["limits"].is_array());
+    assert_eq!(
+        rate_limits_response["result"]["rateLimits"]["primary"]["usedPercent"],
+        0
+    );
+    assert!(rate_limits_response["result"]["rateLimitsByLimitId"].is_object());
 
     send(
         &mut stdin,
@@ -114,12 +118,10 @@ async fn fake_app_server_completes_one_ephemeral_turn() {
         .as_str()
         .expect("thread.id")
         .to_string();
-    assert_eq!(thread_response["result"]["threadId"], thread_id);
 
     // Interleaved notification: must be tolerated, not required before the response.
     let thread_started = wait_for_notification(&mut reader, "thread/started").await;
     assert_eq!(thread_started["params"]["thread"]["id"], thread_id);
-    assert_eq!(thread_started["params"]["threadId"], thread_id);
 
     send(
         &mut stdin,
@@ -132,11 +134,15 @@ async fn fake_app_server_completes_one_ephemeral_turn() {
     )
     .await;
     let turn_start_response = wait_for_response(&mut reader, 6).await;
-    assert_eq!(turn_start_response["result"]["status"], "started");
+    assert_eq!(turn_start_response["result"]["turn"]["id"], "fake-turn-1");
+    assert_eq!(
+        turn_start_response["result"]["turn"]["status"],
+        "inProgress"
+    );
 
     // "turn/started" is interleaved before "turn/completed"; must be tolerated.
     let turn_completed = wait_for_notification(&mut reader, "turn/completed").await;
-    assert_eq!(turn_completed["params"]["status"], "completed");
+    assert_eq!(turn_completed["params"]["turn"]["status"], "completed");
     assert_eq!(turn_completed["params"]["threadId"], thread_id);
 
     let _ = child.start_kill();

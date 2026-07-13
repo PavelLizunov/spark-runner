@@ -144,6 +144,15 @@ impl CodexLock {
         if !native.is_absolute() {
             return Err(ConfigError::InvalidExecutable(self.native_path.clone()));
         }
+        // A lock pins one immutable artifact. Canonicalising a caller-supplied
+        // symlink merely follows a mutable indirection, so reject it before
+        // any hash/version execution.
+        if std::fs::symlink_metadata(native)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(true)
+        {
+            return Err(ConfigError::InvalidExecutable(self.native_path.clone()));
+        }
         let native = std::fs::canonicalize(native)
             .map_err(|_| ConfigError::InvalidExecutable(self.native_path.clone()))?;
         let native_metadata = std::fs::metadata(&native)
@@ -160,6 +169,16 @@ impl CodexLock {
         verify_hash("native runtime", &native, &self.native_sha256)?;
 
         let schema = Path::new(&self.schema_path);
+        if std::fs::symlink_metadata(schema)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(true)
+        {
+            return Err(ConfigError::HashMismatch {
+                kind: "schema",
+                expected: self.schema_hash.clone(),
+                actual: "symlink".to_string(),
+            });
+        }
         let schema = std::fs::canonicalize(schema).map_err(|_| ConfigError::HashMismatch {
             kind: "schema",
             expected: self.schema_hash.clone(),
@@ -396,6 +415,34 @@ mod tests {
                 kind: "native runtime",
                 ..
             })
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// T09: a symlink is mutable indirection and is rejected before any
+    /// version command can run, even if it currently points at a vendor path.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_runtime_is_rejected_before_spawn() {
+        use std::os::unix::fs::symlink;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("spark-runner-symlink-{unique}"));
+        let vendor = root.join("vendor/test/bin");
+        fs::create_dir_all(&vendor).expect("vendor");
+        let target = vendor.join("target");
+        fs::write(&target, b"not executed").expect("target");
+        let link = vendor.join("codex");
+        symlink(&target, &link).expect("symlink");
+        let mut lock =
+            CodexLock::load(std::path::Path::new(super::DEFAULT_CODEX_LOCK)).expect("checked lock");
+        lock.native_path = link.display().to_string();
+        assert!(matches!(
+            lock.verify_for_spawn(),
+            Err(ConfigError::InvalidExecutable(_))
         ));
         let _ = fs::remove_dir_all(root);
     }

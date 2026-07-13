@@ -1172,9 +1172,11 @@ fn push_event(
             .get_mut(&oldest_turn)
             .and_then(|record| (!record.events.is_empty()).then(|| record.events.remove(0)));
         if let Some(removed) = removed {
-            data.replay_bytes = data
-                .replay_bytes
-                .saturating_sub(serde_json::to_vec(&removed).map_or(0, |encoded| encoded.len()));
+            let removed_len = serde_json::to_vec(&removed).map_or(0, |encoded| encoded.len());
+            data.replay_bytes = data.replay_bytes.saturating_sub(removed_len);
+            if let Some(turn) = data.turns.get_mut(&oldest_turn) {
+                turn.event_bytes = turn.event_bytes.saturating_sub(removed_len);
+            }
         }
     }
     let (sender, removed_len) = {
@@ -1278,4 +1280,71 @@ pub async fn serve(config: ApiConfig) -> Result<SocketAddr, ApiError> {
         .await
         .map_err(ApiError::Serve)?;
     Ok(addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T07: global eviction and terminal pruning each account for a retained
+    /// event exactly once. The old global-only subtraction left a stale
+    /// per-turn total, so terminal eviction subtracted it a second time.
+    #[test]
+    fn global_sse_eviction_keeps_per_turn_and_global_bytes_in_sync() {
+        let owner = RuntimeOwner::new(false);
+        let (sender, _receiver) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        owner.data.lock().expect("owner mutex").turns.insert(
+            "turn-test".to_string(),
+            TurnRecord {
+                id: "turn-test".to_string(),
+                thread_id: "thread-test".to_string(),
+                workspace_alias: "default".to_string(),
+                status: TurnStatus::Completed,
+                events: Vec::new(),
+                event_bytes: 0,
+                sender,
+                task: None,
+            },
+        );
+        let state = AppState {
+            inner: Arc::new(Inner {
+                config: ApiConfig {
+                    bind: DEFAULT_BIND,
+                    bearer_token: "test".to_string(),
+                    workspace_aliases: HashSet::from(["default".to_string()]),
+                    live: false,
+                },
+                owner,
+            }),
+        };
+        for _ in 0..80 {
+            push_event(
+                &state,
+                "turn-test",
+                "diagnostic",
+                serde_json::json!({ "padding": "x".repeat(MAX_EVENT_BYTES - 256) }),
+                false,
+            );
+        }
+        let before = state
+            .inner
+            .owner
+            .data
+            .lock()
+            .expect("owner mutex")
+            .replay_bytes;
+        assert!(before <= MAX_SSE_REPLAY_BYTES);
+        prune_terminal_records(&mut state.inner.owner.data.lock().expect("owner mutex"));
+        assert_eq!(
+            state
+                .inner
+                .owner
+                .data
+                .lock()
+                .expect("owner mutex")
+                .replay_bytes,
+            0,
+            "pruning must not underflow a stale per-turn byte total"
+        );
+    }
 }
