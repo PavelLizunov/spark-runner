@@ -119,7 +119,7 @@ fn validate_lock_field(
 }
 
 /// The offline fake app-server is built as a sibling binary of `spark-runner`
-/// in the same target directory.
+/// in the same target directory, but integration tests may run from `target/debug/deps`.
 pub fn fake_app_server_path() -> Result<PathBuf, ConfigError> {
     let current = env::current_exe().map_err(ConfigError::FakeServerNotFound)?;
     let dir = current.parent().ok_or_else(|| {
@@ -128,7 +128,20 @@ pub fn fake_app_server_path() -> Result<PathBuf, ConfigError> {
             "no parent directory for current executable",
         ))
     })?;
-    Ok(dir.join("fake_app_server"))
+    let candidates = [
+        Some(dir.join("fake_app_server")),
+        dir.parent().map(|p| p.join("fake_app_server")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            ConfigError::FakeServerNotFound(io::Error::new(
+                io::ErrorKind::NotFound,
+                "fake_app_server binary not found",
+            ))
+        })
 }
 
 /// A fresh, empty, read-only-safe temp directory for an ephemeral thread's cwd.

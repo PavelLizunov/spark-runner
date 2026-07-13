@@ -1,4 +1,10 @@
-//! Library surface for integration tests. The `spark-runner` binary does not
-//! use this crate; it compiles its own copy of these modules directly.
+//! Library surface for integration tests (and the `fake_app_server` fixture
+//! binary, which reuses [`jsonl::MAX_FRAME_LEN`]). The `spark-runner` binary
+//! also uses this crate directly.
 
+pub mod client;
+pub mod config;
+pub mod jsonl;
+pub mod orchestrator;
 pub mod process;
+pub mod state;
