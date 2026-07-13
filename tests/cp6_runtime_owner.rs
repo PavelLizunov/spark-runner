@@ -640,6 +640,18 @@ async fn permissions_allow_uses_the_generated_profile_shape() {
         approval_event["payload"]["descriptor"]["requested_permissions"]["network_enabled"],
         true
     );
+    assert_eq!(
+        approval_event["payload"]["descriptor"]["reviewable"], true,
+        "authenticated authority must know whether an Allow is safe"
+    );
+    let files = approval_event["payload"]["descriptor"]["requested_permissions"]["file_system"]
+        .as_array()
+        .expect("bounded filesystem descriptor");
+    assert_eq!(files[0]["special_kind"], "project_roots");
+    assert_eq!(files[0]["subpath"], "generated");
+    assert_eq!(files[1]["special_kind"], "unknown");
+    assert_eq!(files[1]["path"], "/tmp/fake-external-root");
+    assert_eq!(files[1]["subpath"], "inputs");
     let (status, decision) = request_json(
         router.clone(),
         "POST",
@@ -793,10 +805,12 @@ async fn control_races_are_interrupted_or_unknown_at_the_correct_boundary() {
         let phase_label = phase.replace('/', "-");
         let journal = unique_path(&format!("control-{phase_label}"), "sqlite3");
         let marker = unique_path(&format!("control-{phase_label}"), "marker");
+        let codex_home_marker = unique_path(&format!("control-home-{phase_label}"), "marker");
         std::env::set_var("SPARK_RUNNER_JOURNAL_PATH", &journal);
         let (control_tx, mut control_rx) = mpsc::channel(1);
         let task = tokio::spawn({
             let marker = marker.clone();
+            let codex_home_marker = codex_home_marker.clone();
             let phase = phase.to_string();
             async move {
                 run_turn_with_launcher_controlled_with_journal(
@@ -807,6 +821,8 @@ async fn control_races_are_interrupted_or_unknown_at_the_correct_boundary() {
                             phase,
                             "--barrier-marker".to_string(),
                             marker.display().to_string(),
+                            "--codex-home-marker".to_string(),
+                            codex_home_marker.display().to_string(),
                         ],
                     },
                     ApprovalPolicy::Deny,
@@ -825,6 +841,12 @@ async fn control_races_are_interrupted_or_unknown_at_the_correct_boundary() {
             .expect("control accepted");
         let result = task.await.expect("controlled task");
         let acknowledgement = ack_rx.await.expect("cleanup acknowledgement");
+        let codex_home =
+            std::fs::read_to_string(&codex_home_marker).expect("fixture private CODEX_HOME marker");
+        assert!(
+            !Path::new(codex_home.trim()).exists(),
+            "controlled completion must remove every private CODEX_HOME"
+        );
         let rows: Vec<String> = Connection::open(&journal)
             .expect("journal")
             .prepare("SELECT payload_json FROM journal_events ORDER BY id")
@@ -854,7 +876,7 @@ async fn control_races_are_interrupted_or_unknown_at_the_correct_boundary() {
             }));
         }
         std::env::remove_var("SPARK_RUNNER_JOURNAL_PATH");
-        cleanup(&[journal, marker]);
+        cleanup(&[journal, marker, codex_home_marker]);
     }
 }
 

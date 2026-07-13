@@ -45,6 +45,8 @@ pub enum AppError {
     Journal(#[from] crate::journal::JournalError),
     #[error(transparent)]
     Api(#[from] crate::api::ApiError),
+    #[error("failed to remove ephemeral runtime directory: {0}")]
+    EphemeralCleanup(std::io::Error),
 }
 
 /// Commands accepted by the one active runtime execution.  The HTTP adapter
@@ -63,10 +65,13 @@ pub enum ControlOutcome {
 }
 
 struct ControlledCompletion {
-    acknowledgement: Option<oneshot::Sender<ControlOutcome>>,
-    acknowledgement_outcome: ControlOutcome,
     status: String,
     execution_status: ExecutionTerminalStatus,
+}
+
+struct ControlledFlowContext<'a> {
+    journal: Option<&'a JournalWriter>,
+    execution_id: &'a str,
 }
 
 fn control_received(
@@ -84,14 +89,38 @@ fn control_received(
     }
 }
 
-fn interrupted_completion(
-    acknowledgement: Option<oneshot::Sender<ControlOutcome>>,
-) -> ControlledCompletion {
+fn interrupted_completion() -> ControlledCompletion {
     ControlledCompletion {
-        acknowledgement,
-        acknowledgement_outcome: ControlOutcome::Interrupted,
         status: "interrupted".to_string(),
         execution_status: ExecutionTerminalStatus::Interrupted,
+    }
+}
+
+/// The auth copy lives only below this directory. Remove it explicitly before
+/// the directory tree so a failed recursive removal never retains an auth
+/// value merely because a parent cleanup raced or was interrupted.
+fn remove_ephemeral_cwd(cwd: &Path) -> Result<(), AppError> {
+    let auth = cwd.join("codex-home").join("auth.json");
+    match std::fs::remove_file(&auth) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            // Continue with recursive removal; a successful tree removal is
+            // sufficient even if the explicit unlink observed a transient.
+        }
+    }
+    match std::fs::remove_dir_all(cwd) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AppError::EphemeralCleanup(error)),
+    }
+}
+
+fn retain_first_error<T>(result: &mut Result<T, AppError>, candidate: Result<(), AppError>) {
+    if result.is_ok() {
+        if let Err(error) = candidate {
+            *result = Err(error);
+        }
     }
 }
 
@@ -221,7 +250,7 @@ async fn spawn_client_with_launcher(
     ) {
         Ok(spawned) => spawned,
         Err(error) => {
-            let _ = std::fs::remove_dir_all(&cwd);
+            remove_ephemeral_cwd(&cwd)?;
             return Err(error.into());
         }
     };
@@ -240,14 +269,14 @@ async fn spawn_client_with_launcher(
 /// durable record, and always reaps that process before reporting.
 pub async fn bootstrap_runtime(launcher: RuntimeLauncher) -> Result<serde_json::Value, AppError> {
     let (mut client, cwd) = spawn_client_with_launcher(&launcher, ApprovalPolicy::Deny).await?;
-    let result = async {
+    let mut result = async {
         client.initialize().await?;
         let rate_limits = client.admit_live_turn().await?;
         Ok::<serde_json::Value, AppError>(rate_limits)
     }
     .await;
-    let _ = client.shutdown().await;
-    let _ = std::fs::remove_dir_all(cwd);
+    retain_first_error(&mut result, client.shutdown().await.map_err(AppError::from));
+    retain_first_error(&mut result, remove_ephemeral_cwd(&cwd));
     result
 }
 
@@ -428,43 +457,53 @@ async fn execute_flow_once(
         matches!(&approval_policy, ApprovalPolicy::External { .. });
     let approval_policy = with_approval_receipt(approval_policy, journal, &execution_id);
     let (mut client, cwd) = spawn_client(live, fake_server_args, approval_policy).await?;
-    let outcome = run_flow_body(&mut client, &cwd, flow, live, journal, &execution_id).await;
-    append_internal_events(
-        journal,
-        &execution_id,
-        client.internal_events(),
-        approval_events_are_synchronous,
-    )
-    .await?;
-    let terminal_status = if outcome.is_ok() {
+    let mut result = run_flow_body(&mut client, &cwd, flow, live, journal, &execution_id).await;
+    let flow_failed = result.is_err();
+    retain_first_error(
+        &mut result,
+        append_internal_events(
+            journal,
+            &execution_id,
+            client.internal_events(),
+            approval_events_are_synchronous,
+        )
+        .await,
+    );
+    let terminal_status = if result.is_ok() {
         ExecutionTerminalStatus::Completed
     } else {
         ExecutionTerminalStatus::Failed
     };
-    append_journal(
-        journal,
-        JournalEvent::ExecutionCompleted {
-            execution_id: execution_id.clone(),
-            status: terminal_status,
-        },
-    )
-    .await?;
-    if outcome.is_err() {
+    retain_first_error(
+        &mut result,
         append_journal(
             journal,
-            JournalEvent::Incident {
-                execution_id: Some(execution_id.clone()),
-                class: "flow_error".to_string(),
-                // Remote protocol errors are intentionally not persisted:
-                // their JSON may contain prompts, paths, or credentials.
-                message: "flow failed; diagnostic payload suppressed".to_string(),
+            JournalEvent::ExecutionCompleted {
+                execution_id: execution_id.clone(),
+                status: terminal_status,
             },
         )
-        .await?;
+        .await,
+    );
+    if flow_failed {
+        retain_first_error(
+            &mut result,
+            append_journal(
+                journal,
+                JournalEvent::Incident {
+                    execution_id: Some(execution_id.clone()),
+                    class: "flow_error".to_string(),
+                    // Remote protocol errors are intentionally not persisted:
+                    // their JSON may contain prompts, paths, or credentials.
+                    message: "flow failed; diagnostic payload suppressed".to_string(),
+                },
+            )
+            .await,
+        );
     }
-    let _ = client.shutdown().await;
-    let _ = std::fs::remove_dir_all(&cwd);
-    outcome
+    retain_first_error(&mut result, client.shutdown().await.map_err(AppError::from));
+    retain_first_error(&mut result, remove_ephemeral_cwd(&cwd));
+    result
 }
 
 fn non_idempotent(method: &'static str) -> impl FnOnce(ClientError) -> AppError {
@@ -688,6 +727,137 @@ pub async fn run_turn_with_launcher_controlled(
     .await
 }
 
+/// All fallible controlled protocol work lives in this inner future so `?`
+/// returns to the caller's single cleanup epilogue, never directly from the
+/// runtime owner. A cancellation before real thread/turn identifiers exist
+/// can only be an interruption; after a non-idempotent write attempt it is
+/// deliberately Unknown and no synthetic interrupt is sent.
+async fn run_controlled_flow(
+    client: &mut CodexClient,
+    cwd: &Path,
+    prompt: &str,
+    turn_timeout: std::time::Duration,
+    controls: &mut mpsc::Receiver<RuntimeControl>,
+    context: ControlledFlowContext<'_>,
+    control_acknowledgement: &mut Option<oneshot::Sender<ControlOutcome>>,
+) -> Result<ControlledCompletion, AppError> {
+    let initialized = tokio::select! {
+        result = client.initialize() => result,
+        control = controls.recv() => {
+            control_received(control, control_acknowledgement)?;
+            return Ok(interrupted_completion());
+        }
+    };
+    initialized?;
+    let rate_limits = tokio::select! {
+        result = client.admit_live_turn() => result,
+        control = controls.recv() => {
+            control_received(control, control_acknowledgement)?;
+            return Ok(interrupted_completion());
+        }
+    }?;
+    append_journal(
+        context.journal,
+        JournalEvent::RateLimitSnapshot {
+            execution_id: context.execution_id.to_string(),
+            snapshot: journal_rate_limit_snapshot(&rate_limits),
+        },
+    )
+    .await?;
+    let thread_delivery = RequestDelivery::new();
+    let thread = tokio::select! {
+        result = client.thread_start_with_delivery(cwd, Some(&thread_delivery)) => result.map_err(non_idempotent("thread/start")),
+        control = controls.recv() => {
+            control_received(control, control_acknowledgement)?;
+            if thread_delivery.may_have_been_written() {
+                return Err(AppError::Client(ClientError::AmbiguousNonIdempotent { method: "thread/start" }));
+            }
+            return Ok(interrupted_completion());
+        }
+    }?;
+    let turn_delivery = RequestDelivery::new();
+    let turn_id = tokio::select! {
+        result = client.turn_start_with_delivery(&thread.thread_id, prompt, Some(&turn_delivery)) => result.map_err(non_idempotent("turn/start")),
+        control = controls.recv() => {
+            control_received(control, control_acknowledgement)?;
+            if turn_delivery.may_have_been_written() {
+                return Err(AppError::Client(ClientError::AmbiguousNonIdempotent { method: "turn/start" }));
+            }
+            return Ok(interrupted_completion());
+        }
+    }?;
+    append_journal(
+        context.journal,
+        JournalEvent::TurnStarted {
+            execution_id: context.execution_id.to_string(),
+            turn_id: turn_id.clone(),
+        },
+    )
+    .await?;
+
+    let deadline = tokio::time::sleep(turn_timeout);
+    tokio::pin!(deadline);
+    tokio::select! {
+        biased;
+        control = controls.recv() => {
+            control_received(control, control_acknowledgement)?;
+            // Both ids come from accepted 0.144.3 responses; do not
+            // synthesize a terminal state if delivery failed or its result
+            // was rejected. That boundary is ambiguous and is deliberately
+            // left recoverable as Unknown on restart.
+            tokio::time::timeout(
+                CONTROLLED_CANCEL_TIMEOUT,
+                client.turn_interrupt(&thread.thread_id, &turn_id),
+            )
+            .await
+            .map_err(|_| AppError::Client(ClientError::TurnDeadlineExceeded))?
+            .map_err(non_idempotent("turn/interrupt"))?;
+            // The interrupt response only acknowledges the RPC. A terminal
+            // state is authoritative only after the matching notification.
+            let terminal = tokio::time::timeout(
+                CONTROLLED_CANCEL_TIMEOUT,
+                client.wait_turn_completed(),
+            )
+            .await
+            .map_err(|_| AppError::Client(ClientError::TurnDeadlineExceeded))?
+            .map_err(non_idempotent("turn/completed"))?;
+            append_journal(
+                context.journal,
+                JournalEvent::TurnCompleted {
+                    execution_id: context.execution_id.to_string(),
+                    turn_id,
+                    status: TurnTerminalStatus::Interrupted,
+                },
+            )
+            .await?;
+            Ok(ControlledCompletion {
+                status: terminal.status,
+                execution_status: ExecutionTerminalStatus::Interrupted,
+            })
+        },
+        completed = client.wait_turn_completed() => {
+            let turn = completed.map_err(non_idempotent("turn/completed"))?;
+            append_journal(
+                context.journal,
+                JournalEvent::TurnCompleted {
+                    execution_id: context.execution_id.to_string(),
+                    turn_id,
+                    status: turn_status(&turn.status),
+                },
+            ).await?;
+            Ok(ControlledCompletion {
+                execution_status: if turn.status == "completed" {
+                    ExecutionTerminalStatus::Completed
+                } else {
+                    ExecutionTerminalStatus::Failed
+                },
+                status: turn.status,
+            })
+        },
+        _ = &mut deadline => Err(AppError::Client(ClientError::TurnDeadlineExceeded)),
+    }
+}
+
 /// Owner-only variant of the controlled path.  `shared_journal` is opened
 /// during owner bootstrap and cloned into the active protocol execution, so
 /// startup recovery, approval receipts, terminal records, and shutdown all
@@ -707,173 +877,81 @@ pub async fn run_turn_with_launcher_controlled_with_journal(
             Some(config) => {
                 let projection = project_recovery(&config.path)?;
                 let writer = JournalWriter::open(config)?;
-                persist_recovery(&writer, projection).await?;
+                if let Err(error) = persist_recovery(&writer, projection).await {
+                    let _ = writer.shutdown().await;
+                    return Err(error);
+                }
                 (Some(writer), true)
             }
             None => (None, false),
         },
     };
     let execution_id = next_execution_id();
-    append_journal(
+    if let Err(error) = append_journal(
         journal.as_ref(),
         JournalEvent::ExecutionStarted {
             execution_id: execution_id.clone(),
         },
     )
-    .await?;
+    .await
+    {
+        if owns_journal {
+            if let Some(journal) = journal {
+                let _ = journal.shutdown().await;
+            }
+        }
+        return Err(error);
+    }
     let approval_events_are_synchronous =
         matches!(&approval_policy, ApprovalPolicy::External { .. });
     let approval_policy = with_approval_receipt(approval_policy, journal.as_ref(), &execution_id);
     let (mut client, cwd) = match spawn_client_with_launcher(&launcher, approval_policy).await {
         Ok(client) => client,
         Err(error) => {
-            append_journal(
+            let completion = append_journal(
                 journal.as_ref(),
                 JournalEvent::ExecutionCompleted {
                     execution_id,
                     status: ExecutionTerminalStatus::Failed,
                 },
             )
-            .await?;
+            .await;
+            let mut result = completion.and(Err(error));
             if owns_journal {
                 if let Some(journal) = journal {
-                    journal.shutdown().await?;
+                    retain_first_error(
+                        &mut result,
+                        journal.shutdown().await.map_err(AppError::from),
+                    );
                 }
             }
-            return Err(error);
+            return result;
         }
     };
     let mut control_acknowledgement = None;
-    let result: Result<ControlledCompletion, AppError> = 'flow: {
-        let initialized = tokio::select! {
-            result = client.initialize() => result,
-            control = controls.recv() => {
-                control_received(control, &mut control_acknowledgement)?;
-                break 'flow Ok(interrupted_completion(control_acknowledgement.take()));
-            }
-        };
-        initialized?;
-        let rate_limits = tokio::select! {
-            result = client.admit_live_turn() => result,
-            control = controls.recv() => {
-                control_received(control, &mut control_acknowledgement)?;
-                break 'flow Ok(interrupted_completion(control_acknowledgement.take()));
-            }
-        }?;
-        append_journal(
-            journal.as_ref(),
-            JournalEvent::RateLimitSnapshot {
-                execution_id: execution_id.clone(),
-                snapshot: journal_rate_limit_snapshot(&rate_limits),
-            },
-        )
-        .await?;
-        let thread_delivery = RequestDelivery::new();
-        let thread = tokio::select! {
-            result = client.thread_start_with_delivery(&cwd, Some(&thread_delivery)) => result.map_err(non_idempotent("thread/start")),
-            control = controls.recv() => {
-                control_received(control, &mut control_acknowledgement)?;
-                if thread_delivery.was_written() {
-                    break 'flow Err(AppError::Client(ClientError::AmbiguousNonIdempotent { method: "thread/start" }));
-                }
-                break 'flow Ok(interrupted_completion(control_acknowledgement.take()));
-            }
-        }?;
-        let turn_delivery = RequestDelivery::new();
-        let turn_id = tokio::select! {
-            result = client.turn_start_with_delivery(&thread.thread_id, &prompt, Some(&turn_delivery)) => result.map_err(non_idempotent("turn/start")),
-            control = controls.recv() => {
-                control_received(control, &mut control_acknowledgement)?;
-                if turn_delivery.was_written() {
-                    break 'flow Err(AppError::Client(ClientError::AmbiguousNonIdempotent { method: "turn/start" }));
-                }
-                break 'flow Ok(interrupted_completion(control_acknowledgement.take()));
-            }
-        }?;
-        append_journal(
-            journal.as_ref(),
-            JournalEvent::TurnStarted {
-                execution_id: execution_id.clone(),
-                turn_id: turn_id.clone(),
-            },
-        )
-        .await?;
-
-        let deadline = tokio::time::sleep(turn_timeout);
-        tokio::pin!(deadline);
-        tokio::select! {
-            biased;
-            control = controls.recv() => {
-                control_received(control, &mut control_acknowledgement)?;
-                    // Both ids come from accepted 0.144.3 responses; do not
-                    // synthesize a terminal state if delivery failed or its
-                    // result was rejected. That boundary is ambiguous and is
-                    // deliberately left recoverable as Unknown on restart.
-                    tokio::time::timeout(
-                        CONTROLLED_CANCEL_TIMEOUT,
-                        client.turn_interrupt(&thread.thread_id, &turn_id),
-                    )
-                    .await
-                    .map_err(|_| AppError::Client(ClientError::TurnDeadlineExceeded))?
-                    .map_err(non_idempotent("turn/interrupt"))?;
-                    // The 0.144.3 interrupt response only acknowledges the
-                    // RPC. A terminal state is authoritative only after the
-                    // matching server notification arrives on this same
-                    // protocol stream.
-                    let terminal = tokio::time::timeout(
-                        CONTROLLED_CANCEL_TIMEOUT,
-                        client.wait_turn_completed(),
-                    )
-                    .await
-                    .map_err(|_| AppError::Client(ClientError::TurnDeadlineExceeded))?
-                    .map_err(non_idempotent("turn/completed"))?;
-                    append_journal(
-                        journal.as_ref(),
-                        JournalEvent::TurnCompleted {
-                            execution_id: execution_id.clone(),
-                            turn_id,
-                            status: TurnTerminalStatus::Interrupted,
-                        },
-                    )
-                    .await?;
-                    Ok(ControlledCompletion {
-                        acknowledgement: control_acknowledgement.take(),
-                        acknowledgement_outcome: ControlOutcome::Interrupted,
-                        status: terminal.status,
-                        execution_status: ExecutionTerminalStatus::Interrupted,
-                    })
-            },
-            completed = client.wait_turn_completed() => {
-                let turn = completed.map_err(non_idempotent("turn/completed"))?;
-                append_journal(
-                    journal.as_ref(),
-                    JournalEvent::TurnCompleted {
-                        execution_id: execution_id.clone(),
-                        turn_id,
-                        status: turn_status(&turn.status),
-                    },
-                ).await?;
-                Ok(ControlledCompletion {
-                    acknowledgement: None,
-                    acknowledgement_outcome: ControlOutcome::Interrupted,
-                    execution_status: if turn.status == "completed" {
-                        ExecutionTerminalStatus::Completed
-                    } else {
-                        ExecutionTerminalStatus::Failed
-                    },
-                    status: turn.status,
-                })
-            },
-            _ = &mut deadline => Err(AppError::Client(ClientError::TurnDeadlineExceeded)),
-        }
-    };
-    append_internal_events(
-        journal.as_ref(),
-        &execution_id,
-        client.internal_events(),
-        approval_events_are_synchronous,
+    let mut result = run_controlled_flow(
+        &mut client,
+        &cwd,
+        &prompt,
+        turn_timeout,
+        controls,
+        ControlledFlowContext {
+            journal: journal.as_ref(),
+            execution_id: &execution_id,
+        },
+        &mut control_acknowledgement,
     )
-    .await?;
+    .await;
+    retain_first_error(
+        &mut result,
+        append_internal_events(
+            journal.as_ref(),
+            &execution_id,
+            client.internal_events(),
+            approval_events_are_synchronous,
+        )
+        .await,
+    );
     let ambiguous_delivery = matches!(
         &result,
         Err(AppError::Client(ClientError::AmbiguousNonIdempotent { .. }))
@@ -883,52 +961,65 @@ pub async fn run_turn_with_launcher_controlled_with_journal(
         Err(AppError::Client(ClientError::TurnDeadlineExceeded))
     );
     if ambiguous_delivery {
-        append_journal(
-            journal.as_ref(),
-            JournalEvent::Incident {
-                execution_id: Some(execution_id.clone()),
-                class: "delivery_ambiguous".to_string(),
-                message: "non-idempotent delivery outcome is unknown; recovery required"
-                    .to_string(),
-            },
-        )
-        .await?;
-    } else {
-        if cancellation_timeout {
+        retain_first_error(
+            &mut result,
             append_journal(
                 journal.as_ref(),
                 JournalEvent::Incident {
                     execution_id: Some(execution_id.clone()),
-                    class: "cancellation_timeout".to_string(),
-                    message: "interrupt acknowledgement or terminal notification timed out; process group reaped"
+                    class: "delivery_ambiguous".to_string(),
+                    message: "non-idempotent delivery outcome is unknown; recovery required"
                         .to_string(),
                 },
             )
-            .await?;
+            .await,
+        );
+    } else {
+        if cancellation_timeout {
+            retain_first_error(
+                &mut result,
+                append_journal(
+                    journal.as_ref(),
+                    JournalEvent::Incident {
+                        execution_id: Some(execution_id.clone()),
+                        class: "cancellation_timeout".to_string(),
+                        message: "interrupt acknowledgement or terminal notification timed out; process group reaped"
+                            .to_string(),
+                    },
+                )
+                .await,
+            );
         }
-        append_journal(
-            journal.as_ref(),
-            JournalEvent::ExecutionCompleted {
-                execution_id: execution_id.clone(),
-                status: result
-                    .as_ref()
-                    .map(|completion| completion.execution_status)
-                    .unwrap_or(ExecutionTerminalStatus::Failed),
-            },
-        )
-        .await?;
+        let execution_status = result
+            .as_ref()
+            .map(|completion| completion.execution_status)
+            .unwrap_or(ExecutionTerminalStatus::Failed);
+        retain_first_error(
+            &mut result,
+            append_journal(
+                journal.as_ref(),
+                JournalEvent::ExecutionCompleted {
+                    execution_id: execution_id.clone(),
+                    status: execution_status,
+                },
+            )
+            .await,
+        );
     }
-    client.shutdown().await?;
-    let _ = std::fs::remove_dir_all(&cwd);
+    retain_first_error(&mut result, client.shutdown().await.map_err(AppError::from));
+    retain_first_error(&mut result, remove_ephemeral_cwd(&cwd));
     if owns_journal {
         if let Some(journal) = journal {
-            journal.shutdown().await?;
+            retain_first_error(
+                &mut result,
+                journal.shutdown().await.map_err(AppError::from),
+            );
         }
     }
     match result {
         Ok(completion) => {
-            if let Some(acknowledgement) = completion.acknowledgement {
-                let _ = acknowledgement.send(completion.acknowledgement_outcome);
+            if let Some(acknowledgement) = control_acknowledgement {
+                let _ = acknowledgement.send(ControlOutcome::Interrupted);
             }
             Ok(format!(
                 "run: mode={} model={} turn_status={status}",

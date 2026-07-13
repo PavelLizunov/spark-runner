@@ -197,6 +197,9 @@ pub struct PendingApproval {
 #[derive(Debug, Clone, Serialize)]
 pub struct ApprovalDescriptor {
     pub kind: &'static str,
+    /// False means a bounded/redacted summary could not show the whole scope,
+    /// so the authenticated authority may only deny the request.
+    pub reviewable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,7 +229,15 @@ pub struct RequestedPermissions {
 #[derive(Debug, Clone, Serialize)]
 pub struct RequestedFileSystemPermission {
     pub access: String,
-    pub path: String,
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub special_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subpath: Option<String>,
 }
 
 impl ApprovalDescriptor {
@@ -239,29 +250,51 @@ impl ApprovalDescriptor {
         };
         let mut descriptor = Self {
             kind: approval_kind(method),
+            reviewable: true,
             command: None,
             cwd: text("cwd", MAX_APPROVAL_TEXT),
             reason: text("reason", MAX_APPROVAL_TEXT),
             file_changes: Vec::new(),
             requested_permissions: None,
         };
+        // CWD and reason are part of the human decision context whenever the
+        // generated request supplies them. A truncated or redacted value can
+        // still explain a denial, but not an informed Allow.
+        descriptor.reviewable &= params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .is_none_or(|cwd| approval_text_is_reviewable(cwd, MAX_APPROVAL_TEXT));
+        descriptor.reviewable &= params
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_none_or(|reason| approval_text_is_reviewable(reason, MAX_APPROVAL_TEXT));
         match method {
             "item/commandExecution/requestApproval" => {
                 descriptor.command = text("command", MAX_APPROVAL_COMMAND);
+                descriptor.reviewable &=
+                    params
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|command| {
+                            approval_text_is_reviewable(command, MAX_APPROVAL_COMMAND)
+                        });
             }
             "execCommandApproval" => {
-                descriptor.command = params
-                    .get("command")
-                    .and_then(Value::as_array)
-                    .map(|parts| {
-                        let joined = parts
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .take(MAX_APPROVAL_LIST_ITEMS)
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        sanitize_approval_text(&joined, MAX_APPROVAL_COMMAND)
-                    });
+                let Some(parts) = params.get("command").and_then(Value::as_array) else {
+                    descriptor.reviewable = false;
+                    return (descriptor, false);
+                };
+                if parts.len() > MAX_APPROVAL_LIST_ITEMS {
+                    descriptor.reviewable = false;
+                }
+                let Some(parts) = parts.iter().map(Value::as_str).collect::<Option<Vec<_>>>()
+                else {
+                    descriptor.reviewable = false;
+                    return (descriptor, false);
+                };
+                let joined = parts.join(" ");
+                descriptor.reviewable &= approval_text_is_reviewable(&joined, MAX_APPROVAL_COMMAND);
+                descriptor.command = Some(sanitize_approval_text(&joined, MAX_APPROVAL_COMMAND));
             }
             "item/fileChange/requestApproval" => {
                 if let Some(root) = text("grantRoot", MAX_APPROVAL_TEXT) {
@@ -270,32 +303,57 @@ impl ApprovalDescriptor {
                         operation: "grant_root".to_string(),
                     });
                 }
+                descriptor.reviewable &= params
+                    .get("grantRoot")
+                    .and_then(Value::as_str)
+                    .is_some_and(|root| approval_text_is_reviewable(root, MAX_APPROVAL_TEXT));
             }
             "applyPatchApproval" => {
-                if let Some(changes) = params.get("fileChanges").and_then(Value::as_object) {
-                    for (path, change) in changes.iter().take(MAX_APPROVAL_LIST_ITEMS) {
-                        descriptor.file_changes.push(ApprovalFileChange {
-                            path: sanitize_approval_text(path, MAX_APPROVAL_TEXT),
-                            operation: change
-                                .get("type")
-                                .and_then(Value::as_str)
-                                .filter(|kind| matches!(*kind, "add" | "update" | "delete"))
-                                .unwrap_or("unknown")
-                                .to_string(),
-                        });
-                    }
+                descriptor.reviewable &= params
+                    .get("grantRoot")
+                    .and_then(Value::as_str)
+                    .is_none_or(|root| approval_text_is_reviewable(root, MAX_APPROVAL_TEXT));
+                if let Some(root) = text("grantRoot", MAX_APPROVAL_TEXT) {
+                    descriptor.file_changes.push(ApprovalFileChange {
+                        path: root,
+                        operation: "grant_root".to_string(),
+                    });
+                }
+                let Some(changes) = params.get("fileChanges").and_then(Value::as_object) else {
+                    descriptor.reviewable = false;
+                    return (descriptor, false);
+                };
+                if changes.len() > MAX_APPROVAL_LIST_ITEMS {
+                    descriptor.reviewable = false;
+                }
+                for (path, change) in changes.iter().take(MAX_APPROVAL_LIST_ITEMS) {
+                    let operation = change
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .filter(|kind| matches!(*kind, "add" | "update" | "delete"));
+                    descriptor.reviewable &=
+                        operation.is_some() && approval_text_is_reviewable(path, MAX_APPROVAL_TEXT);
+                    descriptor.file_changes.push(ApprovalFileChange {
+                        path: sanitize_approval_text(path, MAX_APPROVAL_TEXT),
+                        operation: operation.unwrap_or("unknown").to_string(),
+                    });
                 }
             }
             "item/permissions/requestApproval" => {
                 if let Some(profile) = validated_requested_permissions(params) {
-                    descriptor.requested_permissions = Some(describe_permissions(&profile));
-                    return (descriptor, true);
+                    let (permissions, reviewable) = describe_permissions(&profile);
+                    descriptor.requested_permissions = Some(permissions);
+                    descriptor.reviewable &= reviewable;
+                    let allow_permitted = descriptor.reviewable;
+                    return (descriptor, allow_permitted);
                 }
+                descriptor.reviewable = false;
                 return (descriptor, false);
             }
             _ => {}
         }
-        (descriptor, true)
+        let allow_permitted = descriptor.reviewable;
+        (descriptor, allow_permitted)
     }
 }
 
@@ -306,6 +364,10 @@ impl ApprovalDescriptor {
 pub struct ApprovalCommand {
     pub decision: ApprovalDecision,
     pub delivered: oneshot::Sender<bool>,
+    /// Cancellation holds the protocol reader at the response boundary until
+    /// the owner has queued its real-ID interrupt. Ordinary decisions leave
+    /// this empty and resume immediately after their wire acknowledgement.
+    pub resume: Option<oneshot::Receiver<()>>,
 }
 
 /// Schema-shaped token-refresh hand-off.  Values are intentionally opaque to
@@ -719,9 +781,9 @@ impl CodexClient {
 
         state.on_approval_requested(request_key.clone(), method.to_string())?;
         let (descriptor, allow_permitted) = ApprovalDescriptor::from_request(method, params);
-        let (decision, acknowledgement) = match approval_policy {
-            ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, None),
-            ApprovalPolicy::Deny => (ApprovalDecision::Deny, None),
+        let (decision, acknowledgement, resume) = match approval_policy {
+            ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, None, None),
+            ApprovalPolicy::Deny => (ApprovalDecision::Deny, None, None),
             ApprovalPolicy::External {
                 pending,
                 timeout,
@@ -748,7 +810,7 @@ impl CodexClient {
                         .map_err(|_| ClientError::SessionPoisoned)?;
                 }
                 if pending.send(pending_approval).await.is_err() {
-                    (ApprovalDecision::Deny, None)
+                    (ApprovalDecision::Deny, None, None)
                 } else {
                     // The owner schedules this same deadline.  Leave a
                     // narrow transport grace here solely to avoid retaining a
@@ -760,11 +822,13 @@ impl CodexClient {
                     )
                     .await
                     {
-                        Ok(Ok(command)) => (command.decision, Some(command.delivered)),
+                        Ok(Ok(command)) => {
+                            (command.decision, Some(command.delivered), command.resume)
+                        }
                         // A closed local authority or deadline must still
                         // receive one schema-valid fail-closed response on the
                         // original JSON-RPC request id.
-                        Ok(Err(_)) | Err(_) => (ApprovalDecision::Timeout, None),
+                        Ok(Err(_)) | Err(_) => (ApprovalDecision::Timeout, None, None),
                     }
                 }
             }
@@ -796,6 +860,9 @@ impl CodexClient {
         )?;
         if let Some(acknowledgement) = acknowledgement {
             let _ = acknowledgement.send(true);
+            if let Some(resume) = resume {
+                let _ = resume.await;
+            }
             tokio::task::yield_now().await;
         }
         Ok(())
@@ -841,9 +908,9 @@ impl CodexClient {
             return Err(ClientError::DuplicateApproval { request_key });
         }
         let (descriptor, allow_permitted) = ApprovalDescriptor::from_request(method, params);
-        let (decision, acknowledgement) = match approval_policy {
-            ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, None),
-            ApprovalPolicy::Deny => (ApprovalDecision::Deny, None),
+        let (decision, acknowledgement, resume) = match approval_policy {
+            ApprovalPolicy::AllowForTests => (ApprovalDecision::Allow, None, None),
+            ApprovalPolicy::Deny => (ApprovalDecision::Deny, None, None),
             ApprovalPolicy::External {
                 pending,
                 timeout,
@@ -878,7 +945,7 @@ impl CodexClient {
                     // so fail closed *on the original id* rather than
                     // returning an internal hand-off error without a wire
                     // response.
-                    (ApprovalDecision::Timeout, None)
+                    (ApprovalDecision::Timeout, None, None)
                 } else {
                     match tokio::time::timeout(
                         timeout.saturating_add(Duration::from_secs(1)),
@@ -886,8 +953,10 @@ impl CodexClient {
                     )
                     .await
                     {
-                        Ok(Ok(command)) => (command.decision, Some(command.delivered)),
-                        Ok(Err(_)) | Err(_) => (ApprovalDecision::Timeout, None),
+                        Ok(Ok(command)) => {
+                            (command.decision, Some(command.delivered), command.resume)
+                        }
+                        Ok(Err(_)) | Err(_) => (ApprovalDecision::Timeout, None, None),
                     }
                 }
             }
@@ -909,6 +978,9 @@ impl CodexClient {
         }
         if let Some(acknowledgement) = acknowledgement {
             let _ = acknowledgement.send(true);
+            if let Some(resume) = resume {
+                let _ = resume.await;
+            }
             tokio::task::yield_now().await;
         }
         Ok(())
@@ -1150,16 +1222,7 @@ fn sanitize_approval_text(value: &str, limit: usize) -> String {
     let mut redact_next = false;
     for word in value.split_whitespace() {
         let lower = word.to_ascii_lowercase();
-        let sensitive = redact_next
-            || lower.contains("token")
-            || lower.contains("secret")
-            || lower.contains("password")
-            || lower.contains("authorization")
-            || lower.contains("canary")
-            || lower.starts_with("sk-")
-            || lower.starts_with("ghp_")
-            || lower.starts_with("github_pat_")
-            || lower.starts_with("xoxb-");
+        let sensitive = redact_next || sensitive_approval_word(&lower);
         redact_next = lower == "bearer" || lower.ends_with("bearer:");
         output.push(if sensitive {
             "[REDACTED]".to_string()
@@ -1175,6 +1238,34 @@ fn sanitize_approval_text(value: &str, limit: usize) -> String {
         bounded.push('…');
     }
     bounded
+}
+
+/// A redacted descriptor can explain why a request was denied, but cannot
+/// support an informed Allow for hidden command or filesystem scope.
+fn approval_text_is_reviewable(value: &str, limit: usize) -> bool {
+    value.chars().count() <= limit
+        && !value.chars().any(char::is_control)
+        && !value
+            .split_whitespace()
+            .scan(false, |redact_next, word| {
+                let lower = word.to_ascii_lowercase();
+                let sensitive = *redact_next || sensitive_approval_word(&lower);
+                *redact_next = lower == "bearer" || lower.ends_with("bearer:");
+                Some(sensitive)
+            })
+            .any(|sensitive| sensitive)
+}
+
+fn sensitive_approval_word(lower: &str) -> bool {
+    lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("authorization")
+        || lower.contains("canary")
+        || lower.starts_with("sk-")
+        || lower.starts_with("ghp_")
+        || lower.starts_with("github_pat_")
+        || lower.starts_with("xoxb-")
 }
 
 fn validated_requested_permissions(params: &Value) -> Option<Value> {
@@ -1197,7 +1288,24 @@ fn validated_requested_permissions(params: &Value) -> Option<Value> {
     {
         return None;
     }
+    if permission_entry_count(profile) > MAX_PERMISSION_ENTRIES {
+        return None;
+    }
     Some(Value::Object(profile.clone()))
+}
+
+fn permission_entry_count(profile: &serde_json::Map<String, Value>) -> usize {
+    profile
+        .get("fileSystem")
+        .and_then(Value::as_object)
+        .map(|file_system| {
+            ["entries", "read", "write"]
+                .into_iter()
+                .filter_map(|key| file_system.get(key).and_then(Value::as_array))
+                .map(Vec::len)
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 fn valid_file_system_permissions(value: &Value) -> bool {
@@ -1337,64 +1445,130 @@ fn valid_network_permissions(value: &Value) -> bool {
         })
 }
 
-fn describe_permissions(profile: &Value) -> RequestedPermissions {
+fn describe_permissions(profile: &Value) -> (RequestedPermissions, bool) {
     let mut file_system = Vec::new();
+    let mut reviewable = true;
     let file_system_profile = profile.get("fileSystem").and_then(Value::as_object);
     if let Some(file_system_profile) = file_system_profile {
         if let Some(entries) = file_system_profile.get("entries").and_then(Value::as_array) {
-            for entry in entries.iter().take(MAX_PERMISSION_ENTRIES) {
-                if let (Some(access), Some(path)) = (
+            for entry in entries {
+                if let (Some(access), Some((path, safe))) = (
                     entry.get("access").and_then(Value::as_str),
                     describe_permission_path(entry.get("path").unwrap_or(&Value::Null)),
                 ) {
+                    reviewable &= safe;
                     file_system.push(RequestedFileSystemPermission {
                         access: access.to_string(),
-                        path,
+                        ..path
                     });
+                } else {
+                    reviewable = false;
                 }
             }
         }
         for (access, key) in [("read", "read"), ("write", "write")] {
             if let Some(paths) = file_system_profile.get(key).and_then(Value::as_array) {
-                for path in paths
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .take(MAX_PERMISSION_ENTRIES)
-                {
-                    file_system.push(RequestedFileSystemPermission {
-                        access: access.to_string(),
-                        path: sanitize_approval_text(path, MAX_APPROVAL_TEXT),
-                    });
+                for path in paths {
+                    if let Some(path) = path.as_str() {
+                        reviewable &= approval_text_is_reviewable(path, MAX_APPROVAL_TEXT);
+                        file_system.push(RequestedFileSystemPermission {
+                            access: access.to_string(),
+                            kind: "path",
+                            path: Some(sanitize_approval_text(path, MAX_APPROVAL_TEXT)),
+                            pattern: None,
+                            special_kind: None,
+                            subpath: None,
+                        });
+                    } else {
+                        reviewable = false;
+                    }
                 }
             }
         }
     }
-    RequestedPermissions {
-        file_system,
-        network_enabled: profile.pointer("/network/enabled").and_then(Value::as_bool),
+    (
+        RequestedPermissions {
+            file_system,
+            network_enabled: profile.pointer("/network/enabled").and_then(Value::as_bool),
+        },
+        reviewable,
+    )
+}
+
+fn describe_permission_path(value: &Value) -> Option<(RequestedFileSystemPermission, bool)> {
+    let path = value.as_object()?;
+    match path.get("type").and_then(Value::as_str)? {
+        "path" => path.get("path").and_then(Value::as_str).map(|path| {
+            (
+                RequestedFileSystemPermission {
+                    access: String::new(),
+                    kind: "path",
+                    path: Some(sanitize_approval_text(path, MAX_APPROVAL_TEXT)),
+                    pattern: None,
+                    special_kind: None,
+                    subpath: None,
+                },
+                approval_text_is_reviewable(path, MAX_APPROVAL_TEXT),
+            )
+        }),
+        "glob_pattern" => path.get("pattern").and_then(Value::as_str).map(|pattern| {
+            (
+                RequestedFileSystemPermission {
+                    access: String::new(),
+                    kind: "glob_pattern",
+                    path: None,
+                    pattern: Some(sanitize_approval_text(pattern, MAX_APPROVAL_TEXT)),
+                    special_kind: None,
+                    subpath: None,
+                },
+                approval_text_is_reviewable(pattern, MAX_APPROVAL_TEXT),
+            )
+        }),
+        "special" => describe_special_permission_path(path.get("value")?),
+        _ => None,
     }
 }
 
-fn describe_permission_path(value: &Value) -> Option<String> {
-    let path = value.as_object()?;
-    match path.get("type").and_then(Value::as_str)? {
-        "path" => path
-            .get("path")
+fn describe_special_permission_path(
+    value: &Value,
+) -> Option<(RequestedFileSystemPermission, bool)> {
+    let value = value.as_object()?;
+    let special_kind = match value.get("kind").and_then(Value::as_str)? {
+        "root" => "root",
+        "minimal" => "minimal",
+        "tmpdir" => "tmpdir",
+        "slash_tmp" => "slash_tmp",
+        "project_roots" => "project_roots",
+        "unknown" => "unknown",
+        _ => return None,
+    };
+    let path = value
+        .get("path")
+        .and_then(Value::as_str)
+        .map(|path| sanitize_approval_text(path, MAX_APPROVAL_TEXT));
+    let subpath = value
+        .get("subpath")
+        .and_then(Value::as_str)
+        .map(|subpath| sanitize_approval_text(subpath, MAX_APPROVAL_TEXT));
+    let reviewable = value
+        .get("path")
+        .and_then(Value::as_str)
+        .is_none_or(|path| approval_text_is_reviewable(path, MAX_APPROVAL_TEXT))
+        && value
+            .get("subpath")
             .and_then(Value::as_str)
-            .map(|path| sanitize_approval_text(path, MAX_APPROVAL_TEXT)),
-        "glob_pattern" => path.get("pattern").and_then(Value::as_str).map(|pattern| {
-            format!(
-                "glob:{}",
-                sanitize_approval_text(pattern, MAX_APPROVAL_TEXT)
-            )
-        }),
-        "special" => path
-            .get("value")
-            .and_then(|value| value.get("kind"))
-            .and_then(Value::as_str)
-            .map(|kind| format!("special:{kind}")),
-        _ => None,
-    }
+            .is_none_or(|subpath| approval_text_is_reviewable(subpath, MAX_APPROVAL_TEXT));
+    Some((
+        RequestedFileSystemPermission {
+            access: String::new(),
+            kind: "special",
+            path,
+            pattern: None,
+            special_kind: Some(special_kind),
+            subpath,
+        },
+        reviewable,
+    ))
 }
 
 fn approval_request_key(method: &str, id: &Value, params: &Value) -> String {
@@ -1486,8 +1660,12 @@ mod tests {
                 "reason": "needs network access",
             }),
         );
-        assert!(allowed);
+        assert!(
+            !allowed,
+            "a redacted command cannot be approved without its hidden scope"
+        );
         assert_eq!(command.kind, "command");
+        assert!(!command.reviewable);
         assert_eq!(command.cwd.as_deref(), Some("/tmp/repo"));
         assert_eq!(command.reason.as_deref(), Some("needs network access"));
         let encoded = serde_json::to_string(&command).expect("descriptor json");
@@ -1531,6 +1709,69 @@ mod tests {
             Some(&invalid),
         );
         assert_eq!(response["permissions"], empty_permission_profile());
+    }
+
+    #[test]
+    fn approval_descriptor_exposes_special_permission_scope_or_refuses_allow() {
+        let (descriptor, allowed) = ApprovalDescriptor::from_request(
+            "item/permissions/requestApproval",
+            &json!({
+                "permissions": {
+                    "fileSystem": { "entries": [
+                        {
+                            "access": "write",
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots", "subpath": "generated" }
+                            }
+                        },
+                        {
+                            "access": "read",
+                            "path": {
+                                "type": "special",
+                                "value": {
+                                    "kind": "unknown",
+                                    "path": "/tmp/external-root",
+                                    "subpath": "inputs"
+                                }
+                            }
+                        }
+                    ] },
+                    "network": { "enabled": true }
+                }
+            }),
+        );
+        assert!(allowed);
+        assert!(descriptor.reviewable);
+        let permissions = descriptor
+            .requested_permissions
+            .expect("permission descriptor");
+        assert_eq!(permissions.file_system[0].kind, "special");
+        assert_eq!(
+            permissions.file_system[0].special_kind,
+            Some("project_roots")
+        );
+        assert_eq!(
+            permissions.file_system[0].subpath.as_deref(),
+            Some("generated")
+        );
+        assert_eq!(permissions.file_system[1].special_kind, Some("unknown"));
+        assert_eq!(
+            permissions.file_system[1].path.as_deref(),
+            Some("/tmp/external-root")
+        );
+
+        let (truncated, allowed) = ApprovalDescriptor::from_request(
+            "applyPatchApproval",
+            &json!({
+                "fileChanges": (0..=MAX_APPROVAL_LIST_ITEMS)
+                    .map(|index| (format!("/tmp/file-{index}"), json!({ "type": "update" })))
+                    .collect::<serde_json::Map<String, Value>>()
+            }),
+        );
+        assert!(!allowed);
+        assert!(!truncated.reviewable);
+        assert_eq!(truncated.file_changes.len(), MAX_APPROVAL_LIST_ITEMS);
     }
 
     /// T10: canonical 0.144.3 quota admission is fail-closed.  An available

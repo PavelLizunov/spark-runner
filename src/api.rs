@@ -747,6 +747,7 @@ async fn owner_register_pending(
             .send(ApprovalCommand {
                 decision: ApprovalDecision::Deny,
                 delivered,
+                resume: None,
             })
             .is_ok();
         if sent {
@@ -871,6 +872,10 @@ async fn owner_interrupt(
         "approval_timeout" | "turn_deadline" => ApprovalDecision::Timeout,
         _ => ApprovalDecision::Deny,
     };
+    let control = state
+        .turns
+        .get(turn_id)
+        .and_then(|turn| turn.control.clone());
     let mut claimed = Vec::new();
     for approval in state.approvals.values_mut() {
         if approval.turn_id == turn_id && approval.status == ApprovalStatus::Pending {
@@ -880,8 +885,20 @@ async fn owner_interrupt(
             }
         }
     }
+    // Keep a cancellation approval response on the wire boundary until the
+    // owner has queued its interrupt. Otherwise a fast child can terminalize
+    // between a valid denial and the control command, leaving a closed channel
+    // that cannot distinguish interruption from an unknown protocol outcome.
+    let mut resume_after_interrupt = Vec::new();
     for (approval_id, sender) in claimed {
-        let delivered = deliver_approval(sender, approval_decision).await;
+        let (resume_sender, resume_receiver) = if control.is_some() {
+            let (sender, receiver) = oneshot::channel();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let delivered =
+            deliver_approval_with_resume(sender, approval_decision, resume_receiver).await;
         set_approval_status(state, &approval_id, ApprovalStatus::Denied);
         push_event(
             state,
@@ -901,33 +918,34 @@ async fn owner_interrupt(
                 true,
             ));
         }
+        if let Some(sender) = resume_sender {
+            resume_after_interrupt.push(sender);
+        }
     }
     let (terminal_status, terminal_kind) = cancellation_terminal(authority);
-    let control = state
-        .turns
-        .get(turn_id)
-        .and_then(|turn| turn.control.clone())
-        .ok_or_else(|| {
-            rejection(
-                StatusCode::CONFLICT,
-                "TURN_CLOSED",
-                "turn is no longer owned by a running runtime",
-                false,
-            )
-        })?;
+    let control = control.ok_or_else(|| {
+        rejection(
+            StatusCode::CONFLICT,
+            "TURN_CLOSED",
+            "turn is no longer owned by a running runtime",
+            false,
+        )
+    })?;
     let (ack, response) = oneshot::channel();
-    if control.send(RuntimeControl::Interrupt(ack)).await.is_err() {
-        // A schema-valid denial can itself cause a server terminal
-        // notification before the owner has a chance to submit interrupt.
-        // The execution task has already ended (hence the closed control
-        // channel) and reaped its group; retain the caller's cancellation
-        // intent without attempting a second terminal transition.
+    let sent = control.send(RuntimeControl::Interrupt(ack)).await.is_ok();
+    for resume in resume_after_interrupt {
+        let _ = resume.send(());
+    }
+    if !sent {
+        // A closed command channel provides no proof of an interrupt. Report
+        // the conservative Unknown boundary rather than manufacturing an
+        // interrupted terminal state from the caller's intent.
         terminalize(
             state,
             turn_id,
-            terminal_status,
-            terminal_kind,
-            serde_json::json!({ "status": terminal_status }),
+            TurnStatus::Failed,
+            "turn.failed",
+            serde_json::json!({ "status": "failed", "error": { "class": "delivery_ambiguous" } }),
         );
         return turn_response(state, turn_id);
     }
@@ -944,16 +962,15 @@ async fn owner_interrupt(
             return turn_response(state, turn_id);
         }
         Ok(Err(_)) => {
-            // See the closed-control case above: the server terminalized on
-            // the durable denial before the queued interrupt could be
-            // consumed. The task has dropped the acknowledgement only after
-            // its own cleanup path, so terminalise once locally.
+            // The protocol owner dropped the acknowledgement without a
+            // confirmed cancellation outcome. Keep Unknown distinct from a
+            // requested human interrupt.
             terminalize(
                 state,
                 turn_id,
-                terminal_status,
-                terminal_kind,
-                serde_json::json!({ "status": terminal_status }),
+                TurnStatus::Failed,
+                "turn.failed",
+                serde_json::json!({ "status": "failed", "error": { "class": "delivery_ambiguous" } }),
             );
             return turn_response(state, turn_id);
         }
@@ -1034,11 +1051,20 @@ async fn deliver_approval(
     sender: oneshot::Sender<ApprovalCommand>,
     decision: ApprovalDecision,
 ) -> bool {
+    deliver_approval_with_resume(sender, decision, None).await
+}
+
+async fn deliver_approval_with_resume(
+    sender: oneshot::Sender<ApprovalCommand>,
+    decision: ApprovalDecision,
+    resume: Option<oneshot::Receiver<()>>,
+) -> bool {
     let (delivered, response) = oneshot::channel();
     if sender
         .send(ApprovalCommand {
             decision,
             delivered,
+            resume,
         })
         .is_err()
     {

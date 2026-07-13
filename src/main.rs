@@ -45,6 +45,7 @@ fn error_class(error: &spark_runner::orchestrator::AppError) -> &'static str {
         spark_runner::orchestrator::AppError::Client(_) => "protocol_failure",
         spark_runner::orchestrator::AppError::Journal(_) => "journal_failure",
         spark_runner::orchestrator::AppError::Api(_) => "api_failure",
+        spark_runner::orchestrator::AppError::EphemeralCleanup(_) => "cleanup_failure",
     }
 }
 

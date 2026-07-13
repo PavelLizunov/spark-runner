@@ -36,12 +36,14 @@ pub const MAX_FRAME_LEN: usize = 1024 * 1024;
 const MAX_PENDING_MESSAGES: usize = 128;
 const MAX_PENDING_BYTES: usize = 2 * MAX_FRAME_LEN;
 
-/// Shared with the runtime owner around a non-idempotent request. Once a
-/// flushed JSONL line may have reached the child, cancellation cannot safely
-/// assume the request was not delivered even if its response was not seen.
+/// Shared with the runtime owner around a non-idempotent request. Once the
+/// transport has begun attempting the request write, cancellation cannot
+/// safely assume the request was not delivered even if the newline, flush, or
+/// response was not observed. This is intentionally conservative: a dropped
+/// future at that boundary must become Unknown rather than replayable work.
 #[derive(Clone, Default)]
 pub struct RequestDelivery {
-    written: Arc<AtomicBool>,
+    possibly_written: Arc<AtomicBool>,
 }
 
 impl RequestDelivery {
@@ -49,12 +51,12 @@ impl RequestDelivery {
         Self::default()
     }
 
-    pub fn was_written(&self) -> bool {
-        self.written.load(Ordering::SeqCst)
+    pub fn may_have_been_written(&self) -> bool {
+        self.possibly_written.load(Ordering::SeqCst)
     }
 
-    fn mark_written(&self) {
-        self.written.store(true, Ordering::SeqCst);
+    fn mark_write_started(&self) {
+        self.possibly_written.store(true, Ordering::SeqCst);
     }
 }
 
@@ -213,12 +215,16 @@ impl JsonlClient {
 
         {
             let mut stdin = self.stdin.lock().await;
+            // Set the irreversible boundary immediately before the first
+            // write attempt, not after newline+flush. An AsyncWrite can
+            // report cancellation after accepting a prefix (or all) of this
+            // buffer; no later observation can prove it was pre-write.
+            if let Some(delivery) = delivery {
+                delivery.mark_write_started();
+            }
             stdin.write_all(line.as_bytes()).await?;
             stdin.write_all(b"\n").await?;
             stdin.flush().await?;
-        }
-        if let Some(delivery) = delivery {
-            delivery.mark_written();
         }
 
         let response = tokio::time::timeout(
@@ -535,7 +541,50 @@ impl WaitTarget<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::pin::Pin;
+    use std::task::Poll;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::oneshot;
+
+    /// A deterministic partial-write split. It announces that `poll_write`
+    /// was entered, then remains pending until the test releases it. Dropping
+    /// the RPC future at that point models cancellation after a write attempt
+    /// but before newline/flush/response without relying on wall-clock sleeps.
+    struct SplitWrite {
+        entered: Option<oneshot::Sender<()>>,
+        release: oneshot::Receiver<()>,
+    }
+
+    impl AsyncWrite for SplitWrite {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.as_mut().get_mut();
+            if let Some(entered) = this.entered.take() {
+                let _ = entered.send(());
+            }
+            match Pin::new(&mut this.release).poll(cx) {
+                Poll::Ready(_) => Poll::Ready(Ok(buffer.len())),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     fn client_with_canned_stdout(lines: &[Value], wait_timeout: Duration) -> JsonlClient {
         let (mut server_write, client_read) = tokio::io::duplex(64 * 1024);
@@ -552,6 +601,38 @@ mod tests {
             std::future::pending::<()>().await;
         });
         JsonlClient::with_timeout(tokio::io::sink(), client_read, wait_timeout)
+    }
+
+    #[tokio::test]
+    async fn delivery_is_ambiguous_as_soon_as_a_non_idempotent_write_is_attempted() {
+        let (entered_tx, mut entered_rx) = oneshot::channel();
+        let (_release_tx, release_rx) = oneshot::channel();
+        let (_server_stdout, client_stdout) = tokio::io::duplex(1024);
+        let client = JsonlClient::with_timeout(
+            SplitWrite {
+                entered: Some(entered_tx),
+                release: release_rx,
+            },
+            client_stdout,
+            Duration::from_secs(1),
+        );
+        let delivery = RequestDelivery::new();
+        let mut call = Box::pin(client.call_with_server_request_handler_and_delivery(
+            "turn/start",
+            json!({}),
+            Some(&delivery),
+            |_| async { Ok(()) },
+        ));
+
+        tokio::select! {
+            _ = &mut call => panic!("split writer must not finish before release"),
+            received = &mut entered_rx => received.expect("write-attempt barrier"),
+        }
+        assert!(
+            delivery.may_have_been_written(),
+            "cancellation after poll_write begins is delivery-ambiguous"
+        );
+        drop(call);
     }
 
     /// The terminal `turn/completed` notification is emitted (and thus read)

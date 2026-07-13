@@ -116,8 +116,15 @@ fn main() -> io::Result<()> {
         .unwrap_or_else(|| "item/commandExecution/requestApproval".to_string());
     let barrier_phase = arg_value(&args, "--barrier-phase");
     let barrier_marker = arg_value(&args, "--barrier-marker").map(PathBuf::from);
+    let codex_home_marker = arg_value(&args, "--codex-home-marker").map(PathBuf::from);
     if let Some(marker) = arg_value(&args, "--pid-marker") {
         std::fs::write(marker, std::process::id().to_string())?;
+    }
+    if let Some(marker) = codex_home_marker {
+        let home = std::env::var_os("CODEX_HOME").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "fixture CODEX_HOME is unavailable")
+        })?;
+        std::fs::write(marker, home.to_string_lossy().as_bytes())?;
     }
     let wire_marker = arg_value(&args, "--wire-marker").map(PathBuf::from);
     if approval_mode.is_some() {
@@ -532,7 +539,26 @@ fn send_approval_request(
             "cwd": "/tmp/fake-cwd",
             "reason": "deterministic fake permission request",
             "permissions": {
-                "fileSystem": { "entries": [] },
+                "fileSystem": { "entries": [
+                    {
+                        "access": "write",
+                        "path": {
+                            "type": "special",
+                            "value": { "kind": "project_roots", "subpath": "generated" }
+                        }
+                    },
+                    {
+                        "access": "read",
+                        "path": {
+                            "type": "special",
+                            "value": {
+                                "kind": "unknown",
+                                "path": "/tmp/fake-external-root",
+                                "subpath": "inputs"
+                            }
+                        }
+                    }
+                ] },
                 "network": { "enabled": true }
             },
             "itemId": "item-1",

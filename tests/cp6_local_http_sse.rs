@@ -222,8 +222,10 @@ async fn fake_child_sse_resume_keeps_approval_and_terminal_events() {
     assert!(resumed.iter().any(|event| event["terminal"] == true));
 }
 
-/// T01: the owner closes an active approval before terminalising an interrupt,
-/// and the event stream cannot later become completed.
+/// A default fixture denial can terminalize before its unsupported follow-up
+/// interrupt RPC. That is a failed/unknown boundary, never a fabricated
+/// interrupt or later completion; the injected T01 fixture covers the
+/// confirmed real-ID interrupt path.
 #[tokio::test]
 async fn t01_interrupt_running_turn_is_terminal_once() {
     let router = app(config());
@@ -251,7 +253,7 @@ async fn t01_interrupt_running_turn_is_terminal_once() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(interrupted["status"], "interrupted");
+    assert_eq!(interrupted["status"], "failed");
     let events = tokio::time::timeout(
         std::time::Duration::from_secs(3),
         fetch_sse(router, &format!("/v1/turns/{turn_id}/events"), None),
