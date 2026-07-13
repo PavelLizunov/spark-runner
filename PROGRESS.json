@@ -1,13 +1,18 @@
 {
   "run_id": "spark-runner-foundation-20260712",
   "repo": "PavelLizunov/spark-runner",
-  "current_checkpoint": "CP4",
-  "previous_checkpoint": "CP3",
+  "current_checkpoint": "CP5",
+  "previous_checkpoint": "CP4",
   "state": "active",
-  "completed_checkpoints": ["CP1", "CP2", "CP3"],
+  "completed_checkpoints": [
+    "CP1",
+    "CP2",
+    "CP3",
+    "CP4"
+  ],
   "blocker": null,
-  "updated_at": "2026-07-13T03:03:43Z",
-  "next_command": "Open CP4 after CP3 PR #3 is pushed, CI is green, PR #3 is squash merged, main is confirmed, and the CP3 branch is cleaned up.",
+  "updated_at": "2026-07-13T04:10:18Z",
+  "next_command": "Open CP5 after CP4 PR #4 is pushed, CI is green, PR #4 is squash merged, main is confirmed, and the CP4 branch is cleaned up.",
   "checkpoints": {
     "CP1": {
       "name": "Phase 0 bootstrap: raw app-server + Python SDK oracle",
@@ -50,10 +55,10 @@
       "evidence_file": "docs/evidence/cp/CP3.md"
     },
     "CP4": {
-      "name": "Pending",
-      "state": "pending",
-      "started_at": null,
-      "completed_at": null,
+      "name": "Stage 3 lifecycle and approvals fail closed",
+      "state": "green",
+      "started_at": "2026-07-13T04:00:00Z",
+      "completed_at": "2026-07-13T04:10:18Z",
       "evidence_file": "docs/evidence/cp/CP4.md"
     },
     "CP5": {

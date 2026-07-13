@@ -2,13 +2,14 @@
 //! reads plus one ephemeral read-only thread and turn, using the stable
 //! sandbox shape confirmed in CP1 (`sandbox: "read-only"`, not a map).
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde_json::{json, Value};
 
 use crate::jsonl::{JsonlClient, JsonlError};
 use crate::process::ChildProcess;
-use crate::state::{SessionState, StateError};
+use crate::state::{ApprovalDecision, ApprovalSource, InternalEvent, SessionState, StateError};
 
 pub const REQUIRED_MODEL: &str = "gpt-5.3-codex-spark";
 
@@ -29,6 +30,16 @@ pub enum ClientError {
     MissingTurnStatus,
     #[error("session state was poisoned by a protocol desync")]
     SessionPoisoned,
+    #[error("server approval request missing numeric id")]
+    MissingServerRequestId,
+    #[error("unknown server request method {method:?}; session poisoned")]
+    UnknownServerRequest { method: String },
+    #[error("duplicate approval request {request_key}; session poisoned")]
+    DuplicateApproval { request_key: String },
+    #[error("unexpected response id {id} while waiting for terminal turn notification")]
+    UnexpectedResponseWhileWaiting { id: u64 },
+    #[error("protocol desync after an approval boundary; restart denied fail-closed")]
+    UnresolvedApprovalRestart,
 }
 
 impl ClientError {
@@ -40,6 +51,12 @@ impl ClientError {
     pub fn is_recoverable_desync(&self) -> bool {
         matches!(self, ClientError::Jsonl(error) if error.is_desync())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalPolicy {
+    Deny,
+    AllowForTests,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +74,8 @@ pub struct CodexClient {
     rpc: JsonlClient,
     process: ChildProcess,
     state: SessionState,
+    approval_policy: ApprovalPolicy,
+    seen_approvals: HashSet<String>,
 }
 
 impl CodexClient {
@@ -65,10 +84,21 @@ impl CodexClient {
         stdin: tokio::process::ChildStdin,
         stdout: tokio::process::ChildStdout,
     ) -> Self {
+        Self::with_approval_policy(process, stdin, stdout, ApprovalPolicy::Deny)
+    }
+
+    pub fn with_approval_policy(
+        process: ChildProcess,
+        stdin: tokio::process::ChildStdin,
+        stdout: tokio::process::ChildStdout,
+        approval_policy: ApprovalPolicy,
+    ) -> Self {
         Self {
             rpc: JsonlClient::new(stdin, stdout),
             process,
             state: SessionState::new(),
+            approval_policy,
+            seen_approvals: HashSet::new(),
         }
     }
 
@@ -78,19 +108,6 @@ impl CodexClient {
     /// the higher-level doctor/run orchestration.
     async fn rpc_call(&mut self, method: &str, params: Value) -> Result<Value, ClientError> {
         match self.rpc.call(method, params).await {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                if error.is_desync() {
-                    self.state.poison();
-                }
-                Err(error.into())
-            }
-        }
-    }
-
-    /// Same as [`Self::rpc_call`] but for notification waits.
-    async fn rpc_wait_for_notification(&mut self, method: &str) -> Result<Value, ClientError> {
-        match self.rpc.wait_for_notification(method).await {
             Ok(value) => Ok(value),
             Err(error) => {
                 if error.is_desync() {
@@ -173,10 +190,45 @@ impl CodexClient {
         Ok(())
     }
 
-    /// Wait for the terminal `turn/completed` notification. Raw model output
+    /// Wait for the terminal `turn/completed` notification while the same
+    /// owner task handles server-initiated approval requests. Raw model output
     /// is intentionally not extracted or logged here — only the status field.
     pub async fn wait_turn_completed(&mut self) -> Result<TurnCompleted, ClientError> {
-        let params = self.rpc_wait_for_notification("turn/completed").await?;
+        loop {
+            let message = match self.rpc.next_message().await {
+                Ok(message) => message,
+                Err(error) => {
+                    if error.is_desync() {
+                        self.state.poison();
+                        if !self.seen_approvals.is_empty() {
+                            return Err(ClientError::UnresolvedApprovalRestart);
+                        }
+                    }
+                    return Err(error.into());
+                }
+            };
+
+            if let Some(method) = message.get("method").and_then(Value::as_str) {
+                if message.get("id").is_some() {
+                    self.handle_server_request(&message, method).await?;
+                    continue;
+                }
+                if method == "turn/completed" {
+                    return self
+                        .handle_turn_completed(message.get("params").unwrap_or(&Value::Null));
+                }
+                tracing::debug!(method, "ignoring non-terminal app-server notification");
+                continue;
+            }
+
+            if let Some(id) = message.get("id").and_then(Value::as_u64) {
+                self.state.poison();
+                return Err(ClientError::UnexpectedResponseWhileWaiting { id });
+            }
+        }
+    }
+
+    fn handle_turn_completed(&mut self, params: &Value) -> Result<TurnCompleted, ClientError> {
         let status = params
             .get("turn")
             .and_then(|turn| turn.get("status"))
@@ -193,6 +245,51 @@ impl CodexClient {
         Ok(TurnCompleted { status })
     }
 
+    async fn handle_server_request(
+        &mut self,
+        message: &Value,
+        method: &str,
+    ) -> Result<(), ClientError> {
+        let id = message
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or(ClientError::MissingServerRequestId)?;
+        if !is_known_approval_method(method) {
+            self.state.poison();
+            return Err(ClientError::UnknownServerRequest {
+                method: method.to_string(),
+            });
+        }
+
+        let params = message.get("params").unwrap_or(&Value::Null);
+        let request_key = approval_request_key(method, id, params);
+        if !self.seen_approvals.insert(request_key.clone()) {
+            let _ = self
+                .rpc
+                .respond(id, approval_response(method, ApprovalDecision::Deny))
+                .await;
+            self.state.poison();
+            return Err(ClientError::DuplicateApproval { request_key });
+        }
+
+        self.state
+            .on_approval_requested(request_key.clone(), method.to_string())?;
+        let decision = match self.approval_policy {
+            ApprovalPolicy::AllowForTests => ApprovalDecision::Allow,
+            ApprovalPolicy::Deny => ApprovalDecision::Deny,
+        };
+        self.state.on_approval_decided(
+            request_key,
+            method.to_string(),
+            decision,
+            ApprovalSource::Owner,
+        )?;
+        self.rpc
+            .respond(id, approval_response(method, decision))
+            .await?;
+        Ok(())
+    }
+
     /// Bounded, drained stderr tail from the child app-server process — for
     /// local diagnostics only; never written into evidence files.
     pub async fn stderr_tail(&self) -> String {
@@ -203,8 +300,68 @@ impl CodexClient {
         self.state.is_poisoned()
     }
 
+    pub fn internal_events(&self) -> &[InternalEvent] {
+        self.state.events()
+    }
+
     pub async fn shutdown(mut self) -> Result<(), ClientError> {
+        let _ = self.state.on_shutdown();
         self.process.shutdown().await;
         Ok(())
+    }
+}
+
+fn is_known_approval_method(method: &str) -> bool {
+    matches!(
+        method,
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "execCommandApproval"
+            | "applyPatchApproval"
+    )
+}
+
+fn approval_request_key(method: &str, id: u64, params: &Value) -> String {
+    let stable = params
+        .get("approvalId")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("itemId").and_then(Value::as_str))
+        .or_else(|| params.get("callId").and_then(Value::as_str))
+        .unwrap_or("");
+    if stable.is_empty() {
+        format!("{method}:{id}")
+    } else {
+        format!("{method}:{stable}")
+    }
+}
+
+fn approval_response(method: &str, decision: ApprovalDecision) -> Value {
+    match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            let value = match decision {
+                ApprovalDecision::Allow => "accept",
+                ApprovalDecision::Deny => "cancel",
+                ApprovalDecision::Timeout => "cancel",
+            };
+            json!({ "decision": value })
+        }
+        "execCommandApproval" | "applyPatchApproval" => {
+            let value = match decision {
+                ApprovalDecision::Allow => "approved",
+                ApprovalDecision::Deny => "abort",
+                ApprovalDecision::Timeout => "timed_out",
+            };
+            json!({ "decision": value })
+        }
+        "item/permissions/requestApproval" => json!({
+            "permissions": {
+                "fileSystem": { "entries": [] },
+                "network": { "enabled": false }
+            },
+            "scope": "turn",
+            "strictAutoReview": true
+        }),
+        _ => json!({ "decision": "cancel" }),
     }
 }
