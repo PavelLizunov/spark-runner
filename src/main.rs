@@ -27,10 +27,24 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(err) => {
-            tracing::error!(error = %err, "spark-runner failed");
-            eprintln!("spark-runner: error: {err}");
+            // AppError can wrap child-controlled or local filesystem text.
+            // The CLI is a trust boundary just like HTTP and must not render
+            // arbitrary diagnostics verbatim.
+            let class = error_class(&err);
+            tracing::error!(class, "spark-runner failed");
+            eprintln!("spark-runner: error: {class}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn error_class(error: &spark_runner::orchestrator::AppError) -> &'static str {
+    match error {
+        spark_runner::orchestrator::AppError::Config(_) => "configuration_failure",
+        spark_runner::orchestrator::AppError::Process(_) => "process_failure",
+        spark_runner::orchestrator::AppError::Client(_) => "protocol_failure",
+        spark_runner::orchestrator::AppError::Journal(_) => "journal_failure",
+        spark_runner::orchestrator::AppError::Api(_) => "api_failure",
     }
 }
 

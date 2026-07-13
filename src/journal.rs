@@ -5,7 +5,7 @@
 //! terminal output are persisted only when explicitly supplied and the matching
 //! TTL is configured.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -485,6 +485,10 @@ fn is_sensitive_key(key: &str) -> bool {
 pub struct RecoveryProjection {
     pub executions: BTreeMap<String, ExecutionRecoveryState>,
     pub approvals: BTreeMap<String, ApprovalRecoveryState>,
+    /// Entries which were unresolved in the durable input, as opposed to
+    /// entries already terminalised by a previous startup recovery.
+    pub unresolved_executions: Vec<String>,
+    pub unresolved_approvals: Vec<String>,
     pub replayed_turns: usize,
     pub replayed_approvals: usize,
 }
@@ -512,18 +516,22 @@ pub fn project_recovery(path: &Path) -> JournalResult<RecoveryProjection> {
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     let mut executions: BTreeMap<String, Option<ExecutionRecoveryState>> = BTreeMap::new();
     let mut approvals: BTreeMap<String, Option<ApprovalRecoveryState>> = BTreeMap::new();
+    let mut unresolved_executions = BTreeSet::new();
+    let mut unresolved_approvals = BTreeSet::new();
 
     for row in rows {
         let payload = row?;
         let event: JournalEvent = serde_json::from_str(&payload)?;
         match event {
             JournalEvent::ExecutionStarted { execution_id } => {
+                unresolved_executions.insert(execution_id.clone());
                 executions.entry(execution_id).or_insert(None);
             }
             JournalEvent::ExecutionCompleted {
                 execution_id,
                 status,
             } => {
+                unresolved_executions.remove(&execution_id);
                 executions.insert(
                     execution_id,
                     Some(match status {
@@ -533,12 +541,14 @@ pub fn project_recovery(path: &Path) -> JournalResult<RecoveryProjection> {
                 );
             }
             JournalEvent::RecoveryExecutionUnknown { execution_id } => {
+                unresolved_executions.remove(&execution_id);
                 executions.insert(
                     execution_id,
                     Some(ExecutionRecoveryState::UnknownAfterRestart),
                 );
             }
             JournalEvent::ApprovalRequested { request_key, .. } => {
+                unresolved_approvals.insert(request_key.clone());
                 approvals.entry(request_key).or_insert(None);
             }
             JournalEvent::ApprovalDecided {
@@ -546,6 +556,7 @@ pub fn project_recovery(path: &Path) -> JournalResult<RecoveryProjection> {
                 decision,
                 ..
             } => {
+                unresolved_approvals.remove(&request_key);
                 approvals.insert(
                     request_key,
                     Some(match decision {
@@ -556,6 +567,7 @@ pub fn project_recovery(path: &Path) -> JournalResult<RecoveryProjection> {
                 );
             }
             JournalEvent::RecoveryApprovalDenied { request_key, .. } => {
+                unresolved_approvals.remove(&request_key);
                 approvals.insert(request_key, Some(ApprovalRecoveryState::DeniedOnRestart));
             }
             JournalEvent::TurnStarted { .. }
@@ -579,6 +591,8 @@ pub fn project_recovery(path: &Path) -> JournalResult<RecoveryProjection> {
             .into_iter()
             .map(|(id, state)| (id, state.unwrap_or(ApprovalRecoveryState::DeniedOnRestart)))
             .collect(),
+        unresolved_executions: unresolved_executions.into_iter().collect(),
+        unresolved_approvals: unresolved_approvals.into_iter().collect(),
         replayed_turns: 0,
         replayed_approvals: 0,
     })

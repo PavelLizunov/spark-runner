@@ -11,7 +11,8 @@ use serde::Deserialize;
 
 pub const DEFAULT_CODEX_LOCK: &str = "codex.lock";
 const EXPECTED_CODEX_TRANSPORT: &str = "stdio";
-const EXPECTED_CODEX_SCHEMA_PATH: &str = "protocol/0.142.0/stable.schema.json";
+const EXPECTED_CODEX_SCHEMA_PATH: &str =
+    "protocol/0.144.3/codex_app_server_protocol.v2.schemas.json";
 const PLACEHOLDER_SCHEMA_HASH: &str = "generated-after-implementation";
 
 #[derive(Parser, Debug)]
@@ -47,12 +48,11 @@ pub enum Command {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CodexLock {
-    pub binary_path: String,
     pub version: String,
-    pub sha256: String,
-    /// The JavaScript entry point is only a launcher.  The app-server is the
-    /// platform-native executable selected by its installed package layout;
-    /// both artifacts are pinned because the latter is what we execute.
+    /// The app-server is the platform-native executable from the installed
+    /// Codex package layout.  We execute this exact artifact directly: a
+    /// mutable JavaScript/npm launcher is deliberately not a second trust
+    /// root or part of the spawn path.
     pub native_path: String,
     pub native_sha256: String,
     pub transport: String,
@@ -120,7 +120,7 @@ impl CodexLock {
         if self.schema_hash.is_empty() || self.schema_hash == PLACEHOLDER_SCHEMA_HASH {
             return Err(ConfigError::InvalidSchemaHash(self.schema_hash.clone()));
         }
-        if self.sha256.len() != 64 || self.native_sha256.len() != 64 {
+        if self.native_sha256.len() != 64 {
             return Err(ConfigError::InvalidSchemaHash(
                 "invalid runtime hash".to_string(),
             ));
@@ -133,19 +133,6 @@ impl CodexLock {
     /// metadata parsed at startup.
     pub fn verify_for_spawn(&self) -> Result<PathBuf, ConfigError> {
         self.validate()?;
-        let path = Path::new(&self.binary_path);
-        if !path.is_absolute() {
-            return Err(ConfigError::InvalidExecutable(self.binary_path.clone()));
-        }
-        let canonical = std::fs::canonicalize(path)
-            .map_err(|_| ConfigError::InvalidExecutable(self.binary_path.clone()))?;
-        let metadata = std::fs::metadata(&canonical)
-            .map_err(|_| ConfigError::InvalidExecutable(canonical.display().to_string()))?;
-        if !metadata.is_file() || !is_executable(&metadata) {
-            return Err(ConfigError::InvalidExecutable(
-                canonical.display().to_string(),
-            ));
-        }
         let host = format!("{}-{}", env::consts::OS, env::consts::ARCH);
         if self.platform != host {
             return Err(ConfigError::PlatformMismatch {
@@ -153,8 +140,6 @@ impl CodexLock {
                 host,
             });
         }
-        verify_hash("launcher", &canonical, &self.sha256)?;
-
         let native = Path::new(&self.native_path);
         if !native.is_absolute() {
             return Err(ConfigError::InvalidExecutable(self.native_path.clone()));
@@ -397,28 +382,14 @@ mod tests {
         let root = std::env::temp_dir().join(format!("spark-runner-pin-{unique}"));
         let vendor = root.join("vendor/test/bin");
         fs::create_dir_all(&vendor).expect("vendor");
-        let launcher = root.join("launcher");
         let native = vendor.join("codex");
-        fs::write(&launcher, b"#!/bin/sh\necho codex-cli 0.142.0\n").expect("launcher");
-        fs::write(&native, b"#!/bin/sh\necho codex-cli 0.142.0\n").expect("native");
-        for path in [&launcher, &native] {
-            let mut permissions = fs::metadata(path).expect("metadata").permissions();
-            permissions.set_mode(0o700);
-            fs::set_permissions(path, permissions).expect("chmod");
-        }
-        let schema = std::path::Path::new("protocol/0.142.0/stable.schema.json");
-        let lock = CodexLock {
-            binary_path: launcher.display().to_string(),
-            version: "0.142.0".to_string(),
-            sha256: sha256_hex(&fs::read(&launcher).expect("launcher bytes")),
-            native_path: native.display().to_string(),
-            native_sha256: "0".repeat(64),
-            transport: "stdio".to_string(),
-            required_model: crate::client::REQUIRED_MODEL.to_string(),
-            schema_path: schema.display().to_string(),
-            schema_hash: sha256_hex(&fs::read(schema).expect("schema bytes")),
-            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-        };
+        fs::write(&native, b"#!/bin/sh\necho codex-cli 0.144.3\n").expect("native");
+        let mut permissions = fs::metadata(&native).expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&native, permissions).expect("chmod");
+        let mut lock =
+            CodexLock::load(std::path::Path::new(super::DEFAULT_CODEX_LOCK)).expect("checked lock");
+        lock.native_path = native.display().to_string();
         assert!(matches!(
             lock.verify_for_spawn(),
             Err(ConfigError::HashMismatch {
@@ -427,5 +398,15 @@ mod tests {
             })
         ));
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// T09 matching case: the checked lock is an assertion about the exact
+    /// native vendor binary and schema generated by that installed binary.
+    #[test]
+    fn checked_native_runtime_and_generated_schema_match_before_spawn() {
+        let lock =
+            CodexLock::load(std::path::Path::new(super::DEFAULT_CODEX_LOCK)).expect("checked lock");
+        let verified = lock.verify_for_spawn().expect("matching native pin");
+        assert_eq!(verified, std::fs::canonicalize(lock.native_path).unwrap());
     }
 }

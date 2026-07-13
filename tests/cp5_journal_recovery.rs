@@ -12,6 +12,7 @@ use spark_runner::journal::{
     project_recovery, ApprovalRecoveryState, ApprovalTerminalDecision, ExecutionRecoveryState,
     ExecutionTerminalStatus, JournalConfig, JournalEvent, JournalWriter,
 };
+use spark_runner::orchestrator::recover_journal_before_readiness;
 
 fn unique_journal(label: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -87,6 +88,51 @@ async fn restart_projection_marks_unknown_and_denied_without_replay() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+}
+
+/// T12: recovery is part of the actual owner startup boundary. It writes one
+/// durable terminal decision before admission and is idempotent on restart.
+#[tokio::test]
+async fn t12_startup_recovery_is_durable_and_idempotent() {
+    let path = unique_journal("startup-recovery");
+    let writer = JournalWriter::open(JournalConfig::new(&path)).unwrap();
+    writer
+        .append(JournalEvent::ExecutionStarted {
+            execution_id: "exec-unresolved".to_string(),
+        })
+        .await
+        .unwrap();
+    writer
+        .append(JournalEvent::ApprovalRequested {
+            execution_id: "exec-unresolved".to_string(),
+            request_key: "approval-unresolved".to_string(),
+            method: "item/commandExecution/requestApproval".to_string(),
+        })
+        .await
+        .unwrap();
+    writer.shutdown().await.unwrap();
+
+    recover_journal_before_readiness(&path).await.unwrap();
+    recover_journal_before_readiness(&path).await.unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let recovered: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM journal_events WHERE payload_json LIKE '%Recovery%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recovered, 2, "one execution and one approval decision only");
+    let projection = project_recovery(&path).unwrap();
+    assert_eq!(
+        projection.executions["exec-unresolved"],
+        ExecutionRecoveryState::UnknownAfterRestart
+    );
+    assert_eq!(
+        projection.approvals["approval-unresolved"],
+        ApprovalRecoveryState::DeniedOnRestart
+    );
+    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -176,8 +222,10 @@ async fn redacts_before_persistence_and_raw_capture_requires_ttl_opt_in() {
 async fn opt_in_capture_is_redacted_and_pruned_by_ttl() {
     let path = unique_journal("ttl");
     let mut config = JournalConfig::new(&path);
-    config.terminal_output_ttl = Some(Duration::from_millis(1));
-    config.raw_capture_ttl = Some(Duration::from_millis(1));
+    // Zero TTL is deterministic: the capture is expired at insertion time and
+    // lets this retention test avoid time-based sleeps.
+    config.terminal_output_ttl = Some(Duration::ZERO);
+    config.raw_capture_ttl = Some(Duration::ZERO);
     let writer = JournalWriter::open(config).expect("open journal");
     writer
         .append_with_capture(
@@ -210,7 +258,6 @@ async fn opt_in_capture_is_redacted_and_pruned_by_ttl() {
     assert!(!terminal_output.contains("sk-terminal-secret"));
     assert!(!raw_capture.contains("sk-raw-secret"));
 
-    tokio::time::sleep(Duration::from_millis(5)).await;
     let pruned = writer.prune_expired().await.unwrap();
     assert_eq!(pruned, 2);
     let remaining_events: i64 = connection

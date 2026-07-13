@@ -1,12 +1,10 @@
 {
-  "binary_path": "/home/uap/.local/bin/codex",
-  "version": "0.142.0",
-  "sha256": "d3be844c45c4fd89392536e56e1010963f94785592596b50cd0c45bb8a341406",
+  "version": "0.144.3",
   "native_path": "/home/uap/.local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
   "native_sha256": "37e6f5953f191b04f7b62cb07dae90f51d0947ad89f0355665b421fbde28700b",
   "transport": "stdio",
   "required_model": "gpt-5.3-codex-spark",
-  "schema_path": "protocol/0.142.0/stable.schema.json",
-  "schema_hash": "efdc3e4ef848db9543c29d7f150820fe80e970720cc887e17e6f3c196bc37259",
+  "schema_path": "protocol/0.144.3/codex_app_server_protocol.v2.schemas.json",
+  "schema_hash": "ff44dca1f6398a5653881ff477a7d46e6476780dcca436858fb016ca0c247ec4",
   "platform": "linux-x86_64"
 }

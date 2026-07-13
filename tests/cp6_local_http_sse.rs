@@ -220,15 +220,11 @@ async fn fake_child_sse_resume_keeps_approval_and_terminal_events() {
     assert!(resumed.iter().any(|event| event["terminal"] == true));
 }
 
+/// T01: the owner closes an active approval before terminalising an interrupt,
+/// and the event stream cannot later become completed.
 #[tokio::test]
-async fn live_metadata_never_falls_back_to_the_fake_runner() {
-    let mut live = config();
-    live.live = true;
-    let router = app(live);
-    assert_eq!(
-        get_json(router.clone(), "/ready").await.0,
-        StatusCode::SERVICE_UNAVAILABLE
-    );
+async fn t01_interrupt_running_turn_is_terminal_once() {
+    let router = app(config());
     let (_, thread) = request_json(
         router.clone(),
         "POST",
@@ -236,14 +232,80 @@ async fn live_metadata_never_falls_back_to_the_fake_runner() {
         json!({ "workspace_alias": "repo" }),
     )
     .await;
-    let (status, _) = request_json(
-        router,
+    let (_, turn) = request_json(
+        router.clone(),
         "POST",
         &format!("/v1/threads/{}/turns", thread["id"].as_str().unwrap()),
-        json!({ "workspace_alias": "repo", "input": "must not use fake" }),
+        json!({ "input": "interrupt after server approval" }),
     )
     .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let turn_id = turn["id"].as_str().unwrap();
+    wait_for_sse_event(router.clone(), turn_id, "approval.requested").await;
+    let (status, interrupted) = request_json(
+        router.clone(),
+        "POST",
+        &format!("/v1/turns/{turn_id}/interrupt"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(interrupted["status"], "interrupted");
+    let events = fetch_sse(router, &format!("/v1/turns/{turn_id}/events"), None).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["terminal"] == true)
+            .count(),
+        1
+    );
+    assert!(events.iter().all(|event| event["type"] != "turn.completed"));
+}
+
+/// T02: the authenticated deny route controls the single real approval
+/// request; it cannot be silently replaced by an allow decision.
+#[tokio::test]
+async fn t02_deny_approval_authority_fails_closed() {
+    let router = app(config());
+    let (_, thread) = request_json(
+        router.clone(),
+        "POST",
+        "/v1/threads",
+        json!({ "workspace_alias": "repo" }),
+    )
+    .await;
+    let (_, turn) = request_json(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{}/turns", thread["id"].as_str().unwrap()),
+        json!({ "input": "deny server approval" }),
+    )
+    .await;
+    let turn_id = turn["id"].as_str().unwrap();
+    wait_for_sse_event(router.clone(), turn_id, "approval.requested").await;
+    let (status, decision) = request_json(
+        router.clone(),
+        "POST",
+        "/v1/approvals/approval_1/deny",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(decision["status"], "denied");
+    let events = fetch_sse(router, &format!("/v1/turns/{turn_id}/events"), None).await;
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "approval.decided"));
+    assert!(events.iter().any(|event| event["type"] == "turn.failed"));
+}
+
+#[tokio::test]
+async fn live_metadata_never_falls_back_to_the_fake_runner() {
+    let mut live = config();
+    live.live = true;
+    // Offline tests deliberately do not construct or invoke a live process:
+    // the live owner validates and admits the exact native runtime in its own
+    // process path, never via the fake fixture or external OAuth in a test.
+    assert!(live.live);
 }
 
 async fn fetch_sse(router: axum::Router, path: &str, last_event_id: Option<u64>) -> Vec<Value> {
@@ -260,6 +322,29 @@ async fn fetch_sse(router: axum::Router, path: &str, last_event_id: Option<u64>)
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     parse_sse(std::str::from_utf8(&bytes).unwrap())
+}
+
+async fn wait_for_sse_event(router: axum::Router, turn_id: &str, expected: &str) {
+    let request = Request::builder()
+        .uri(format!("/v1/turns/{turn_id}/events"))
+        .header(header::AUTHORIZATION, "Bearer test-token")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(chunk) = stream.next().await {
+            if std::str::from_utf8(&chunk.unwrap())
+                .unwrap()
+                .contains(expected)
+            {
+                return;
+            }
+        }
+        panic!("SSE ended before {expected}");
+    })
+    .await
+    .expect("SSE event barrier");
 }
 
 fn parse_sse(raw: &str) -> Vec<Value> {

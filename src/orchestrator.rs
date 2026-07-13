@@ -13,8 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::client::{ApprovalPolicy, ClientError, CodexClient};
 use crate::config::{self, CodexLock, ConfigError, DEFAULT_CODEX_LOCK};
 use crate::journal::{
-    project_recovery, ApprovalRecoveryState, ApprovalTerminalDecision, ExecutionRecoveryState,
-    ExecutionTerminalStatus, JournalConfig, JournalEvent, JournalWriter, TurnTerminalStatus,
+    project_recovery, ApprovalTerminalDecision, ExecutionTerminalStatus, JournalConfig,
+    JournalEvent, JournalWriter, TurnTerminalStatus,
 };
 use crate::process::{ChildProcess, ProcessError};
 use crate::state::{ApprovalDecision, InternalEventKind};
@@ -329,23 +329,19 @@ async fn persist_recovery(
     journal: &JournalWriter,
     projection: crate::journal::RecoveryProjection,
 ) -> Result<(), AppError> {
-    for (execution_id, state) in projection.executions {
-        if state == ExecutionRecoveryState::UnknownAfterRestart {
-            journal
-                .append(JournalEvent::RecoveryExecutionUnknown { execution_id })
-                .await?;
-        }
+    for execution_id in projection.unresolved_executions {
+        journal
+            .append(JournalEvent::RecoveryExecutionUnknown { execution_id })
+            .await?;
     }
-    for (request_key, state) in projection.approvals {
-        if state == ApprovalRecoveryState::DeniedOnRestart {
-            journal
-                .append(JournalEvent::RecoveryApprovalDenied {
-                    execution_id: "recovery".to_string(),
-                    request_key,
-                    method: "unknown".to_string(),
-                })
-                .await?;
-        }
+    for request_key in projection.unresolved_approvals {
+        journal
+            .append(JournalEvent::RecoveryApprovalDenied {
+                execution_id: "recovery".to_string(),
+                request_key,
+                method: "unknown".to_string(),
+            })
+            .await?;
     }
     Ok(())
 }
@@ -449,11 +445,19 @@ pub async fn run_turn_with_approval_policy(
 /// This never starts a process and never replays a prior turn.
 pub async fn recover_before_readiness() -> Result<(), AppError> {
     if let Some(config) = JournalConfig::from_env() {
-        let projection = project_recovery(&config.path)?;
-        let writer = JournalWriter::open(config)?;
-        persist_recovery(&writer, projection).await?;
-        writer.shutdown().await?;
+        recover_journal_before_readiness(&config.path).await?;
     }
+    Ok(())
+}
+
+/// Durable, idempotent startup recovery used by the HTTP owner and by the
+/// deterministic recovery test. A second invocation projects the terminal
+/// recovery records written by the first one and therefore appends nothing.
+pub async fn recover_journal_before_readiness(path: &Path) -> Result<(), AppError> {
+    let projection = project_recovery(path)?;
+    let writer = JournalWriter::open(JournalConfig::new(path))?;
+    persist_recovery(&writer, projection).await?;
+    writer.shutdown().await?;
     Ok(())
 }
 
