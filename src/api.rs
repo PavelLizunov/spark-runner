@@ -736,6 +736,15 @@ async fn owner_register_pending(
         deadline,
         decision,
     } = pending;
+    // A descriptor that could not losslessly expose the requested action is
+    // deny-only. Do not create a pending record or emit approval.requested:
+    // either would present an actionable-looking approval whose exact scope
+    // the authority cannot review. This is the early counterpart to the
+    // complete-event budget check below.
+    if !allow_permitted {
+        deny_pending_approval(decision).await;
+        return Ok(());
+    }
     let terminal = state
         .turns
         .get(turn_id)
@@ -2013,5 +2022,58 @@ mod tests {
         assert!(state.approvals.is_empty());
         assert!(state.turns["turn_1"].events.is_empty());
         assert!(matches!(state.turns["turn_1"].status, TurnStatus::Running));
+    }
+
+    /// Lossless descriptor validation happens before this owner. Preserve
+    /// that fail-closed result here rather than retaining a deny-only pending
+    /// record for an HTTP authority to inspect or decide.
+    #[tokio::test]
+    async fn unreviewable_approval_is_denied_before_actionable_registration() {
+        let mut state = OwnerState::new(false);
+        let (decision, received) = oneshot::channel::<ApprovalCommand>();
+        let acknowledgement = tokio::spawn(async move {
+            let command = received.await.expect("owner must make a decision");
+            assert_eq!(command.decision, ApprovalDecision::Deny);
+            command
+                .delivered
+                .send(true)
+                .expect("owner is still waiting for delivery");
+        });
+        let (owner_tx, _owner_rx) = mpsc::channel(1);
+        let registered = owner_register_pending(
+            &mut state,
+            &owner_tx,
+            "turn_which_must_not_be_registered",
+            PendingApproval {
+                request_key: "approval:unreviewable-patch".to_string(),
+                method: "applyPatchApproval".to_string(),
+                descriptor: ApprovalDescriptor {
+                    kind: "file_change",
+                    reviewable: false,
+                    command: None,
+                    command_arguments: None,
+                    cwd: None,
+                    environment_id: None,
+                    network_approval: None,
+                    reason: None,
+                    file_changes: Vec::new(),
+                    requested_permissions: None,
+                    requested_permission_profile: None,
+                    permission_grant_scope: None,
+                    strict_auto_review: None,
+                },
+                allow_permitted: false,
+                deadline: Duration::from_secs(1),
+                decision,
+            },
+        )
+        .await;
+        assert!(registered.is_ok());
+        acknowledgement
+            .await
+            .expect("decision acknowledgement task");
+        assert!(state.approvals.is_empty());
+        assert_eq!(state.next_approval, 1);
+        assert!(state.turns.is_empty());
     }
 }

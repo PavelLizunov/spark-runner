@@ -1,6 +1,6 @@
 # CP6 — local HTTP/SSE adapter
 
-Status: **cycle 17 remediation gate-verified offline**. All evidence below is deterministic and offline: no OAuth, network request, credential value, or model turn was used.
+Status: **cycle 18 remediation gate-verified offline**. All evidence below is deterministic and offline: no OAuth, network request, credential value, or model turn was used.
 
 Historical cycle-13 code SHA evidence: `8aa051f9f2214883ad22ac7c2490090f08d69c3a` (`fix(cp6): harden auth approval and cancellation`). This evidence commit is separate metadata, not a claim that it is the current code SHA.
 
@@ -14,7 +14,7 @@ Historical cycle-13 code SHA evidence: `8aa051f9f2214883ad22ac7c2490090f08d69c3a
 - Child-controlled approval identifiers are hashed to short opaque keys before SSE, SQLite, and duplicate tracking. Duplicate tracking, internal events, API retention, and SSE replay are bounded; executable oversized/repeated-child-ID coverage verifies no raw canary reaches durable state.
 - Reroute/auth/model/quota execution failures clear the owner readiness/model/quota snapshot. Token-file owner-only permissions, API capacity, replay, and retention coverage remain executable.
 - Live launch now requires the explicitly configured `SPARK_RUNNER_SUBSCRIPTION_AUTH_FILE`; it rejects absent, relative, symlinked, non-regular, or non-owner-only sources before spawn. The selected opaque handle alone is copied to the fresh `CODEX_HOME/auth.json` with `0600` permissions under its `0700` home. The child inherits neither the source path nor ambient Codex configuration, MCP configuration, or credential environment. Fake-canary coverage verifies this route and unsafe-mode rejection only; it does not inspect a real auth file.
-- `approval.requested` SSE events carry an explicit 0.144.3 schema-derived approval matrix. Every authority-bearing field is either copied losslessly into the authenticated owner descriptor or makes Allow impossible. This includes command environments and managed-network host/protocol, file-change session roots, exact add/delete content, exact update `unified_diff` and `move_path`, and the exact bounded permission profile plus this owner's fixed turn/strict-review response scope. Invalid permission profiles cannot be approved; a valid Allow returns exactly the validated in-flight profile, while Deny and Timeout return distinct fail-closed schema-valid responses.
+- `approval.requested` SSE events carry an explicit 0.144.3 schema-derived approval matrix. Every authority-bearing field is either copied losslessly into the authenticated owner descriptor or makes Allow impossible. This includes an exact command working directory, command environments and managed-network host/protocol, exact add/delete content, exact update `unified_diff` and `move_path`, and the exact bounded permission profile plus this owner's fixed turn/strict-review response scope. The v2 file-change callback is deny-only because its approved `FileChangeThreadItem.changes` are not present in the callback. Invalid permission profiles cannot be approved; a valid Allow returns exactly the validated in-flight profile, while Deny and Timeout return distinct fail-closed schema-valid responses.
 - Controlled cancellation now records execution interruption rather than completion before initialize/admission or before an irreversible write. A tracked JSONL flush boundary turns a control race after `thread/start` or `turn/start` delivery into a `delivery_ambiguous` durable incident and Unknown owner outcome; no synthetic interrupt is sent without both real identifiers. Deterministic fixture barriers cover all four phases without sleeps.
 
 ## Cycle 13 gates (code SHA above)
@@ -93,6 +93,13 @@ This cycle is limited to deterministic local/offline code and fake fixtures;
 it does not claim live app-server, account, credential, OAuth, network, or
 model verification.
 
+This remediation remained incomplete: `item/commandExecution/requestApproval`
+could still Allow when its working directory was absent, and
+`item/fileChange/requestApproval` could still Allow a separately delivered
+file-change payload that the descriptor did not contain. Cycle 18 corrects
+both gaps; the historical cycle-17 gate counts below do not establish that
+the original claim was complete.
+
 - `src/client.rs` now declares a 0.144.3-derived matrix for every supported
   request variant: command execution, legacy exec, apply-patch, file-change,
   and permissions. The matrix identifies descriptor fields, persistent
@@ -118,3 +125,36 @@ model verification.
 - `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-17 CARGO_NET_OFFLINE=true cargo test --locked --all-targets --all-features` — exit 0; duration 28.7s; 75 tests.
 - `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-17 CARGO_NET_OFFLINE=true cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0; duration 8.7s.
 - `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-17 git diff --check` — exit 0; duration 0.1s.
+
+## Cycle 18 exhaustive approval-matrix remediation
+
+This cycle is limited to deterministic local/offline code and fake fixtures;
+it does not claim live app-server, account, credential, OAuth, network, or
+model verification.
+
+- The matrix now enumerates every declared top-level 0.144.3 field for all
+  five supported variants. An unclassified top-level extension is deny-only,
+  even when a generated schema is forward-compatible. The table-driven
+  regression asserts that field list and whether an exact Allow review is
+  supported for each variant.
+- Command-execution approvals require an exact `cwd`, matching legacy exec
+  and permissions approval. `item/fileChange/requestApproval` is permanently
+  deny-only in this owner because the accepted response grants correlated
+  `FileChangeThreadItem.changes` that the request does not provide; the owner
+  does not attempt to reconstruct or infer those bytes.
+- `applyPatchApproval` keeps add/delete `content` and update `unified_diff`
+  byte-for-byte in the descriptor, including the update move destination. Two
+  distinct update payloads serialize to distinct allowable descriptors. A
+  malformed, extended, source-budget-exceeded, or final-event-over-budget
+  patch is denied before an actionable approval record exists. The latter two
+  checks use the existing 8 KiB patch-copy and final 16 KiB event-budget
+  paths; no digest stands in for reviewable patch bytes.
+- Existing move-path, queued-control priority, event-size admission, and
+  interrupt delivery-ambiguity regressions remain in the offline suite.
+
+## Cycle 18 serial gate measurements
+
+- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-18 cargo fmt --all -- --check` — exit 0; duration 0.19s.
+- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-18 CARGO_NET_OFFLINE=true cargo test --locked --all-targets --all-features` — exit 0; duration 29.55s; 76 tests.
+- `CARGO_TARGET_DIR=/home/uap/swarm-out/spark-runner-cp6-multiagent-20260713T123358Z/target-author-cycle-18 CARGO_NET_OFFLINE=true cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0; duration 3.61s.
+- `git diff --check` — exit 0; duration 0.00s.

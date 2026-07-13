@@ -542,7 +542,6 @@ fn send_approval_request(
 ) -> io::Result<()> {
     let params = match approval_method {
         "item/fileChange/requestApproval" => json!({
-            "approvalId": approval_key,
             "grantRoot": "/tmp/fake-write-root",
             "reason": "deterministic fake file change",
             "itemId": "item-1",
@@ -551,7 +550,6 @@ fn send_approval_request(
             "turnId": turn_id,
         }),
         "item/permissions/requestApproval" => json!({
-            "approvalId": approval_key,
             "cwd": "/tmp/fake-cwd",
             "reason": "deterministic fake permission request",
             "permissions": {
@@ -602,10 +600,6 @@ fn send_approval_request(
             "command": "echo deterministic-fake-approval",
             "cwd": "/tmp/fake-cwd",
             "reason": "deterministic fake command",
-            "permissions": {
-                "fileSystem": { "entries": [] },
-                "network": { "enabled": true }
-            },
             "itemId": "item-1",
             "startedAtMs": 1,
             "threadId": thread_id,

@@ -296,6 +296,11 @@ pub struct RequestedFileSystemPermission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApprovalSchemaMatrixEntry {
     pub method: &'static str,
+    /// Every top-level field declared by the pinned 0.144.3 request schema.
+    /// An extension is deny-only, even when a generated schema would accept
+    /// it, until it has been classified in this matrix. This prevents a newer
+    /// authority-bearing field from being silently ignored by an old owner.
+    pub schema_fields: &'static [&'static str],
     /// Fields copied losslessly into [`ApprovalDescriptor`] when Allow is
     /// possible. `reason` is shown as decision context even though it does
     /// not itself grant authority.
@@ -304,14 +309,37 @@ pub struct ApprovalSchemaMatrixEntry {
     /// owner ever returns. If present, this owner refuses Allow instead of
     /// silently dropping the proposal.
     pub deny_allow_if_present: &'static [&'static str],
+    /// Authority granted by this response but not carried in the request.
+    /// Such a variant is deny-only until a bounded, exact correlation path
+    /// delivers this payload to the descriptor.
+    pub unreviewable_authority: Option<&'static str>,
     /// Routing/correlation fields and explicitly best-effort display metadata
     /// that do not change the action of this owner's one-request response.
     pub non_authority_fields: &'static [&'static str],
+    /// False when the generated request's response grants authority whose
+    /// exact payload is carried only by a separate notification. The request
+    /// remains describable for diagnostics, but cannot become actionable.
+    pub allow_supported: bool,
 }
 
 pub const APPROVAL_SCHEMA_MATRIX: &[ApprovalSchemaMatrixEntry] = &[
     ApprovalSchemaMatrixEntry {
         method: "item/commandExecution/requestApproval",
+        schema_fields: &[
+            "turnId",
+            "approvalId",
+            "threadId",
+            "command",
+            "commandActions",
+            "cwd",
+            "environmentId",
+            "itemId",
+            "networkApprovalContext",
+            "proposedExecpolicyAmendment",
+            "proposedNetworkPolicyAmendments",
+            "reason",
+            "startedAtMs",
+        ],
         descriptor_fields: &[
             "command",
             "cwd",
@@ -324,6 +352,7 @@ pub const APPROVAL_SCHEMA_MATRIX: &[ApprovalSchemaMatrixEntry] = &[
             "proposedExecpolicyAmendment",
             "proposedNetworkPolicyAmendments",
         ],
+        unreviewable_authority: None,
         non_authority_fields: &[
             "approvalId",
             "itemId",
@@ -332,15 +361,34 @@ pub const APPROVAL_SCHEMA_MATRIX: &[ApprovalSchemaMatrixEntry] = &[
             "startedAtMs",
             "commandActions",
         ],
+        allow_supported: true,
     },
     ApprovalSchemaMatrixEntry {
         method: "execCommandApproval",
+        schema_fields: &[
+            "approvalId",
+            "callId",
+            "command",
+            "conversationId",
+            "cwd",
+            "parsedCmd",
+            "reason",
+        ],
         descriptor_fields: &["command[]", "cwd", "reason"],
         deny_allow_if_present: &[],
+        unreviewable_authority: None,
         non_authority_fields: &["approvalId", "callId", "conversationId", "parsedCmd"],
+        allow_supported: true,
     },
     ApprovalSchemaMatrixEntry {
         method: "applyPatchApproval",
+        schema_fields: &[
+            "callId",
+            "conversationId",
+            "fileChanges",
+            "grantRoot",
+            "reason",
+        ],
         descriptor_fields: &[
             "grantRoot",
             "fileChanges.<path>.type",
@@ -350,16 +398,38 @@ pub const APPROVAL_SCHEMA_MATRIX: &[ApprovalSchemaMatrixEntry] = &[
             "reason",
         ],
         deny_allow_if_present: &[],
+        unreviewable_authority: None,
         non_authority_fields: &["callId", "conversationId"],
+        allow_supported: true,
     },
     ApprovalSchemaMatrixEntry {
         method: "item/fileChange/requestApproval",
+        schema_fields: &[
+            "grantRoot",
+            "itemId",
+            "reason",
+            "startedAtMs",
+            "threadId",
+            "turnId",
+        ],
         descriptor_fields: &["grantRoot", "reason"],
         deny_allow_if_present: &[],
+        unreviewable_authority: Some("correlated FileChangeThreadItem.changes"),
         non_authority_fields: &["itemId", "threadId", "turnId", "startedAtMs"],
+        allow_supported: false,
     },
     ApprovalSchemaMatrixEntry {
         method: "item/permissions/requestApproval",
+        schema_fields: &[
+            "cwd",
+            "environmentId",
+            "itemId",
+            "permissions",
+            "reason",
+            "startedAtMs",
+            "threadId",
+            "turnId",
+        ],
         descriptor_fields: &[
             "cwd",
             "environmentId",
@@ -373,7 +443,9 @@ pub const APPROVAL_SCHEMA_MATRIX: &[ApprovalSchemaMatrixEntry] = &[
             "reason",
         ],
         deny_allow_if_present: &[],
+        unreviewable_authority: None,
         non_authority_fields: &["itemId", "threadId", "turnId", "startedAtMs"],
+        allow_supported: true,
     },
 ];
 
@@ -383,8 +455,29 @@ fn approval_schema_variant(method: &str) -> Option<&'static ApprovalSchemaMatrix
         .find(|variant| variant.method == method)
 }
 
+/// Keep the schema list honest: every top-level request field must be mapped
+/// to a lossless descriptor field, a deny-on-presence field, or a documented
+/// non-authority field. A future field cannot become Allow-capable merely by
+/// being added to `schema_fields`.
+fn approval_matrix_is_complete(entry: &ApprovalSchemaMatrixEntry) -> bool {
+    entry.schema_fields.iter().all(|field| {
+        entry
+            .descriptor_fields
+            .iter()
+            .chain(entry.deny_allow_if_present)
+            .chain(entry.non_authority_fields)
+            .any(|classification| {
+                *classification == *field
+                    || classification
+                        .strip_prefix(field)
+                        .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('['))
+            })
+    })
+}
+
 impl ApprovalDescriptor {
     fn from_request(method: &str, params: &Value) -> (Self, bool) {
+        let schema = approval_schema_variant(method);
         let (cwd, cwd_reviewable) = optional_approval_text(params, "cwd", MAX_APPROVAL_TEXT);
         let (reason, reason_reviewable) =
             optional_approval_text(params, "reason", MAX_APPROVAL_TEXT);
@@ -408,6 +501,14 @@ impl ApprovalDescriptor {
         // malformed value can still explain a denial, but not an informed
         // Allow.
         descriptor.reviewable &= cwd_reviewable && reason_reviewable;
+        // The generated schema permits top-level extension fields. This
+        // protocol owner does not: an extension has no reviewed authority
+        // classification, so it is deny-only until added to the matrix.
+        descriptor.reviewable &= schema.is_some_and(|entry| {
+            entry.allow_supported
+                && approval_matrix_is_complete(entry)
+                && params_have_only_schema_fields(params, entry.schema_fields)
+        });
         match method {
             "item/commandExecution/requestApproval" => {
                 let (command, command_reviewable) =
@@ -422,6 +523,9 @@ impl ApprovalDescriptor {
                     describe_network_approval(params.get("networkApprovalContext"));
                 descriptor.network_approval = network_approval;
                 descriptor.reviewable &= network_reviewable;
+                // A missing/null working directory leaves relative command
+                // execution bound to an undisclosed server default.
+                descriptor.reviewable &= descriptor.cwd.is_some();
                 // The owner only ever returns `accept`, never a persistent
                 // cache/execpolicy/network amendment decision. Refuse Allow
                 // rather than letting either schema proposal be invisible.
@@ -464,9 +568,14 @@ impl ApprovalDescriptor {
                         unified_diff: None,
                     });
                 }
-                // This request carries no file payload. The session write
-                // root is therefore the entire authority an Allow can grant.
-                descriptor.reviewable &= root_reviewable && !descriptor.file_changes.is_empty();
+                // The accept response approves the correlated
+                // FileChangeThreadItem.changes, but those paths, kinds, and
+                // patch bytes are absent from this request. Never register it
+                // as actionable until the protocol delivers and binds that
+                // exact payload through a bounded review path.
+                descriptor.reviewable &= root_reviewable
+                    && !descriptor.file_changes.is_empty()
+                    && schema.is_some_and(|entry| entry.allow_supported);
             }
             "applyPatchApproval" => {
                 let (root, root_reviewable) =
@@ -1511,6 +1620,17 @@ fn has_only_keys(value: &serde_json::Map<String, Value>, allowed: &[&str]) -> bo
     value.keys().all(|key| allowed.contains(&key.as_str()))
 }
 
+/// The pinned schemas intentionally leave most top-level objects open for
+/// forward compatibility. That is unsafe at an approval boundary: an unknown
+/// field may change the effect of a generated response without appearing in
+/// the authenticated descriptor. Only the matrix's complete schema field set
+/// is therefore eligible for Allow.
+fn params_have_only_schema_fields(params: &Value, allowed: &[&str]) -> bool {
+    params
+        .as_object()
+        .is_some_and(|params| has_only_keys(params, allowed))
+}
+
 /// Preserve patch bytes exactly. A digest is deliberately not used here: it
 /// cannot let a human independently review the requested content. Returning
 /// `false` avoids copying over-budget content and makes Allow impossible.
@@ -2240,6 +2360,9 @@ mod tests {
         struct MatrixCase {
             name: &'static str,
             method: &'static str,
+            schema_fields: &'static [&'static str],
+            allow_supported: bool,
+            unreviewable_authority: Option<&'static str>,
             params: Value,
             expected: Vec<(&'static str, Value)>,
         }
@@ -2284,6 +2407,23 @@ mod tests {
             MatrixCase {
                 name: "command_execution_environment_and_network",
                 method: "item/commandExecution/requestApproval",
+                schema_fields: &[
+                    "turnId",
+                    "approvalId",
+                    "threadId",
+                    "command",
+                    "commandActions",
+                    "cwd",
+                    "environmentId",
+                    "itemId",
+                    "networkApprovalContext",
+                    "proposedExecpolicyAmendment",
+                    "proposedNetworkPolicyAmendments",
+                    "reason",
+                    "startedAtMs",
+                ],
+                allow_supported: true,
+                unreviewable_authority: None,
                 params: json!({
                     "command": "curl https://registry.example/v1/index",
                     "cwd": "/repo",
@@ -2310,6 +2450,17 @@ mod tests {
             MatrixCase {
                 name: "exec_command_exact_argv",
                 method: "execCommandApproval",
+                schema_fields: &[
+                    "approvalId",
+                    "callId",
+                    "command",
+                    "conversationId",
+                    "cwd",
+                    "parsedCmd",
+                    "reason",
+                ],
+                allow_supported: true,
+                unreviewable_authority: None,
                 params: json!({
                     "approvalId": "approval-1",
                     "callId": "call-1",
@@ -2330,6 +2481,15 @@ mod tests {
             MatrixCase {
                 name: "apply_patch_add_delete_update_and_move",
                 method: "applyPatchApproval",
+                schema_fields: &[
+                    "callId",
+                    "conversationId",
+                    "fileChanges",
+                    "grantRoot",
+                    "reason",
+                ],
+                allow_supported: true,
+                unreviewable_authority: None,
                 params: json!({
                     "callId": "call-1",
                     "conversationId": "thread-1",
@@ -2363,8 +2523,18 @@ mod tests {
                 ],
             },
             MatrixCase {
-                name: "file_change_session_root",
+                name: "file_change_unbound_correlated_changes",
                 method: "item/fileChange/requestApproval",
+                schema_fields: &[
+                    "grantRoot",
+                    "itemId",
+                    "reason",
+                    "startedAtMs",
+                    "threadId",
+                    "turnId",
+                ],
+                allow_supported: false,
+                unreviewable_authority: Some("correlated FileChangeThreadItem.changes"),
                 params: json!({
                     "grantRoot": "/repo/generated",
                     "reason": "allow writes under generated",
@@ -2381,6 +2551,18 @@ mod tests {
             MatrixCase {
                 name: "permissions_full_profile_and_fixed_response_scope",
                 method: "item/permissions/requestApproval",
+                schema_fields: &[
+                    "cwd",
+                    "environmentId",
+                    "itemId",
+                    "permissions",
+                    "reason",
+                    "startedAtMs",
+                    "threadId",
+                    "turnId",
+                ],
+                allow_supported: true,
+                unreviewable_authority: None,
                 params: json!({
                     "cwd": "/repo",
                     "environmentId": "container-a",
@@ -2405,17 +2587,35 @@ mod tests {
         assert_eq!(APPROVAL_SCHEMA_MATRIX.len(), cases.len());
         let mut descriptors = Vec::new();
         for case in cases {
+            let entry = APPROVAL_SCHEMA_MATRIX
+                .iter()
+                .find(|entry| entry.method == case.method)
+                .unwrap_or_else(|| panic!("{} must be a declared schema variant", case.name));
+            assert_eq!(
+                entry.schema_fields, case.schema_fields,
+                "{} must enumerate every top-level 0.144.3 schema field",
+                case.name
+            );
+            assert_eq!(
+                entry.allow_supported, case.allow_supported,
+                "{} must declare whether an exact Allow review exists",
+                case.name
+            );
+            assert_eq!(
+                entry.unreviewable_authority, case.unreviewable_authority,
+                "{} must document authority absent from the request",
+                case.name
+            );
             assert!(
-                APPROVAL_SCHEMA_MATRIX
-                    .iter()
-                    .any(|entry| entry.method == case.method),
-                "{} must be a declared schema variant",
+                approval_matrix_is_complete(entry),
+                "{} must classify every declared top-level field",
                 case.name
             );
             let (descriptor, allowed) = ApprovalDescriptor::from_request(case.method, &case.params);
-            assert!(
+            assert_eq!(
                 allowed && descriptor.reviewable,
-                "{} must be allowable",
+                case.allow_supported,
+                "{} Allow eligibility must match the schema matrix",
                 case.name
             );
             let descriptor = serde_json::to_value(descriptor).expect("descriptor JSON");
@@ -2469,10 +2669,22 @@ mod tests {
 
         let deny_cases = [
             (
+                "command execution without an exact cwd",
+                "item/commandExecution/requestApproval",
+                json!({
+                    "command": "./relative-tool",
+                    "itemId": "item-1",
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "startedAtMs": 1
+                }),
+            ),
+            (
                 "command persistent proposal",
                 "item/commandExecution/requestApproval",
                 json!({
                     "command": "echo current-only",
+                    "cwd": "/repo",
                     "proposedExecpolicyAmendment": ["echo *"]
                 }),
             ),
@@ -2481,9 +2693,28 @@ mod tests {
                 "item/commandExecution/requestApproval",
                 json!({
                     "command": "curl https://registry.example",
+                    "cwd": "/repo",
                     "proposedNetworkPolicyAmendments": [
                         { "action": "allow", "host": "registry.example" }
                     ]
+                }),
+            ),
+            (
+                "command execution with unclassified top-level extension",
+                "item/commandExecution/requestApproval",
+                json!({
+                    "command": "echo current-only",
+                    "cwd": "/repo",
+                    "futureAuthority": "hidden"
+                }),
+            ),
+            (
+                "exec command with unclassified top-level extension",
+                "execCommandApproval",
+                json!({
+                    "command": ["echo", "current-only"],
+                    "cwd": "/repo",
+                    "futureAuthority": "hidden"
                 }),
             ),
             (
@@ -2507,6 +2738,16 @@ mod tests {
                 }),
             ),
             (
+                "patch with unclassified top-level extension",
+                "applyPatchApproval",
+                json!({
+                    "fileChanges": {
+                        "/repo/add.rs": { "type": "add", "content": "exact" }
+                    },
+                    "futureAuthority": "hidden"
+                }),
+            ),
+            (
                 "patch content over bounded review budget",
                 "applyPatchApproval",
                 json!({
@@ -2516,6 +2757,20 @@ mod tests {
                             "content": "x".repeat(MAX_APPROVAL_PATCH_BYTES + 1)
                         }
                     }
+                }),
+            ),
+            (
+                "file change request lacks its correlated patch payload",
+                "item/fileChange/requestApproval",
+                json!({ "grantRoot": "/repo" }),
+            ),
+            (
+                "permissions with unclassified top-level extension",
+                "item/permissions/requestApproval",
+                json!({
+                    "cwd": "/repo",
+                    "permissions": { "network": { "enabled": false } },
+                    "futureAuthority": "hidden"
                 }),
             ),
         ];
