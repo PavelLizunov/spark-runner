@@ -4,6 +4,7 @@
 
 pub mod client;
 pub mod config;
+pub mod journal;
 pub mod jsonl;
 pub mod orchestrator;
 pub mod process;
