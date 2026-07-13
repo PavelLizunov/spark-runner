@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::client::{ClientError, CodexClient, REQUIRED_MODEL};
+use crate::client::{ApprovalPolicy, ClientError, CodexClient, REQUIRED_MODEL};
 use crate::config::{self, CodexLock, ConfigError, DEFAULT_CODEX_LOCK};
 use crate::process::{ChildProcess, ProcessError};
 
@@ -59,11 +59,17 @@ fn launch_spec(live: bool, fake_server_args: &[String]) -> Result<(String, Vec<S
 async fn spawn_client(
     live: bool,
     fake_server_args: &[String],
+    approval_policy: ApprovalPolicy,
 ) -> Result<(CodexClient, PathBuf), AppError> {
     let (program, args) = launch_spec(live, fake_server_args)?;
     let cwd = config::ephemeral_cwd()?;
     let spawned = ChildProcess::spawn(&program, &args, None)?;
-    let client = CodexClient::new(spawned.process, spawned.stdin, spawned.stdout);
+    let client = CodexClient::with_approval_policy(
+        spawned.process,
+        spawned.stdin,
+        spawned.stdout,
+        approval_policy,
+    );
     Ok((client, cwd))
 }
 
@@ -151,8 +157,9 @@ async fn execute_flow_once(
     flow: &Flow,
     live: bool,
     fake_server_args: &[String],
+    approval_policy: ApprovalPolicy,
 ) -> Result<String, AppError> {
-    let (mut client, cwd) = spawn_client(live, fake_server_args).await?;
+    let (mut client, cwd) = spawn_client(live, fake_server_args, approval_policy).await?;
     let outcome = run_flow_body(&mut client, &cwd, flow, live).await;
     let _ = client.shutdown().await;
     let _ = std::fs::remove_dir_all(&cwd);
@@ -166,26 +173,27 @@ async fn run_with_restart(
     flow: Flow,
     live: bool,
     fake_server_args: &[String],
+    approval_policy: ApprovalPolicy,
 ) -> Result<String, AppError> {
-    match execute_flow_once(&flow, live, fake_server_args).await {
+    match execute_flow_once(&flow, live, fake_server_args, approval_policy).await {
         Ok(summary) => Ok(summary),
         Err(error) if error.is_recoverable_desync() => {
             tracing::warn!(
                 error = %error,
                 "recoverable protocol desync on first attempt; restarting app-server once"
             );
-            execute_flow_once(&flow, live, fake_server_args).await
+            execute_flow_once(&flow, live, fake_server_args, approval_policy).await
         }
         Err(error) => Err(error),
     }
 }
 
 pub async fn run_doctor(live: bool) -> Result<String, AppError> {
-    run_with_restart(Flow::Doctor, live, &[]).await
+    run_with_restart(Flow::Doctor, live, &[], ApprovalPolicy::Deny).await
 }
 
 pub async fn run_turn(prompt: String, live: bool) -> Result<String, AppError> {
-    run_with_restart(Flow::Run(prompt), live, &[]).await
+    run_with_restart(Flow::Run(prompt), live, &[], ApprovalPolicy::Deny).await
 }
 
 /// Test-support entry point for the offline fake app-server only: same as
@@ -195,5 +203,12 @@ pub async fn run_turn(prompt: String, live: bool) -> Result<String, AppError> {
 pub async fn run_doctor_with_fake_server_args(
     fake_server_args: &[String],
 ) -> Result<String, AppError> {
-    run_with_restart(Flow::Doctor, false, fake_server_args).await
+    run_with_restart(Flow::Doctor, false, fake_server_args, ApprovalPolicy::Deny).await
+}
+
+pub async fn run_doctor_with_fake_server_args_and_approval_policy(
+    fake_server_args: &[String],
+    approval_policy: ApprovalPolicy,
+) -> Result<String, AppError> {
+    run_with_restart(Flow::Doctor, false, fake_server_args, approval_policy).await
 }

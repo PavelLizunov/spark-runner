@@ -150,6 +150,32 @@ impl JsonlClient {
         Ok(notification.get("params").cloned().unwrap_or(Value::Null))
     }
 
+    /// Send a JSON-RPC response to a request initiated by the app-server.
+    pub async fn respond(&self, id: u64, result: Value) -> Result<(), JsonlError> {
+        let response = serde_json::json!({ "id": id, "result": result });
+        let line = serde_json::to_string(&response)?;
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin
+            .write_all(
+                b"
+",
+            )
+            .await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    /// Read the next protocol message, first draining messages buffered while
+    /// another wait was in progress. This is used by the single owner task
+    /// that must handle app-server approval requests interleaved with turn
+    /// notifications.
+    pub async fn next_message(&self) -> Result<Value, JsonlError> {
+        tokio::time::timeout(self.wait_timeout, self.read_next_message())
+            .await
+            .map_err(|_| JsonlError::Timeout(self.wait_timeout))?
+    }
+
     async fn wait_for(&self, target: WaitTarget<'_>) -> Result<Value, JsonlError> {
         tokio::time::timeout(self.wait_timeout, self.read_until_match(&target))
             .await
@@ -192,13 +218,17 @@ impl JsonlClient {
             // Waiting for a specific response id: any other response-shaped
             // message (one carrying an `id`) is a desync, not something to
             // tolerate and buffer — it means the app-server answered a
-            // request we did not make (or answered one twice).
+            // request we did not make (or answered one twice). Server-initiated
+            // requests also carry an `id`, but they additionally carry a
+            // `method`; those belong to the client owner task and are buffered.
             if let WaitTarget::ResponseId(expected) = target {
-                if let Some(actual) = value.get("id").and_then(Value::as_u64) {
-                    return Err(JsonlError::UnexpectedResponseId {
-                        expected: *expected,
-                        actual,
-                    });
+                if value.get("method").is_none() {
+                    if let Some(actual) = value.get("id").and_then(Value::as_u64) {
+                        return Err(JsonlError::UnexpectedResponseId {
+                            expected: *expected,
+                            actual,
+                        });
+                    }
                 }
             }
 
@@ -208,6 +238,31 @@ impl JsonlClient {
                 "buffering unrelated message while waiting"
             );
             reader.pending.push(value);
+        }
+    }
+
+    async fn read_next_message(&self) -> Result<Value, JsonlError> {
+        let mut reader = self.reader.lock().await;
+        if !reader.pending.is_empty() {
+            return Ok(reader.pending.remove(0));
+        }
+
+        loop {
+            let mut line = String::new();
+            let bytes_read = reader.stdout.read_line(&mut line).await?;
+            if bytes_read == 0 {
+                return Err(JsonlError::StreamClosed);
+            }
+            if bytes_read > MAX_FRAME_LEN {
+                return Err(JsonlError::OversizedFrame {
+                    limit: MAX_FRAME_LEN,
+                });
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            return serde_json::from_str(trimmed).map_err(|_| JsonlError::MalformedFrame);
         }
     }
 }
@@ -222,7 +277,10 @@ enum WaitTarget<'a> {
 impl WaitTarget<'_> {
     fn matches(&self, value: &Value) -> bool {
         match self {
-            WaitTarget::ResponseId(id) => value.get("id").and_then(Value::as_u64) == Some(*id),
+            WaitTarget::ResponseId(id) => {
+                value.get("method").is_none()
+                    && value.get("id").and_then(Value::as_u64) == Some(*id)
+            }
             WaitTarget::Notification(method) => {
                 value.get("id").is_none()
                     && value.get("method").and_then(Value::as_str) == Some(*method)

@@ -1,15 +1,6 @@
 //! Deterministic offline stand-in for `codex app-server --listen stdio://`.
 //! Reads JSONL requests on stdin, writes JSONL responses/notifications on
 //! stdout: enough of the happy path for offline `doctor`/`run` and tests.
-//!
-//! For CP3 regression tests it also supports a small set of deterministic
-//! fault modes selected via `--fake-mode <mode>` (applied once, to the first
-//! request received): `oversized_frame`, `malformed_frame`,
-//! `unknown_response_id`, `unknown_response_id_once`. An optional
-//! `--fail-marker <path>` records one line per process invocation (used by
-//! `unknown_response_id_once` to behave normally only from the second
-//! invocation onward, simulating "fixed after a restart", and by tests to
-//! assert exactly how many app-server processes were spawned).
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -55,8 +46,6 @@ fn maybe_apply_fault(
 
     match mode {
         "oversized_frame" => {
-            // Deliberately exceeds MAX_FRAME_LEN so the client's bounded
-            // JSONL reader must reject it rather than buffering it.
             let padding = "x".repeat(MAX_FRAME_LEN + 1024);
             let line = format!(
                 "{}\n",
@@ -106,14 +95,21 @@ fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let fake_mode = arg_value(&args, "--fake-mode");
     let fail_marker = arg_value(&args, "--fail-marker").map(PathBuf::from);
+    let approval_mode = arg_value(&args, "--approval-mode");
+    if approval_mode.is_some() {
+        if let Some(marker) = fail_marker.as_ref() {
+            let _ = record_attempt(marker)?;
+        }
+    }
 
     let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
     let mut stdout = io::stdout();
     let mut thread_counter: u64 = 0;
     let mut turn_counter: u64 = 0;
     let mut fault_pending = fake_mode.is_some();
 
-    for line in stdin.lock().lines() {
+    while let Some(line) = lines.next() {
         let line = line?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -232,13 +228,11 @@ fn main() -> io::Result<()> {
                         "params": { "threadId": thread_id, "turnId": turn_id }
                     }),
                 )?;
-                send(
-                    &mut stdout,
-                    &json!({
-                        "method": "turn/completed",
-                        "params": { "threadId": thread_id, "turnId": turn_id, "status": "completed" }
-                    }),
-                )?;
+                if let Some(mode) = approval_mode.as_deref() {
+                    handle_approval_mode(&mut lines, &mut stdout, mode, &thread_id, &turn_id)?;
+                } else {
+                    send_turn_completed(&mut stdout, &thread_id, &turn_id, "completed")?;
+                }
             }
             _ => {
                 if let Some(id) = id {
@@ -255,6 +249,98 @@ fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn handle_approval_mode(
+    lines: &mut impl Iterator<Item = io::Result<String>>,
+    stdout: &mut impl Write,
+    mode: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> io::Result<()> {
+    let approval_id = 9001;
+    send_approval_request(stdout, approval_id, thread_id, turn_id)?;
+
+    if mode == "timeout" {
+        std::process::exit(0);
+    }
+
+    let first_decision = read_decision(lines)?.unwrap_or_else(|| "missing".to_string());
+    match mode {
+        "duplicate" => {
+            send_approval_request(stdout, approval_id, thread_id, turn_id)?;
+            let _ = read_decision(lines)?;
+        }
+        "restart_unresolved" => {
+            stdout.write_all(b"not-a-valid-jsonl-frame\n")?;
+            stdout.flush()?;
+        }
+        _ => {
+            let status = if first_decision == "accept" {
+                "completed"
+            } else {
+                "failed"
+            };
+            send_turn_completed(stdout, thread_id, turn_id, status)?;
+        }
+    }
+    Ok(())
+}
+
+fn send_approval_request(
+    stdout: &mut impl Write,
+    id: u64,
+    thread_id: &str,
+    turn_id: &str,
+) -> io::Result<()> {
+    send(
+        stdout,
+        &json!({
+            "id": id,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "approvalId": "approval-1",
+                "command": "echo deterministic-fake-approval",
+                "itemId": "item-1",
+                "startedAtMs": 1,
+                "threadId": thread_id,
+                "turnId": turn_id
+            }
+        }),
+    )
+}
+
+fn read_decision(
+    lines: &mut impl Iterator<Item = io::Result<String>>,
+) -> io::Result<Option<String>> {
+    let Some(line) = lines.next() else {
+        return Ok(None);
+    };
+    let line = line?;
+    let value: Value = match serde_json::from_str(line.trim()) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    Ok(value
+        .get("result")
+        .and_then(|result| result.get("decision"))
+        .and_then(Value::as_str)
+        .map(str::to_string))
+}
+
+fn send_turn_completed(
+    stdout: &mut impl Write,
+    thread_id: &str,
+    turn_id: &str,
+    status: &str,
+) -> io::Result<()> {
+    send(
+        stdout,
+        &json!({
+            "method": "turn/completed",
+            "params": { "threadId": thread_id, "turnId": turn_id, "status": status }
+        }),
+    )
 }
 
 fn send(stdout: &mut impl Write, value: &Value) -> io::Result<()> {
