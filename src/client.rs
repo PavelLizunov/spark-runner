@@ -142,9 +142,9 @@ fn model_list_contains_required_model(models: &Value) -> bool {
         .and_then(Value::as_array)
         .is_some_and(|models| {
             models.iter().any(|entry| {
-                ["id", "model"].iter().any(|field| {
-                    entry.get(field).and_then(Value::as_str) == Some(REQUIRED_MODEL)
-                })
+                ["id", "model"]
+                    .iter()
+                    .any(|field| entry.get(field).and_then(Value::as_str) == Some(REQUIRED_MODEL))
             })
         })
 }
