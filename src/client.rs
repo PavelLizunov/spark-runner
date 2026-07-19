@@ -455,6 +455,45 @@ fn approval_schema_variant(method: &str) -> Option<&'static ApprovalSchemaMatrix
         .find(|variant| variant.method == method)
 }
 
+fn approval_route_matches(
+    method: &str,
+    params: &Value,
+    active_thread_id: Option<&str>,
+    active_turn_id: Option<&str>,
+) -> bool {
+    let Some(schema) = approval_schema_variant(method) else {
+        return false;
+    };
+    let Some(thread_id) = active_thread_id else {
+        return false;
+    };
+    let Some(turn_id) = active_turn_id else {
+        return false;
+    };
+
+    (!schema.schema_fields.contains(&"threadId")
+        || params.get("threadId").and_then(Value::as_str) == Some(thread_id))
+        && (!schema.schema_fields.contains(&"turnId")
+            || params.get("turnId").and_then(Value::as_str) == Some(turn_id))
+        && (!schema.schema_fields.contains(&"conversationId")
+            || params.get("conversationId").and_then(Value::as_str) == Some(thread_id))
+}
+
+fn terminal_route_matches(
+    params: &Value,
+    active_thread_id: Option<&str>,
+    active_turn_id: Option<&str>,
+) -> bool {
+    params.get("threadId").and_then(Value::as_str) == active_thread_id
+        && params
+            .get("turn")
+            .and_then(|turn| turn.get("id"))
+            .and_then(Value::as_str)
+            == active_turn_id
+        && active_thread_id.is_some()
+        && active_turn_id.is_some()
+}
+
 /// Keep the schema list honest: every top-level request field must be mapped
 /// to a lossless descriptor field, a deny-on-presence field, or a documented
 /// non-authority field. A future field cannot become Allow-capable merely by
@@ -731,11 +770,19 @@ pub struct CodexClient {
     rpc: JsonlClient,
     process: ChildProcess,
     state: SessionState,
+    active_thread_id: Option<String>,
+    active_turn_id: Option<String>,
     approval_policy: ApprovalPolicy,
     auth_refresh_policy: AuthRefreshPolicy,
     /// Requests can arrive while any ordinary RPC is awaited.  Keep this
     /// shared with that dispatch path so an id can never receive two answers.
     seen_approvals: Arc<Mutex<SeenApprovals>>,
+}
+
+#[derive(Clone, Copy)]
+struct ActiveRoute<'a> {
+    thread_id: Option<&'a str>,
+    turn_id: Option<&'a str>,
 }
 
 impl CodexClient {
@@ -753,10 +800,28 @@ impl CodexClient {
         stdout: tokio::process::ChildStdout,
         approval_policy: ApprovalPolicy,
     ) -> Self {
+        Self::with_approval_policy_and_timeout(
+            process,
+            stdin,
+            stdout,
+            approval_policy,
+            crate::jsonl::DEFAULT_WAIT_TIMEOUT,
+        )
+    }
+
+    pub fn with_approval_policy_and_timeout(
+        process: ChildProcess,
+        stdin: tokio::process::ChildStdin,
+        stdout: tokio::process::ChildStdout,
+        approval_policy: ApprovalPolicy,
+        wait_timeout: Duration,
+    ) -> Self {
         Self {
-            rpc: JsonlClient::new(stdin, stdout),
+            rpc: JsonlClient::with_timeout(stdin, stdout, wait_timeout),
             process,
             state: SessionState::new(),
+            active_thread_id: None,
+            active_turn_id: None,
             approval_policy,
             auth_refresh_policy: AuthRefreshPolicy::Unavailable,
             seen_approvals: Arc::new(Mutex::new(SeenApprovals::default())),
@@ -790,6 +855,8 @@ impl CodexClient {
         let approval_policy = self.approval_policy.clone();
         let auth_refresh_policy = self.auth_refresh_policy.clone();
         let seen_approvals = Arc::clone(&self.seen_approvals);
+        let active_thread_id = self.active_thread_id.clone();
+        let active_turn_id = self.active_turn_id.clone();
         match rpc
             .call_with_server_request_handler_and_delivery(
                 method,
@@ -799,12 +866,16 @@ impl CodexClient {
                     let approval_policy = approval_policy.clone();
                     let auth_refresh_policy = auth_refresh_policy.clone();
                     let seen_approvals = Arc::clone(&seen_approvals);
+                    let active_thread_id = active_thread_id.clone();
+                    let active_turn_id = active_turn_id.clone();
                     async move {
                         Self::dispatch_server_request_during_call(
                             rpc,
                             &approval_policy,
                             &auth_refresh_policy,
                             &seen_approvals,
+                            active_thread_id.as_deref(),
+                            active_turn_id.as_deref(),
                             message,
                         )
                         .await
@@ -942,6 +1013,7 @@ impl CodexClient {
         }
 
         self.state.on_thread_started()?;
+        self.active_thread_id = Some(thread_id.clone());
         Ok(ThreadStarted { thread_id, model })
     }
 
@@ -967,12 +1039,14 @@ impl CodexClient {
             .rpc_call_with_delivery("turn/start", params, delivery)
             .await?;
         self.state.on_turn_started()?;
-        result
+        let turn_id = result
             .get("turn")
             .and_then(|turn| turn.get("id"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
-            .ok_or(ClientError::MissingTurnId)
+            .ok_or(ClientError::MissingTurnId)?;
+        self.active_turn_id = Some(turn_id.clone());
+        Ok(turn_id)
     }
 
     /// Wait for the terminal `turn/completed` notification while the same
@@ -1004,8 +1078,16 @@ impl CodexClient {
                     continue;
                 }
                 if method == "turn/completed" {
-                    return self
-                        .handle_turn_completed(message.get("params").unwrap_or(&Value::Null));
+                    let params = message.get("params").unwrap_or(&Value::Null);
+                    if !terminal_route_matches(
+                        params,
+                        self.active_thread_id.as_deref(),
+                        self.active_turn_id.as_deref(),
+                    ) {
+                        self.state.poison();
+                        return Err(ClientError::SessionPoisoned);
+                    }
+                    return self.handle_turn_completed(params);
                 }
                 if method == "model/rerouted" {
                     self.state.poison();
@@ -1062,6 +1144,10 @@ impl CodexClient {
             &self.approval_policy,
             &self.auth_refresh_policy,
             &self.seen_approvals,
+            ActiveRoute {
+                thread_id: self.active_thread_id.as_deref(),
+                turn_id: self.active_turn_id.as_deref(),
+            },
             message,
         )
         .await
@@ -1073,6 +1159,7 @@ impl CodexClient {
         approval_policy: &ApprovalPolicy,
         auth_refresh_policy: &AuthRefreshPolicy,
         seen_approvals: &Arc<Mutex<SeenApprovals>>,
+        active_route: ActiveRoute<'_>,
         message: &Value,
     ) -> Result<(), ClientError> {
         let method = message
@@ -1094,6 +1181,15 @@ impl CodexClient {
         }
 
         let params = message.get("params").unwrap_or(&Value::Null);
+        if !approval_route_matches(method, params, active_route.thread_id, active_route.turn_id) {
+            rpc.respond(
+                id,
+                approval_response(method, ApprovalDecision::Deny, Some(params)),
+            )
+            .await?;
+            state.poison();
+            return Err(ClientError::SessionPoisoned);
+        }
         let request_key = approval_request_key(method, &id, params);
         let seen = seen_approvals
             .lock()
@@ -1203,6 +1299,8 @@ impl CodexClient {
         approval_policy: &ApprovalPolicy,
         auth_refresh_policy: &AuthRefreshPolicy,
         seen_approvals: &Arc<Mutex<SeenApprovals>>,
+        active_thread_id: Option<&str>,
+        active_turn_id: Option<&str>,
         message: Value,
     ) -> Result<(), ClientError> {
         let id = message
@@ -1224,6 +1322,14 @@ impl CodexClient {
             return Err(ClientError::UnknownServerRequest);
         }
         let params = message.get("params").unwrap_or(&Value::Null);
+        if !approval_route_matches(method, params, active_thread_id, active_turn_id) {
+            rpc.respond(
+                id,
+                approval_response(method, ApprovalDecision::Deny, Some(params)),
+            )
+            .await?;
+            return Err(ClientError::SessionPoisoned);
+        }
         let request_key = approval_request_key(method, &id, params);
         let seen = seen_approvals
             .lock()
@@ -2864,6 +2970,43 @@ mod tests {
         assert!(matches!(
             seen.insert("approval:bounded:overflow".to_string()),
             Err(ClientError::SessionPoisoned)
+        ));
+    }
+
+    #[test]
+    fn protocol_messages_must_match_the_active_route() {
+        let approval = json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "approvalId": "approval-1",
+            "command": "pwd"
+        });
+        assert!(approval_route_matches(
+            "item/commandExecution/requestApproval",
+            &approval,
+            Some("thread-1"),
+            Some("turn-1")
+        ));
+        assert!(!approval_route_matches(
+            "item/commandExecution/requestApproval",
+            &approval,
+            Some("thread-1"),
+            Some("turn-other")
+        ));
+
+        let terminal = json!({
+            "threadId": "thread-1",
+            "turn": { "id": "turn-1", "status": "completed" }
+        });
+        assert!(terminal_route_matches(
+            &terminal,
+            Some("thread-1"),
+            Some("turn-1")
+        ));
+        assert!(!terminal_route_matches(
+            &terminal,
+            Some("thread-other"),
+            Some("turn-1")
         ));
     }
 

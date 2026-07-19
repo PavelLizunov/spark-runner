@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 /// Default bound for a single response/notification wait. Generous enough for
 /// a live model turn, but short enough that a protocol desync fails loudly
 /// instead of hanging the `doctor`/`run` commands indefinitely.
-const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Upper bound on a single JSONL frame (line), measured via
 /// [`tokio::io::AsyncBufReadExt::read_line`]'s returned byte count. Protects

@@ -16,7 +16,7 @@ async fn main() -> ExitCode {
         Command::Serve { live } => match ApiConfig::from_env(live) {
             Ok(config) => serve(config)
                 .await
-                .map(|addr| format!("serve: listening on {addr}"))
+                .map(|addr| format!("serve: stopped on {addr}"))
                 .map_err(Into::into),
             Err(err) => Err(err.into()),
         },

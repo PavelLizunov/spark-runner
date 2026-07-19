@@ -567,7 +567,7 @@ pub fn ephemeral_cwd() -> Result<PathBuf, ConfigError> {
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     let dir = env::temp_dir().join(format!("spark-runner-{}-{unique}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(ConfigError::EphemeralDir)?;
+    std::fs::create_dir(&dir).map_err(ConfigError::EphemeralDir)?;
     Ok(dir)
 }
 
