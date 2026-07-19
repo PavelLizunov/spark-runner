@@ -69,9 +69,9 @@ pub enum JsonlError {
     #[error("app-server stdout closed while waiting for a response or notification")]
     StreamClosed,
     #[error(
-        "app-server returned a remote error for request id {id} (diagnostic payload suppressed)"
+        "app-server returned a remote error for request id {id}, code {code:?} (diagnostic payload suppressed)"
     )]
-    Remote { id: u64 },
+    Remote { id: u64, code: Option<i64> },
     #[error("timed out after {0:?} waiting for an app-server response or notification")]
     Timeout(Duration),
     #[error(
@@ -237,8 +237,10 @@ impl JsonlClient {
         .map_err(|_| JsonlError::Timeout(self.wait_timeout))??;
 
         if let Some(error) = response.get("error") {
-            let _ = error;
-            return Err(JsonlError::Remote { id });
+            return Err(JsonlError::Remote {
+                id,
+                code: error.get("code").and_then(Value::as_i64),
+            });
         }
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }

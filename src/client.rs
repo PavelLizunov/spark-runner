@@ -138,12 +138,18 @@ fn fallback_model(class: &'static str, observed: &str) -> ClientError {
     }
 }
 
-fn remote_rejection_class(method: &str) -> &'static str {
+fn remote_rejection_class(method: &str, code: Option<i64>) -> &'static str {
+    if method == "account/rateLimits/read" {
+        return match code {
+            Some(-32601) => "rate_limits_method_not_found",
+            Some(-32602) => "rate_limits_params_rejected",
+            _ => "rate_limits_read_rejected",
+        };
+    }
     match method {
         "initialize" => "initialize_rejected",
         "account/read" => "account_read_rejected",
         "model/list" => "model_list_rejected",
-        "account/rateLimits/read" => "rate_limits_read_rejected",
         "thread/start" => "thread_start_rejected",
         "turn/start" => "turn_start_rejected",
         "turn/interrupt" => "turn_interrupt_rejected",
@@ -913,9 +919,9 @@ impl CodexClient {
         {
             Ok(value) => Ok(value),
             Err(error) => {
-                if matches!(error, JsonlError::Remote { .. }) {
+                if let JsonlError::Remote { code, .. } = &error {
                     return Err(ClientError::RemoteRejected {
-                        class: remote_rejection_class(method),
+                        class: remote_rejection_class(method, *code),
                     });
                 }
                 if error.is_desync() {
@@ -3042,7 +3048,7 @@ mod tests {
         );
         assert_eq!(
             ClientError::RemoteRejected {
-                class: remote_rejection_class("account/rateLimits/read")
+                class: remote_rejection_class("account/rateLimits/read", None)
             }
             .class(),
             "rate_limits_read_rejected"
