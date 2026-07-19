@@ -2,6 +2,13 @@
 
 A Rust runner for the pinned Codex Spark app-server protocol, with a loopback HTTP/SSE adapter and fail-closed runtime controls.
 
+Print the package version without starting app-server:
+
+```sh
+$ spark-runner --version
+spark-runner 0.1.0
+```
+
 ## Status
 
 CP6 offline remediation was accepted at `ad2952cdf3e0ad1a4921c2d6fd64925e10eb7c7e` and squash-merged by PR [#6](https://github.com/PavelLizunov/spark-runner/pull/6) as `072b777b290a2dddc7c38009de438c4173db99b2`. GitHub Actions runs [29281701984](https://github.com/PavelLizunov/spark-runner/actions/runs/29281701984) and [29281705056](https://github.com/PavelLizunov/spark-runner/actions/runs/29281705056) passed with 76 offline tests. Controlled live UAT remains pending; CP7 has not started.

@@ -105,7 +105,11 @@ fn make_fd_inheritable(file: &std::fs::File) -> Result<(), ConfigError> {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "spark-runner", about = "Minimal Codex app-server runner")]
+#[command(
+    name = "spark-runner",
+    about = "Minimal Codex app-server runner",
+    version
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
