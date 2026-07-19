@@ -21,8 +21,12 @@ Linux only. Configure opaque aliases for each service workspace; requests never 
 
 ```sh
 export SPARK_RUNNER_BEARER_TOKEN_FILE=/run/secrets/spark-runner-token
+export SPARK_RUNNER_SUBSCRIPTION_AUTH_FILE=/home/service/.codex/auth.json
 export SPARK_RUNNER_WORKSPACES='billing=/srv/billing,search=/srv/search'
 export SPARK_RUNNER_BIND=127.0.0.1:8787
+# Required only when this host needs an explicit OpenAI egress. Credentials in
+# proxy URLs are rejected; use a local/VPN gateway endpoint.
+export SPARK_RUNNER_EGRESS_PROXY=http://192.168.0.202:30880
 ./spark-runner serve --live
 ```
 
