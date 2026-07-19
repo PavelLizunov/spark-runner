@@ -255,7 +255,7 @@ fn main() -> io::Result<()> {
                     }
                 }),
             )?,
-            "account/rateLimits/read" if !params.is_null() => send(
+            "account/rateLimits/read" if request.get("params").is_some() => send(
                 &mut stdout,
                 &json!({
                     "id": id,

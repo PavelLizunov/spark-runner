@@ -12,7 +12,11 @@ use tokio::process::{ChildStdin, Command};
 const REQUIRED_MODEL: &str = "gpt-5.3-codex-spark";
 
 async fn send(stdin: &mut ChildStdin, id: u64, method: &str, params: Value) {
-    let request = json!({ "id": id, "method": method, "params": params });
+    let request = if params.is_null() {
+        json!({ "id": id, "method": method })
+    } else {
+        json!({ "id": id, "method": method, "params": params })
+    };
     let line = serde_json::to_string(&request).expect("serialize request");
     stdin
         .write_all(line.as_bytes())
