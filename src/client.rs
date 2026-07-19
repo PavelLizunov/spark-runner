@@ -3021,7 +3021,6 @@ mod tests {
         );
     }
 
-
     /// The generated 0.144.3 permissions response has no decision enum.
     /// Allow must therefore preserve the requested bounded-in-flight profile,
     /// while deny remains an empty fail-closed profile.
