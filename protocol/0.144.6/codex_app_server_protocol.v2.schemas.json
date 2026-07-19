@@ -296,10 +296,14 @@
       "title": "ThreadStartParams",
       "type": "object",
       "properties": {
-        "serviceName": {
-          "type": [
-            "string",
-            "null"
+        "sessionStartSource": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadStartSource"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "approvalPolicy": {
@@ -348,7 +352,7 @@
             "null"
           ]
         },
-        "serviceTier": {
+        "serviceName": {
           "type": [
             "string",
             "null"
@@ -370,16 +374,6 @@
             "null"
           ]
         },
-        "sandbox": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/SandboxMode"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "threadSource": {
           "description": "Optional client-supplied analytics source classification for this thread.",
           "anyOf": [
@@ -391,14 +385,20 @@
             }
           ]
         },
-        "sessionStartSource": {
+        "sandbox": {
           "anyOf": [
             {
-              "$ref": "#/definitions/ThreadStartSource"
+              "$ref": "#/definitions/SandboxMode"
             },
             {
               "type": "null"
             }
+          ]
+        },
+        "serviceTier": {
+          "type": [
+            "string",
+            "null"
           ]
         },
         "model": {
@@ -1717,13 +1717,10 @@
             "null"
           ]
         },
-        "threadId": {
-          "type": "string"
-        },
-        "sandbox": {
+        "personality": {
           "anyOf": [
             {
-              "$ref": "#/definitions/SandboxMode"
+              "$ref": "#/definitions/Personality"
             },
             {
               "type": "null"
@@ -1735,6 +1732,9 @@
             "string",
             "null"
           ]
+        },
+        "threadId": {
+          "type": "string"
         },
         "model": {
           "description": "Configuration overrides for the resumed thread, if any.",
@@ -1749,10 +1749,10 @@
             "null"
           ]
         },
-        "personality": {
+        "sandbox": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Personality"
+              "$ref": "#/definitions/SandboxMode"
             },
             {
               "type": "null"
@@ -1819,8 +1819,11 @@
         "ephemeral": {
           "type": "boolean"
         },
-        "threadId": {
-          "type": "string"
+        "serviceTier": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "lastTurnId": {
           "description": "Optional last turn id to fork through, inclusive.\n\nWhen specified, turns after `last_turn_id` are omitted from the fork. The referenced turn cannot be in progress.",
@@ -1842,16 +1845,6 @@
             "null"
           ]
         },
-        "sandbox": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/SandboxMode"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "threadSource": {
           "description": "Optional client-supplied analytics source classification for this forked thread.",
           "anyOf": [
@@ -1863,11 +1856,18 @@
             }
           ]
         },
-        "serviceTier": {
-          "type": [
-            "string",
-            "null"
+        "sandbox": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SandboxMode"
+            },
+            {
+              "type": "null"
+            }
           ]
+        },
+        "threadId": {
+          "type": "string"
         }
       }
     },
@@ -3652,15 +3652,11 @@
             "null"
           ]
         },
-        "summary": {
-          "description": "Override the reasoning summary for this turn and subsequent turns.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ReasoningSummary"
-            },
-            {
-              "type": "null"
-            }
+        "serviceTier": {
+          "description": "Override the service tier for this turn and subsequent turns.",
+          "type": [
+            "string",
+            "null"
           ]
         },
         "cwd": {
@@ -3681,12 +3677,8 @@
             }
           ]
         },
-        "serviceTier": {
-          "description": "Override the service tier for this turn and subsequent turns.",
-          "type": [
-            "string",
-            "null"
-          ]
+        "threadId": {
+          "type": "string"
         },
         "input": {
           "type": "array",
@@ -3701,6 +3693,20 @@
             "null"
           ]
         },
+        "summary": {
+          "description": "Override the reasoning summary for this turn and subsequent turns.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "outputSchema": {
+          "description": "Optional JSON Schema used to constrain the final assistant message for this turn."
+        },
         "sandboxPolicy": {
           "description": "Override the sandbox policy for this turn and subsequent turns.",
           "anyOf": [
@@ -3711,12 +3717,6 @@
               "type": "null"
             }
           ]
-        },
-        "outputSchema": {
-          "description": "Optional JSON Schema used to constrain the final assistant message for this turn."
-        },
-        "threadId": {
-          "type": "string"
         }
       }
     },
@@ -7577,8 +7577,13 @@
         "modelProvider": {
           "type": "string"
         },
-        "thread": {
-          "$ref": "#/definitions/Thread"
+        "sandbox": {
+          "description": "Legacy sandbox policy retained for compatibility. Experimental clients should prefer `activePermissionProfile` for profile provenance.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SandboxPolicy"
+            }
+          ]
         },
         "reasoningEffort": {
           "anyOf": [
@@ -7590,13 +7595,8 @@
             }
           ]
         },
-        "sandbox": {
-          "description": "Legacy sandbox policy retained for compatibility. Experimental clients should prefer `activePermissionProfile` for profile provenance.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/SandboxPolicy"
-            }
-          ]
+        "thread": {
+          "$ref": "#/definitions/Thread"
         }
       }
     },
@@ -7640,8 +7640,13 @@
         "thread"
       ],
       "properties": {
-        "thread": {
-          "$ref": "#/definitions/Thread"
+        "sandbox": {
+          "description": "Legacy sandbox policy retained for compatibility. Experimental clients should prefer `activePermissionProfile` for profile provenance.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SandboxPolicy"
+            }
+          ]
         },
         "approvalPolicy": {
           "$ref": "#/definitions/AskForApproval"
@@ -7677,13 +7682,8 @@
         "modelProvider": {
           "type": "string"
         },
-        "sandbox": {
-          "description": "Legacy sandbox policy retained for compatibility. Experimental clients should prefer `activePermissionProfile` for profile provenance.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/SandboxPolicy"
-            }
-          ]
+        "thread": {
+          "$ref": "#/definitions/Thread"
         },
         "reasoningEffort": {
           "anyOf": [
@@ -15155,12 +15155,44 @@
         }
       ]
     },
-    "FuzzyFileSearchMatchType": {
-      "type": "string",
-      "enum": [
-        "file",
-        "directory"
-      ]
+    "FuzzyFileSearchParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "FuzzyFileSearchParams",
+      "type": "object",
+      "required": [
+        "query",
+        "roots"
+      ],
+      "properties": {
+        "cancellationToken": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "query": {
+          "type": "string"
+        },
+        "roots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "FuzzyFileSearchSessionCompletedNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "FuzzyFileSearchSessionCompletedNotification",
+      "type": "object",
+      "required": [
+        "sessionId"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        }
+      }
     },
     "FuzzyFileSearchSessionUpdatedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -15186,29 +15218,84 @@
         }
       }
     },
-    "FuzzyFileSearchParams": {
+    "InitializeParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "FuzzyFileSearchParams",
+      "title": "InitializeParams",
       "type": "object",
       "required": [
-        "query",
-        "roots"
+        "clientInfo"
       ],
       "properties": {
-        "cancellationToken": {
+        "capabilities": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/InitializeCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "clientInfo": {
+          "$ref": "#/definitions/ClientInfo"
+        }
+      }
+    },
+    "InitializeCapabilities": {
+      "description": "Client-declared capabilities negotiated during initialize.",
+      "type": "object",
+      "properties": {
+        "experimentalApi": {
+          "description": "Opt into receiving experimental API methods and fields.",
+          "default": false,
+          "type": "boolean"
+        },
+        "mcpServerOpenaiFormElicitation": {
+          "description": "Allow downstream MCP servers to request OpenAI extended form elicitations.",
+          "type": "boolean"
+        },
+        "optOutNotificationMethods": {
+          "description": "Exact notification method names that should be suppressed for this connection (for example `thread/started`).",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "requestAttestation": {
+          "description": "Opt into `attestation/generate` requests for upstream `x-oai-attestation`.",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
+    "FuzzyFileSearchMatchType": {
+      "type": "string",
+      "enum": [
+        "file",
+        "directory"
+      ]
+    },
+    "ClientInfo": {
+      "type": "object",
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "title": {
           "type": [
             "string",
             "null"
           ]
         },
-        "query": {
+        "version": {
           "type": "string"
-        },
-        "roots": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
         }
       }
     },
@@ -15250,93 +15337,6 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
-        }
-      }
-    },
-    "FuzzyFileSearchSessionCompletedNotification": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "FuzzyFileSearchSessionCompletedNotification",
-      "type": "object",
-      "required": [
-        "sessionId"
-      ],
-      "properties": {
-        "sessionId": {
-          "type": "string"
-        }
-      }
-    },
-    "InitializeParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "InitializeParams",
-      "type": "object",
-      "required": [
-        "clientInfo"
-      ],
-      "properties": {
-        "capabilities": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/InitializeCapabilities"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "clientInfo": {
-          "$ref": "#/definitions/ClientInfo"
-        }
-      }
-    },
-    "ClientInfo": {
-      "type": "object",
-      "required": [
-        "name",
-        "version"
-      ],
-      "properties": {
-        "name": {
-          "type": "string"
-        },
-        "title": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "version": {
-          "type": "string"
-        }
-      }
-    },
-    "InitializeCapabilities": {
-      "description": "Client-declared capabilities negotiated during initialize.",
-      "type": "object",
-      "properties": {
-        "experimentalApi": {
-          "description": "Opt into receiving experimental API methods and fields.",
-          "default": false,
-          "type": "boolean"
-        },
-        "mcpServerOpenaiFormElicitation": {
-          "description": "Allow downstream MCP servers to request OpenAI extended form elicitations.",
-          "type": "boolean"
-        },
-        "optOutNotificationMethods": {
-          "description": "Exact notification method names that should be suppressed for this connection (for example `thread/started`).",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "type": "string"
-          }
-        },
-        "requestAttestation": {
-          "description": "Opt into `attestation/generate` requests for upstream `x-oai-attestation`.",
-          "default": false,
-          "type": "boolean"
         }
       }
     },
