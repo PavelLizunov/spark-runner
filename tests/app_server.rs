@@ -91,7 +91,7 @@ async fn fake_app_server_completes_one_ephemeral_turn() {
         .expect("data array");
     assert!(models.iter().any(|model| model["id"] == REQUIRED_MODEL));
 
-    send(&mut stdin, 4, "account/rateLimits/read", json!({})).await;
+    send(&mut stdin, 4, "account/rateLimits/read", Value::Null).await;
     let rate_limits_response = wait_for_response(&mut reader, 4).await;
     assert_eq!(
         rate_limits_response["result"]["rateLimits"]["primary"]["usedPercent"],

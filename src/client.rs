@@ -964,7 +964,7 @@ impl CodexClient {
     }
 
     pub async fn rate_limits_read(&mut self) -> Result<Value, ClientError> {
-        self.rpc_call("account/rateLimits/read", json!({})).await
+        self.rpc_call("account/rateLimits/read", Value::Null).await
     }
 
     /// Admission checks shared by every live turn. They run before the first

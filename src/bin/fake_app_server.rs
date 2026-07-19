@@ -255,6 +255,13 @@ fn main() -> io::Result<()> {
                     }
                 }),
             )?,
+            "account/rateLimits/read" if !params.is_null() => send(
+                &mut stdout,
+                &json!({
+                    "id": id,
+                    "error": { "code": -32602, "message": "params must be null" }
+                }),
+            )?,
             "account/rateLimits/read" => send(
                 &mut stdout,
                 &json!({
