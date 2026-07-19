@@ -19,8 +19,6 @@ use crate::state::{ApprovalDecision, ApprovalSource, InternalEvent, SessionState
 pub const REQUIRED_MODEL: &str = "gpt-5.3-codex-spark";
 const MAX_SEEN_APPROVALS: usize = 256;
 const MAX_SEEN_APPROVAL_BYTES: usize = 16 * 1024;
-const MAX_MODEL_LIST_PAGES: usize = 32;
-const MAX_MODEL_CURSOR_LEN: usize = 4096;
 
 /// The child controls both JSON-RPC request ids and approval identifiers.
 /// Keep only fixed-size opaque keys and bound the duplicate detector so a
@@ -135,20 +133,6 @@ fn fallback_model(class: &'static str, observed: &str) -> ClientError {
         hash: remote_value_hash(observed),
         required: REQUIRED_MODEL,
     }
-}
-
-fn model_list_contains_required_model(models: &Value) -> bool {
-    models
-        .get("data")
-        .or_else(|| models.get("models"))
-        .and_then(Value::as_array)
-        .is_some_and(|models| {
-            models.iter().any(|entry| {
-                ["id", "model"]
-                    .iter()
-                    .any(|field| entry.get(field).and_then(Value::as_str) == Some(REQUIRED_MODEL))
-            })
-        })
 }
 
 /// Remote quota responses are diagnostics, not audit payloads.  Keep only
@@ -955,8 +939,7 @@ impl CodexClient {
     }
 
     pub async fn model_list(&mut self) -> Result<Value, ClientError> {
-        self.rpc_call("model/list", json!({ "includeHidden": true }))
-            .await
+        self.rpc_call("model/list", json!({})).await
     }
 
     pub async fn rate_limits_read(&mut self) -> Result<Value, ClientError> {
@@ -971,39 +954,10 @@ impl CodexClient {
         if account.pointer("/account/type").and_then(Value::as_str) != Some("chatgpt") {
             return Err(ClientError::ChatGptAuthRequired);
         }
-        let mut models = self.model_list().await?;
-        let mut has_required_model = false;
-        for _ in 0..MAX_MODEL_LIST_PAGES {
-            if model_list_contains_required_model(&models) {
-                has_required_model = true;
-                break;
-            }
-            let Some(cursor) = models.get("nextCursor") else {
-                break;
-            };
-            if cursor.is_null() {
-                break;
-            }
-            let Some(cursor) = cursor
-                .as_str()
-                .filter(|cursor| cursor.len() <= MAX_MODEL_CURSOR_LEN)
-            else {
-                self.state.poison();
-                return Err(ClientError::SessionPoisoned);
-            };
-            models = self
-                .rpc_call(
-                    "model/list",
-                    json!({ "cursor": cursor, "includeHidden": true }),
-                )
-                .await?;
-        }
-        if !has_required_model {
-            return Err(fallback_model(
-                "missing_from_model_list",
-                "missing-from-model-list",
-            ));
-        }
+        // Research-preview models can be selectable even when the app-server
+        // catalog omits them. The subsequent `thread_start` requests and verifies the
+        // exact required model, which is the authoritative no-fallback gate.
+        self.model_list().await?;
         let rate_limits = self.rate_limits_read().await?;
         // A secondary window being available does not override an exhausted
         // primary bucket (nor a workspace-credit exhaustion).  The native
@@ -3067,16 +3021,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn model_admission_accepts_the_schema_model_identifier() {
-        let models = json!({
-            "data": [{
-                "id": "picker-entry",
-                "model": REQUIRED_MODEL
-            }]
-        });
-        assert!(model_list_contains_required_model(&models));
-    }
 
     /// The generated 0.144.3 permissions response has no decision enum.
     /// Allow must therefore preserve the requested bounded-in-flight profile,
