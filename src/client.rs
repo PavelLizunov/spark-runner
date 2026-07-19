@@ -96,6 +96,16 @@ pub enum ClientError {
 }
 
 impl ClientError {
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::FallbackModel { .. } => "required_model_unavailable",
+            Self::ChatGptAuthRequired => "chatgpt_auth_required",
+            Self::QuotaUnavailable => "quota_unavailable",
+            Self::AuthTokensRefreshUnavailable => "auth_refresh_unavailable",
+            _ => "protocol_failure",
+        }
+    }
+
     /// Whether this error is a JSONL protocol desync (oversized/malformed
     /// frame or an unexpected response id) that poisoned the session and may
     /// be worth a single controlled app-server restart. Other failures
@@ -3008,6 +3018,19 @@ mod tests {
             Some("thread-other"),
             Some("turn-1")
         ));
+    }
+
+    #[test]
+    fn admission_failures_have_safe_operator_classes() {
+        assert_eq!(
+            ClientError::ChatGptAuthRequired.class(),
+            "chatgpt_auth_required"
+        );
+        assert_eq!(ClientError::QuotaUnavailable.class(), "quota_unavailable");
+        assert_eq!(
+            ClientError::AuthTokensRefreshUnavailable.class(),
+            "auth_refresh_unavailable"
+        );
     }
 
     /// The generated 0.144.3 permissions response has no decision enum.

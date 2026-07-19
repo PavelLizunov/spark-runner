@@ -42,7 +42,7 @@ fn error_class(error: &spark_runner::orchestrator::AppError) -> &'static str {
     match error {
         spark_runner::orchestrator::AppError::Config(_) => "configuration_failure",
         spark_runner::orchestrator::AppError::Process(_) => "process_failure",
-        spark_runner::orchestrator::AppError::Client(_) => "protocol_failure",
+        spark_runner::orchestrator::AppError::Client(error) => error.class(),
         spark_runner::orchestrator::AppError::Journal(_) => "journal_failure",
         spark_runner::orchestrator::AppError::Api(_) => "api_failure",
         spark_runner::orchestrator::AppError::EphemeralCleanup(_) => "cleanup_failure",
