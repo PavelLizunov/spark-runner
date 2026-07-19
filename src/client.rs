@@ -135,6 +135,20 @@ fn fallback_model(class: &'static str, observed: &str) -> ClientError {
     }
 }
 
+fn model_list_contains_required_model(models: &Value) -> bool {
+    models
+        .get("data")
+        .or_else(|| models.get("models"))
+        .and_then(Value::as_array)
+        .is_some_and(|models| {
+            models.iter().any(|entry| {
+                ["id", "model"].iter().any(|field| {
+                    entry.get(field).and_then(Value::as_str) == Some(REQUIRED_MODEL)
+                })
+            })
+        })
+}
+
 /// Remote quota responses are diagnostics, not audit payloads.  Keep only
 /// the admission fact and a fixed-width correlation hash so arbitrary child
 /// fields (including canaries under innocent keys) never cross into SQLite.
@@ -955,15 +969,7 @@ impl CodexClient {
             return Err(ClientError::ChatGptAuthRequired);
         }
         let models = self.model_list().await?;
-        let has_required_model = models
-            .get("data")
-            .or_else(|| models.get("models"))
-            .and_then(Value::as_array)
-            .is_some_and(|models| {
-                models
-                    .iter()
-                    .any(|model| model.get("id").and_then(Value::as_str) == Some(REQUIRED_MODEL))
-            });
+        let has_required_model = model_list_contains_required_model(&models);
         if !has_required_model {
             return Err(fallback_model(
                 "missing_from_model_list",
@@ -3031,6 +3037,17 @@ mod tests {
             ClientError::AuthTokensRefreshUnavailable.class(),
             "auth_refresh_unavailable"
         );
+    }
+
+    #[test]
+    fn model_admission_accepts_the_schema_model_identifier() {
+        let models = json!({
+            "data": [{
+                "id": "picker-entry",
+                "model": REQUIRED_MODEL
+            }]
+        });
+        assert!(model_list_contains_required_model(&models));
     }
 
     /// The generated 0.144.3 permissions response has no decision enum.
