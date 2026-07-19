@@ -31,7 +31,11 @@ async fn main() -> ExitCode {
             // The CLI is a trust boundary just like HTTP and must not render
             // arbitrary diagnostics verbatim.
             let class = error_class(&err);
-            tracing::error!(class, "spark-runner failed");
+            let remote_code = match &err {
+                spark_runner::orchestrator::AppError::Client(error) => error.remote_code(),
+                _ => None,
+            };
+            tracing::error!(class, ?remote_code, "spark-runner failed");
             eprintln!("spark-runner: error: {class}");
             ExitCode::FAILURE
         }

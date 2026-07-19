@@ -93,8 +93,11 @@ pub enum ClientError {
     TurnDeadlineExceeded,
     #[error("app-server requested ChatGPT token refresh but the runtime owner has no bounded refresh response")]
     AuthTokensRefreshUnavailable,
-    #[error("app-server rejected an RPC request (class={class}; diagnostic payload suppressed)")]
-    RemoteRejected { class: &'static str },
+    #[error("app-server rejected an RPC request (class={class}, code={code:?}; diagnostic payload suppressed)")]
+    RemoteRejected {
+        class: &'static str,
+        code: Option<i64>,
+    },
 }
 
 impl ClientError {
@@ -104,8 +107,15 @@ impl ClientError {
             Self::ChatGptAuthRequired => "chatgpt_auth_required",
             Self::QuotaUnavailable => "quota_unavailable",
             Self::AuthTokensRefreshUnavailable => "auth_refresh_unavailable",
-            Self::RemoteRejected { class } => class,
+            Self::RemoteRejected { class, .. } => class,
             _ => "protocol_failure",
+        }
+    }
+
+    pub fn remote_code(&self) -> Option<i64> {
+        match self {
+            Self::RemoteRejected { code, .. } => *code,
+            _ => None,
         }
     }
 
@@ -922,6 +932,7 @@ impl CodexClient {
                 if let JsonlError::Remote { code, .. } = &error {
                     return Err(ClientError::RemoteRejected {
                         class: remote_rejection_class(method, *code),
+                        code: *code,
                     });
                 }
                 if error.is_desync() {
@@ -3048,7 +3059,8 @@ mod tests {
         );
         assert_eq!(
             ClientError::RemoteRejected {
-                class: remote_rejection_class("account/rateLimits/read", None)
+                class: remote_rejection_class("account/rateLimits/read", None),
+                code: None
             }
             .class(),
             "rate_limits_read_rejected"
