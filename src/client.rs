@@ -997,11 +997,10 @@ impl CodexClient {
         // exact required model, which is the authoritative no-fallback gate.
         self.model_list().await?;
         let rate_limits = self.rate_limits_read().await?;
-        // A secondary window being available does not override an exhausted
-        // primary bucket (nor a workspace-credit exhaustion).  The native
-        // 0.144.6 response deliberately carries both the legacy single view
-        // and the metered-by-limit view; every advertised bucket must be
-        // usable before we spend a non-idempotent turn request.
+        // A secondary or model-specific window being available does not
+        // override an exhausted bucket. The native response carries both the
+        // legacy single view and the metered-by-limit view; every advertised
+        // usage window must be usable before we spend a non-idempotent turn.
         let has_quota = quota_available(&rate_limits);
         if !has_quota {
             return Err(ClientError::QuotaUnavailable);
@@ -1622,27 +1621,6 @@ fn rate_limit_windows(rate_limits: &Value) -> Vec<&Value> {
     windows
 }
 
-fn credits_available(rate_limits: &Value) -> bool {
-    fn snapshot_credits_available(snapshot: &Value) -> bool {
-        snapshot.get("credits").is_none_or(|credits| {
-            credits.is_null()
-                || credits
-                    .get("unlimited")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                || credits
-                    .get("hasCredits")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-        })
-    }
-    snapshot_credits_available(rate_limits.get("rateLimits").unwrap_or(&Value::Null))
-        && rate_limits
-            .get("rateLimitsByLimitId")
-            .and_then(Value::as_object)
-            .is_none_or(|by_id| by_id.values().all(snapshot_credits_available))
-}
-
 fn quota_available(rate_limits: &Value) -> bool {
     let windows = rate_limit_windows(rate_limits);
     rate_limits
@@ -1665,7 +1643,6 @@ fn quota_available(rate_limits: &Value) -> bool {
                 .and_then(Value::as_i64)
                 .is_some_and(|used| (0..100).contains(&used))
         })
-        && credits_available(rate_limits)
 }
 
 fn is_known_approval_method(method: &str) -> bool {
@@ -2940,9 +2917,21 @@ mod tests {
             "rateLimitsByLimitId": null
         });
         assert!(!quota_available(&exhausted_primary));
-        assert!(!credits_available(
-            &json!({ "rateLimits": { "credits": { "hasCredits": false, "unlimited": false } } })
-        ));
+        let subscription_without_purchased_credits = json!({
+            "rateLimits": {
+                "primary": { "usedPercent": 46 },
+                "rateLimitReachedType": null,
+                "credits": { "hasCredits": false, "unlimited": false }
+            },
+            "rateLimitsByLimitId": {
+                "codex_bengalfox": {
+                    "primary": { "usedPercent": 0 },
+                    "rateLimitReachedType": null,
+                    "credits": null
+                }
+            }
+        });
+        assert!(quota_available(&subscription_without_purchased_credits));
 
         let reached = json!({
             "rateLimits": { "primary": { "usedPercent": 0 }, "rateLimitReachedType": "workspace_owner_credits_depleted", "credits": null },
