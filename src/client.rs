@@ -984,7 +984,9 @@ impl CodexClient {
             if cursor.is_null() {
                 break;
             }
-            let Some(cursor) = cursor.as_str().filter(|cursor| cursor.len() <= MAX_MODEL_CURSOR_LEN)
+            let Some(cursor) = cursor
+                .as_str()
+                .filter(|cursor| cursor.len() <= MAX_MODEL_CURSOR_LEN)
             else {
                 self.state.poison();
                 return Err(ClientError::SessionPoisoned);
