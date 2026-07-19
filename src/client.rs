@@ -224,7 +224,7 @@ pub struct PendingApproval {
     pub method: String,
     pub descriptor: ApprovalDescriptor,
     /// A permission grant is permitted only when the exact requested profile
-    /// passed the bounded 0.144.3-shaped validation below.
+    /// passed the bounded 0.144.6-shaped validation below.
     pub allow_permitted: bool,
     /// The owner, not a detached client future, owns expiry.  This lets the
     /// same cancellation command deny, interrupt, await terminal completion,
@@ -332,13 +332,13 @@ pub struct RequestedFileSystemPermission {
 }
 
 /// The authority-bearing fields of every server approval request supported by
-/// the pinned 0.144.3 protocol schema.  This is deliberately explicit rather
+/// the pinned 0.144.6 protocol schema.  This is deliberately explicit rather
 /// than inferred from a generic JSON object: an added field must be placed in
 /// one of these buckets before it can become approvable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApprovalSchemaMatrixEntry {
     pub method: &'static str,
-    /// Every top-level field declared by the pinned 0.144.3 request schema.
+    /// Every top-level field declared by the pinned 0.144.6 request schema.
     /// An extension is deny-only, even when a generated schema would accept
     /// it, until it has been classified in this matrix. This prevents a newer
     /// authority-bearing field from being silently ignored by an old owner.
@@ -999,7 +999,7 @@ impl CodexClient {
         let rate_limits = self.rate_limits_read().await?;
         // A secondary window being available does not override an exhausted
         // primary bucket (nor a workspace-credit exhaustion).  The native
-        // 0.144.3 response deliberately carries both the legacy single view
+        // 0.144.6 response deliberately carries both the legacy single view
         // and the metered-by-limit view; every advertised bucket must be
         // usable before we spend a non-idempotent turn request.
         let has_quota = quota_available(&rate_limits);
@@ -1538,7 +1538,7 @@ impl CodexClient {
     }
 
     /// Interrupt the exact live turn before process cleanup.  The generated
-    /// 0.144.3 shape requires both identifiers; callers must not fabricate a
+    /// 0.144.6 shape requires both identifiers; callers must not fabricate a
     /// terminal state without making this protocol attempt.
     pub async fn turn_interrupt(
         &mut self,
@@ -1751,7 +1751,7 @@ fn describe_network_approval(value: Option<&Value>) -> (Option<ApprovalNetworkAp
     )
 }
 
-/// Every accepted patch variant has exactly the keys defined by the 0.144.3
+/// Every accepted patch variant has exactly the keys defined by the 0.144.6
 /// `FileChange` union. Rejecting extensions prevents an action-bearing byte
 /// from being silently dropped from an otherwise approvable descriptor.
 fn has_exact_keys(change: &serde_json::Map<String, Value>, allowed: &[&str]) -> bool {
@@ -2201,7 +2201,7 @@ fn approval_response(method: &str, decision: ApprovalDecision, params: Option<&V
             json!({ "decision": value })
         }
         "item/permissions/requestApproval" => {
-            // 0.144.3 requires a GrantedPermissionProfile rather than a
+            // 0.144.6 requires a GrantedPermissionProfile rather than a
             // decision enum. An explicit owner Allow grants the exact
             // profile requested on this one original request; Deny/timeout
             // use an empty profile. The profile is never persisted; a bounded
@@ -2735,7 +2735,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} must be a declared schema variant", case.name));
             assert_eq!(
                 entry.schema_fields, case.schema_fields,
-                "{} must enumerate every top-level 0.144.3 schema field",
+                "{} must enumerate every top-level 0.144.6 schema field",
                 case.name
             );
             assert_eq!(
@@ -2925,7 +2925,7 @@ mod tests {
         }
     }
 
-    /// T10: canonical 0.144.3 quota admission is fail-closed.  An available
+    /// T10: canonical 0.144.6 quota admission is fail-closed.  An available
     /// secondary window never overrides an exhausted primary or an explicit
     /// reached type, and malformed snapshots do not become capacity.
     #[test]
@@ -3067,7 +3067,7 @@ mod tests {
         );
     }
 
-    /// The generated 0.144.3 permissions response has no decision enum.
+    /// The generated 0.144.6 permissions response has no decision enum.
     /// Allow must therefore preserve the requested bounded-in-flight profile,
     /// while deny remains an empty fail-closed profile.
     #[test]

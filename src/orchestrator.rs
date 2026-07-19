@@ -768,7 +768,7 @@ async fn run_controlled_flow(
         biased;
         control = controls.recv() => {
             control_received(control, control_acknowledgement)?;
-            // Both ids come from accepted 0.144.3 responses; do not
+            // Both ids come from accepted 0.144.6 responses; do not
             // synthesize a terminal state if delivery failed or its result
             // was rejected. That boundary is ambiguous and is deliberately
             // left recoverable as Unknown on restart.

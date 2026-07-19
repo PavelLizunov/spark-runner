@@ -608,7 +608,7 @@ async fn reroute_failure_triggers_fresh_admission_on_ready() {
     assert_eq!(limits["quota_available"], true);
 }
 
-/// 0.144.3 permission approvals carry a granted profile rather than a
+/// 0.144.6 permission approvals carry a granted profile rather than a
 /// decision string. The injected owner preserves the exact in-flight request
 /// profile for an authenticated Allow and does not fabricate a command shape.
 #[tokio::test]

@@ -193,7 +193,7 @@ fn main() -> io::Result<()> {
                     &json!({
                     "id": id,
                     "result": {
-                        "serverInfo": { "name": "fake-codex-app-server", "version": "0.144.3" }
+                        "serverInfo": { "name": "fake-codex-app-server", "version": "0.144.6" }
                     }
                     }),
                 )?;
@@ -314,7 +314,7 @@ fn main() -> io::Result<()> {
                         "result": {
                             "thread": {
                                 "id": thread_id,
-                                "cliVersion": "0.144.3",
+                                "cliVersion": "0.144.6",
                                 "createdAt": 1,
                                 "updatedAt": 1,
                                 "cwd": "/tmp",
@@ -342,7 +342,7 @@ fn main() -> io::Result<()> {
                         "params": {
                             "thread": {
                                 "id": thread_id,
-                                "cliVersion": "0.144.3",
+                                "cliVersion": "0.144.6",
                                 "createdAt": 1,
                                 "updatedAt": 1,
                                 "cwd": "/tmp",
