@@ -4,7 +4,7 @@ A Rust runner for the pinned Codex Spark app-server protocol, with a loopback HT
 
 ## Status
 
-CP6 offline remediation was accepted at `ad2952cdf3e0ad1a4921c2d6fd64925e10eb7c7e` and squash-merged by PR [#6](https://github.com/PavelLizunov/spark-runner/pull/6) as `072b777b290a2dddc7c38009de438c4173db99b2`. GitHub Actions runs [29281701984](https://github.com/PavelLizunov/spark-runner/actions/runs/29281701984) and [29281705056](https://github.com/PavelLizunov/spark-runner/actions/runs/29281705056) passed with 76 offline tests. The integration-ready candidate passes 80 offline tests and a controlled live doctor on `uap-build-1` using pinned Codex `0.144.6`, the explicit VPN egress, and exact model `gpt-5.3-codex-spark`; the turn completed with no fallback or leaked process. CI validation for the candidate is pending.
+CP6 offline remediation was accepted at `ad2952cdf3e0ad1a4921c2d6fd64925e10eb7c7e` and squash-merged by PR [#6](https://github.com/PavelLizunov/spark-runner/pull/6) as `072b777b290a2dddc7c38009de438c4173db99b2`. GitHub Actions runs [29281701984](https://github.com/PavelLizunov/spark-runner/actions/runs/29281701984) and [29281705056](https://github.com/PavelLizunov/spark-runner/actions/runs/29281705056) passed with 76 offline tests. The integration-ready candidate passes 80 offline tests, a controlled live doctor, and live loopback HTTP/SSE happy-path and cancellation UAT on `uap-build-1` using pinned Codex `0.144.6`, explicit VPN egress, and exact model `gpt-5.3-codex-spark`; no fallback or leaked process was observed.
 
 ## Safe offline checks
 

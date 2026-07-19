@@ -6,8 +6,8 @@
   "state": "active",
   "completed_checkpoints": [],
   "blocker": null,
-  "updated_at": "2026-07-19T21:57:21Z",
-  "next_command": "Wait for required GitHub Actions on PR #9, address any failure without weakening the gates, then mark ready for owner review.",
+  "updated_at": "2026-07-19T22:18:08Z",
+  "next_command": "Require green GitHub Actions for the live-evidence update on PR #9, then request owner review and merge before CP7 service installation and soak.",
   "checkpoints": {
     "CP1": {
       "name": "Phase 0 bootstrap: raw app-server + Python SDK oracle",
@@ -95,7 +95,17 @@
           "fallback_model_used": false,
           "turn_started": true,
           "turn_status": "completed",
-          "process_cleanup": "clean"
+          "process_cleanup": "clean",
+          "http_sse": {
+            "status": "passed",
+            "observed_at": "2026-07-19T22:18:08Z",
+            "invalid_token": "rejected",
+            "happy_path_terminal": "completed",
+            "sse_disconnect_terminal": "interrupted",
+            "explicit_interrupt_terminal": "interrupted",
+            "thread_cleanup": "clean",
+            "readiness_after_tests": "ready"
+          }
         }
       }
     },

@@ -30,6 +30,8 @@ The next admission failure, `quota_unavailable`, was a local interpretation bug:
 
 With `SPARK_RUNNER_EGRESS_PROXY=http://192.168.0.202:30880`, the release binary completed `doctor --live` using exact model `gpt-5.3-codex-spark`. Terminal status was `completed`, no fallback or approval occurred, and pre/post process checks were clean.
 
+The live loopback API was then exercised through the same egress. Authenticated readiness, model and quota reads passed; an invalid bearer was rejected; a logical thread and live turn progressed through SSE `turn.started` to `turn.completed`; the terminal turn was readable and its thread was deleted. Two further live turns proved both controlling-SSE disconnect and explicit `/interrupt` terminalize as `interrupted`. Readiness remained green and no process, temporary token, capture, or worktree change remained.
+
 ## Residual live risk
 
-The one-process doctor path is now proven online. GitHub Actions for the candidate, merge, service-level HTTP/SSE integration against each real consumer, and the CP7 service/soak/release gates remain pending.
+The direct doctor and loopback HTTP/SSE runtime paths are now proven online. Merge, integration against the first external consumer, and the CP7 service/soak/release gates remain pending.
