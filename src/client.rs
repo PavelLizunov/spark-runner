@@ -93,6 +93,8 @@ pub enum ClientError {
     TurnDeadlineExceeded,
     #[error("app-server requested ChatGPT token refresh but the runtime owner has no bounded refresh response")]
     AuthTokensRefreshUnavailable,
+    #[error("app-server rejected an RPC request (class={class}; diagnostic payload suppressed)")]
+    RemoteRejected { class: &'static str },
 }
 
 impl ClientError {
@@ -102,6 +104,7 @@ impl ClientError {
             Self::ChatGptAuthRequired => "chatgpt_auth_required",
             Self::QuotaUnavailable => "quota_unavailable",
             Self::AuthTokensRefreshUnavailable => "auth_refresh_unavailable",
+            Self::RemoteRejected { class } => class,
             _ => "protocol_failure",
         }
     }
@@ -132,6 +135,19 @@ fn fallback_model(class: &'static str, observed: &str) -> ClientError {
         class,
         hash: remote_value_hash(observed),
         required: REQUIRED_MODEL,
+    }
+}
+
+fn remote_rejection_class(method: &str) -> &'static str {
+    match method {
+        "initialize" => "initialize_rejected",
+        "account/read" => "account_read_rejected",
+        "model/list" => "model_list_rejected",
+        "account/rateLimits/read" => "rate_limits_read_rejected",
+        "thread/start" => "thread_start_rejected",
+        "turn/start" => "turn_start_rejected",
+        "turn/interrupt" => "turn_interrupt_rejected",
+        _ => "rpc_rejected",
     }
 }
 
@@ -897,6 +913,11 @@ impl CodexClient {
         {
             Ok(value) => Ok(value),
             Err(error) => {
+                if matches!(error, JsonlError::Remote { .. }) {
+                    return Err(ClientError::RemoteRejected {
+                        class: remote_rejection_class(method),
+                    });
+                }
                 if error.is_desync() {
                     self.state.poison();
                     // A server request can be interleaved with any ordinary
@@ -3018,6 +3039,13 @@ mod tests {
         assert_eq!(
             ClientError::AuthTokensRefreshUnavailable.class(),
             "auth_refresh_unavailable"
+        );
+        assert_eq!(
+            ClientError::RemoteRejected {
+                class: remote_rejection_class("account/rateLimits/read")
+            }
+            .class(),
+            "rate_limits_read_rejected"
         );
     }
 
