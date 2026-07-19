@@ -4,7 +4,7 @@ A Rust runner for the pinned Codex Spark app-server protocol, with a loopback HT
 
 ## Status
 
-CP6 offline remediation was accepted at `ad2952cdf3e0ad1a4921c2d6fd64925e10eb7c7e` and squash-merged by PR [#6](https://github.com/PavelLizunov/spark-runner/pull/6) as `072b777b290a2dddc7c38009de438c4173db99b2`. GitHub Actions runs [29281701984](https://github.com/PavelLizunov/spark-runner/actions/runs/29281701984) and [29281705056](https://github.com/PavelLizunov/spark-runner/actions/runs/29281705056) passed with 76 offline tests. The current tree passes 80 offline tests on `uap-build-1`; CI validation is pending. Controlled live UAT currently stops before `thread/start` because pinned Codex `0.144.3` returns JSON-RPC internal error `-32603` from `account/rateLimits/read`. Spark entitlement is visible in the product UI; no fallback was used and no live turn started.
+CP6 offline remediation was accepted at `ad2952cdf3e0ad1a4921c2d6fd64925e10eb7c7e` and squash-merged by PR [#6](https://github.com/PavelLizunov/spark-runner/pull/6) as `072b777b290a2dddc7c38009de438c4173db99b2`. GitHub Actions runs [29281701984](https://github.com/PavelLizunov/spark-runner/actions/runs/29281701984) and [29281705056](https://github.com/PavelLizunov/spark-runner/actions/runs/29281705056) passed with 76 offline tests. The integration-ready candidate passes 80 offline tests and a controlled live doctor on `uap-build-1` using pinned Codex `0.144.6`, the explicit VPN egress, and exact model `gpt-5.3-codex-spark`; the turn completed with no fallback or leaked process. CI validation for the candidate is pending.
 
 ## Safe offline checks
 

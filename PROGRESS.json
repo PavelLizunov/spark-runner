@@ -3,19 +3,11 @@
   "repo": "PavelLizunov/spark-runner",
   "current_checkpoint": "CP6",
   "previous_checkpoint": "CP5",
-  "state": "partial",
+  "state": "active",
   "completed_checkpoints": [],
-  "blocker": {
-    "code": "rate_limits_read_internal_error",
-    "host": "uap-build-1",
-    "required_model": "gpt-5.3-codex-spark",
-    "fallback_model_used": false,
-    "observed_at": "2026-07-19T20:34:55Z",
-    "remote_code": -32603,
-    "summary": "Controlled live admission reached the authenticated pinned app-server, but account/rateLimits/read returned JSON-RPC internal error -32603. The owner confirmed Spark entitlement in the product UI. No thread or model turn was started."
-  },
-  "updated_at": "2026-07-19T20:36:12Z",
-  "next_command": "Owner decision required: update the pinned Codex runtime from 0.144.3 to current patch 0.144.6 and regenerate its schema/hash, or explicitly authorize one diagnostic UAT that bypasses only the failing quota-read gate. Do not weaken the production gate or substitute another model.",
+  "blocker": null,
+  "updated_at": "2026-07-19T21:57:21Z",
+  "next_command": "Push fix/integration-ready, open a draft PR to main, and require the offline GitHub Actions validation before marking CP6 complete.",
   "checkpoints": {
     "CP1": {
       "name": "Phase 0 bootstrap: raw app-server + Python SDK oracle",
@@ -88,16 +80,21 @@
         "offline_test_count": 76
       },
       "integration_ready_candidate": {
-        "commit": "30efa5c441e7e015992db39a8ad42c989a00f397",
+        "commit": "3e54de89acdd01dcffc5140da41360d5f0bf6281",
         "offline_test_count": 80,
         "live_uat": {
           "host": "uap-build-1",
-          "status": "blocked",
-          "failure_classification": "rate_limits_read_internal_error",
-          "remote_code": -32603,
+          "status": "passed",
+          "observed_at": "2026-07-19T21:57:21Z",
+          "codex_version": "0.144.6",
+          "egress_proxy": "192.168.0.202:30880",
+          "failure_classification": null,
+          "remote_code": null,
           "required_model": "gpt-5.3-codex-spark",
           "fallback_model_used": false,
-          "turn_started": false
+          "turn_started": true,
+          "turn_status": "completed",
+          "process_cleanup": "clean"
         }
       }
     },

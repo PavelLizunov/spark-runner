@@ -1,6 +1,6 @@
 # CP6 — local HTTP/SSE adapter
 
-Status: **blocked**. The integration-ready candidate passed offline gates, but the pinned app-server returns an internal error from its rate-limit read before a live thread can start.
+Status: **ready for CI**. The integration-ready candidate passed the complete offline gate and one controlled live Spark turn on `uap-build-1`; CP6 remains open until the candidate PR is green and merged.
 
 ## Accepted remediation
 
@@ -14,20 +14,22 @@ The accepted remediation's deterministic fake-fixture suite passed 76 tests. It 
 
 ## Integration-ready candidate
 
-- Candidate commit: `30efa5c441e7e015992db39a8ad42c989a00f397`.
+- Live-tested code commit: `3e54de89acdd01dcffc5140da41360d5f0bf6281`.
 - Build host: 8 logical CPUs, 11 GiB RAM with about 10 GiB available, and 53 GiB free disk; resource capacity is sufficient.
 - Native build-host gates: formatting, clippy with warnings denied, 80 offline tests, and locked release build passed.
-- The pinned Codex `0.144.3` native binary and checked-in schema matched their locked SHA-256 values.
+- The pinned Codex `0.144.6` native binary and regenerated checked-in schema matched their locked SHA-256 values.
 - Subscription OAuth was selected explicitly from an owner-only regular file. No credential value was copied into the repository, output, evidence, or CI.
 
 ## Controlled live UAT
 
-The initial conclusion that Spark entitlement was absent was incorrect: preview models are not reliably represented by the app-server catalog, and the owner confirmed both the model and its unused separate quota in the product UI. The runner now uses `model/list` only as a protocol-health read; the subsequent `thread/start` remains the authoritative exact-model/no-fallback gate.
+The initial conclusion that Spark entitlement was absent was incorrect: preview models are not reliably represented by the app-server catalog, and the owner confirmed both the model and its unused separate quota in the product UI. The runner uses `model/list` only as a protocol-health read; `thread/start` is the authoritative exact-model/no-fallback gate.
 
-Live diagnosis then exposed the actual blocker: pinned Codex `0.144.3` returns JSON-RPC internal error `-32603` from `account/rateLimits/read`, including after the request was corrected to the schema's parameterless shape. The current published patch is `0.144.6`. No `thread/start`, model turn, fallback model, or approval occurred.
+The `-32603` rate-limit failure was caused by the runner's intentionally cleared child environment also removing the required RU egress settings. The host shell already used the cluster VLESS gateway, but `codex app-server` did not inherit it. The runner now accepts only an explicit `SPARK_RUNNER_EGRESS_PROXY`, rejects credential-bearing or malformed URLs, and passes the validated endpoint to the child as standard HTTP(S) proxy variables. No UAP, VPNRouter, k3s, or routing configuration was changed.
 
-Per `MISSION.md`, another model must not be substituted and the production quota gate must not be silently weakened. The next action requires an owner decision: update and repin Codex `0.144.6`, or authorize one diagnostic-only turn that bypasses the failing quota read.
+The next admission failure, `quota_unavailable`, was a local interpretation bug: `credits.hasCredits=false` means there are no separately purchased credits, not that subscription usage is exhausted. Admission now relies on the explicit reached type and every advertised usage window; a reached type or `usedPercent >= 100` still fails closed. The observed snapshot had available General and separate Spark windows.
+
+With `SPARK_RUNNER_EGRESS_PROXY=http://192.168.0.202:30880`, the release binary completed `doctor --live` using exact model `gpt-5.3-codex-spark`. Terminal status was `completed`, no fallback or approval occurred, and pre/post process checks were clean.
 
 ## Residual live risk
 
-Authenticated bootstrap, account read, and model-catalog RPC were exercised, but a real thread/turn and operational service behavior could not be tested because the rate-limit RPC failed before `thread/start`. CP6 is not complete, and CP7 remains pending.
+The one-process doctor path is now proven online. GitHub Actions for the candidate, merge, service-level HTTP/SSE integration against each real consumer, and the CP7 service/soak/release gates remain pending.
