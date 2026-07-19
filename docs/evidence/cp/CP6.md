@@ -1,6 +1,6 @@
 # CP6 — local HTTP/SSE adapter
 
-Status: **ready for CI**. The integration-ready candidate passed the complete offline gate and one controlled live Spark turn on `uap-build-1`; CP6 remains open until the candidate PR is green and merged.
+Status: **ready for CI**. The integration-ready candidate passed the complete offline gate and one controlled live Spark turn on `uap-build-1`; draft PR [#9](https://github.com/PavelLizunov/spark-runner/pull/9) remains open until required CI is green and the owner approves merge.
 
 ## Accepted remediation
 

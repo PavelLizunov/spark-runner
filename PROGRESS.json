@@ -7,7 +7,7 @@
   "completed_checkpoints": [],
   "blocker": null,
   "updated_at": "2026-07-19T21:57:21Z",
-  "next_command": "Push fix/integration-ready, open a draft PR to main, and require the offline GitHub Actions validation before marking CP6 complete.",
+  "next_command": "Wait for required GitHub Actions on PR #9, address any failure without weakening the gates, then mark ready for owner review.",
   "checkpoints": {
     "CP1": {
       "name": "Phase 0 bootstrap: raw app-server + Python SDK oracle",
@@ -81,6 +81,7 @@
       },
       "integration_ready_candidate": {
         "commit": "3e54de89acdd01dcffc5140da41360d5f0bf6281",
+        "pull_request": "https://github.com/PavelLizunov/spark-runner/pull/9",
         "offline_test_count": 80,
         "live_uat": {
           "host": "uap-build-1",
