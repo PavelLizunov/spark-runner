@@ -19,6 +19,8 @@ use crate::state::{ApprovalDecision, ApprovalSource, InternalEvent, SessionState
 pub const REQUIRED_MODEL: &str = "gpt-5.3-codex-spark";
 const MAX_SEEN_APPROVALS: usize = 256;
 const MAX_SEEN_APPROVAL_BYTES: usize = 16 * 1024;
+const MAX_MODEL_LIST_PAGES: usize = 32;
+const MAX_MODEL_CURSOR_LEN: usize = 4096;
 
 /// The child controls both JSON-RPC request ids and approval identifiers.
 /// Keep only fixed-size opaque keys and bound the duplicate detector so a
@@ -953,7 +955,8 @@ impl CodexClient {
     }
 
     pub async fn model_list(&mut self) -> Result<Value, ClientError> {
-        self.rpc_call("model/list", json!({})).await
+        self.rpc_call("model/list", json!({ "includeHidden": true }))
+            .await
     }
 
     pub async fn rate_limits_read(&mut self) -> Result<Value, ClientError> {
@@ -968,8 +971,31 @@ impl CodexClient {
         if account.pointer("/account/type").and_then(Value::as_str) != Some("chatgpt") {
             return Err(ClientError::ChatGptAuthRequired);
         }
-        let models = self.model_list().await?;
-        let has_required_model = model_list_contains_required_model(&models);
+        let mut models = self.model_list().await?;
+        let mut has_required_model = false;
+        for _ in 0..MAX_MODEL_LIST_PAGES {
+            if model_list_contains_required_model(&models) {
+                has_required_model = true;
+                break;
+            }
+            let Some(cursor) = models.get("nextCursor") else {
+                break;
+            };
+            if cursor.is_null() {
+                break;
+            }
+            let Some(cursor) = cursor.as_str().filter(|cursor| cursor.len() <= MAX_MODEL_CURSOR_LEN)
+            else {
+                self.state.poison();
+                return Err(ClientError::SessionPoisoned);
+            };
+            models = self
+                .rpc_call(
+                    "model/list",
+                    json!({ "cursor": cursor, "includeHidden": true }),
+                )
+                .await?;
+        }
         if !has_required_model {
             return Err(fallback_model(
                 "missing_from_model_list",
