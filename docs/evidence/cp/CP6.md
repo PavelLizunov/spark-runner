@@ -1,6 +1,6 @@
 # CP6 — local HTTP/SSE adapter
 
-Status: **blocked**. The integration-ready candidate passed offline gates, but controlled live admission showed that the required model is unavailable to the authenticated build-host account.
+Status: **blocked**. The integration-ready candidate passed offline gates, but the pinned app-server returns an internal error from its rate-limit read before a live thread can start.
 
 ## Accepted remediation
 
@@ -14,7 +14,7 @@ The accepted remediation's deterministic fake-fixture suite passed 76 tests. It 
 
 ## Integration-ready candidate
 
-- Candidate commit: `0d32fbd0ef2100a8cae05d7f310370bc8c01e218`.
+- Candidate commit: `30efa5c441e7e015992db39a8ad42c989a00f397`.
 - Build host: 8 logical CPUs, 11 GiB RAM with about 10 GiB available, and 53 GiB free disk; resource capacity is sufficient.
 - Native build-host gates: formatting, clippy with warnings denied, 80 offline tests, and locked release build passed.
 - The pinned Codex `0.144.3` native binary and checked-in schema matched their locked SHA-256 values.
@@ -22,10 +22,12 @@ The accepted remediation's deterministic fake-fixture suite passed 76 tests. It 
 
 ## Controlled live UAT
 
-The live doctor reached authenticated model admission on `uap-build-1`, then failed closed with `required_model_unavailable`: `gpt-5.3-codex-spark` was absent from `model/list`. The same admission blocker was confirmed three times after correcting the initially omitted explicit auth-file selector. No `thread/start`, model turn, fallback model, or approval occurred.
+The initial conclusion that Spark entitlement was absent was incorrect: preview models are not reliably represented by the app-server catalog, and the owner confirmed both the model and its unused separate quota in the product UI. The runner now uses `model/list` only as a protocol-health read; the subsequent `thread/start` remains the authoritative exact-model/no-fallback gate.
 
-Per `MISSION.md`, another model must not be substituted. The next action is an owner decision or restoration of the exact Spark model entitlement, followed by one controlled rerun.
+Live diagnosis then exposed the actual blocker: pinned Codex `0.144.3` returns JSON-RPC internal error `-32603` from `account/rateLimits/read`, including after the request was corrected to the schema's parameterless shape. The current published patch is `0.144.6`. No `thread/start`, model turn, fallback model, or approval occurred.
+
+Per `MISSION.md`, another model must not be substituted and the production quota gate must not be silently weakened. The next action requires an owner decision: update and repin Codex `0.144.6`, or authorize one diagnostic-only turn that bypasses the failing quota read.
 
 ## Residual live risk
 
-Authenticated bootstrap and model admission were exercised, but a real thread/turn and operational service behavior could not be tested because admission failed before `thread/start`. CP6 is not complete, and CP7 remains pending.
+Authenticated bootstrap, account read, and model-catalog RPC were exercised, but a real thread/turn and operational service behavior could not be tested because the rate-limit RPC failed before `thread/start`. CP6 is not complete, and CP7 remains pending.
