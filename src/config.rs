@@ -15,9 +15,9 @@ pub const DEFAULT_CODEX_LOCK: &str = "codex.lock";
 /// explicitly; the launcher retains its verified handle through provisioning.
 pub const SUBSCRIPTION_AUTH_FILE_ENV: &str = "SPARK_RUNNER_SUBSCRIPTION_AUTH_FILE";
 const EXPECTED_CODEX_TRANSPORT: &str = "stdio";
-const EXPECTED_CODEX_VERSION: &str = "0.144.3";
+const EXPECTED_CODEX_VERSION: &str = "0.144.6";
 const EXPECTED_CODEX_SCHEMA_PATH: &str =
-    "protocol/0.144.3/codex_app_server_protocol.v2.schemas.json";
+    "protocol/0.144.6/codex_app_server_protocol.v2.schemas.json";
 const PLACEHOLDER_SCHEMA_HASH: &str = "generated-after-implementation";
 
 /// A verified live executable kept open from byte verification through spawn.
@@ -571,7 +571,7 @@ pub fn ephemeral_cwd() -> Result<PathBuf, ConfigError> {
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     let dir = env::temp_dir().join(format!("spark-runner-{}-{unique}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(ConfigError::EphemeralDir)?;
+    std::fs::create_dir(&dir).map_err(ConfigError::EphemeralDir)?;
     Ok(dir)
 }
 
@@ -645,7 +645,7 @@ mod tests {
         let vendor = root.join("vendor/test/bin");
         fs::create_dir_all(&vendor).expect("vendor");
         let native = vendor.join("codex");
-        fs::write(&native, b"#!/bin/sh\necho codex-cli 0.144.3\n").expect("native");
+        fs::write(&native, b"#!/bin/sh\necho codex-cli 0.144.6\n").expect("native");
         let mut permissions = fs::metadata(&native).expect("metadata").permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&native, permissions).expect("chmod");
@@ -695,7 +695,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn checked_native_runtime_and_generated_schema_match_before_spawn() {
-        let fixture = hermetic_lock_fixture("0.144.3");
+        let fixture = hermetic_lock_fixture("0.144.6");
         let verified = fixture
             .lock
             .verify_for_spawn()
@@ -711,7 +711,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn platform_schema_and_version_mismatches_fail_closed() {
-        let fixture = hermetic_lock_fixture("0.144.3");
+        let fixture = hermetic_lock_fixture("0.144.6");
 
         let mut wrong_platform = fixture.lock.clone();
         wrong_platform.platform = "definitely-not-this-host".to_string();
@@ -749,7 +749,7 @@ mod tests {
         let vendor = root.join("vendor/test/bin");
         fs::create_dir_all(&vendor).expect("vendor");
         let native = vendor.join("codex");
-        let original = b"#!/bin/sh\necho codex-cli 0.144.3\n";
+        let original = b"#!/bin/sh\necho codex-cli 0.144.6\n";
         fs::write(&native, original).expect("original executable");
         let mut permissions = fs::metadata(&native).expect("metadata").permissions();
         permissions.set_mode(0o700);
@@ -776,7 +776,7 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(
             String::from_utf8_lossy(&output.stdout).trim(),
-            "codex-cli 0.144.3"
+            "codex-cli 0.144.6"
         );
         let _ = fs::remove_dir_all(root);
     }

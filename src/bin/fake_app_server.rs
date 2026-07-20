@@ -117,6 +117,7 @@ fn main() -> io::Result<()> {
     let barrier_phase = arg_value(&args, "--barrier-phase");
     let barrier_marker = arg_value(&args, "--barrier-marker").map(PathBuf::from);
     let codex_home_marker = arg_value(&args, "--codex-home-marker").map(PathBuf::from);
+    let thread_cwd_marker = arg_value(&args, "--thread-cwd-marker").map(PathBuf::from);
     if let Some(marker) = arg_value(&args, "--pid-marker") {
         std::fs::write(marker, std::process::id().to_string())?;
     }
@@ -192,7 +193,7 @@ fn main() -> io::Result<()> {
                     &json!({
                     "id": id,
                     "result": {
-                        "serverInfo": { "name": "fake-codex-app-server", "version": "0.144.3" }
+                        "serverInfo": { "name": "fake-codex-app-server", "version": "0.144.6" }
                     }
                     }),
                 )?;
@@ -254,6 +255,13 @@ fn main() -> io::Result<()> {
                     }
                 }),
             )?,
+            "account/rateLimits/read" if request.get("params").is_some() => send(
+                &mut stdout,
+                &json!({
+                    "id": id,
+                    "error": { "code": -32602, "message": "params must be null" }
+                }),
+            )?,
             "account/rateLimits/read" => send(
                 &mut stdout,
                 &json!({
@@ -285,6 +293,13 @@ fn main() -> io::Result<()> {
                 }),
             )?,
             "thread/start" => {
+                if let Some(marker) = thread_cwd_marker.as_ref() {
+                    let cwd = params
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    std::fs::write(marker, cwd.as_bytes())?;
+                }
                 thread_counter += 1;
                 let thread_id = format!("fake-thread-{thread_counter}");
                 let model = params
@@ -299,7 +314,7 @@ fn main() -> io::Result<()> {
                         "result": {
                             "thread": {
                                 "id": thread_id,
-                                "cliVersion": "0.144.3",
+                                "cliVersion": "0.144.6",
                                 "createdAt": 1,
                                 "updatedAt": 1,
                                 "cwd": "/tmp",
@@ -327,7 +342,7 @@ fn main() -> io::Result<()> {
                         "params": {
                             "thread": {
                                 "id": thread_id,
-                                "cliVersion": "0.144.3",
+                                "cliVersion": "0.144.6",
                                 "createdAt": 1,
                                 "updatedAt": 1,
                                 "cwd": "/tmp",

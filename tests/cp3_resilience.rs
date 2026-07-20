@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use spark_runner::orchestrator::run_doctor_with_fake_server_args;
-use spark_runner::process::{ChildProcess, STDERR_TAIL_BYTES};
+use spark_runner::process::{ChildProcess, EGRESS_PROXY_ENV, STDERR_TAIL_BYTES};
 use tokio::io::AsyncReadExt;
 
 fn unique_marker_path(label: &str) -> PathBuf {
@@ -212,6 +212,7 @@ async fn t08_child_environment_excludes_secret_canaries_and_uses_private_codex_h
     for (name, value) in &canaries {
         std::env::set_var(name, value);
     }
+    std::env::set_var(EGRESS_PROXY_ENV, "http://127.0.0.1:30880");
     let spawned = ChildProcess::spawn("/usr/bin/env", &[], Some(&cwd)).expect("spawn env fixture");
     let mut stdout = spawned.stdout;
     let mut bytes = Vec::new();
@@ -224,12 +225,22 @@ async fn t08_child_environment_excludes_secret_canaries_and_uses_private_codex_h
     for (name, _) in &canaries {
         std::env::remove_var(name);
     }
+    std::env::remove_var(EGRESS_PROXY_ENV);
 
     let output = String::from_utf8(bytes).expect("env is UTF-8");
     for (_, value) in &canaries[..4] {
         assert!(
             !output.contains(value),
             "secret canary reached child: {value}"
+        );
+    }
+    assert!(!output.lines().any(|line| line.starts_with("SPARK_RUNNER_")));
+    for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+        assert!(
+            output
+                .lines()
+                .any(|line| line == format!("{name}=http://127.0.0.1:30880")),
+            "validated egress was not passed as {name}"
         );
     }
     let codex_home = output
@@ -245,6 +256,12 @@ async fn t08_child_environment_excludes_secret_canaries_and_uses_private_codex_h
             & 0o777,
         0o700
     );
+    std::env::set_var(EGRESS_PROXY_ENV, "http://user:secret@127.0.0.1:30880");
+    let error = ChildProcess::spawn("/usr/bin/env", &[], None)
+        .err()
+        .expect("credential-bearing proxy URLs must be rejected");
+    std::env::remove_var(EGRESS_PROXY_ENV);
+    assert_eq!(error.to_string(), "invalid explicit egress proxy");
     let _ = std::fs::remove_dir_all(cwd);
 }
 

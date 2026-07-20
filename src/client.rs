@@ -93,9 +93,32 @@ pub enum ClientError {
     TurnDeadlineExceeded,
     #[error("app-server requested ChatGPT token refresh but the runtime owner has no bounded refresh response")]
     AuthTokensRefreshUnavailable,
+    #[error("app-server rejected an RPC request (class={class}, code={code:?}; diagnostic payload suppressed)")]
+    RemoteRejected {
+        class: &'static str,
+        code: Option<i64>,
+    },
 }
 
 impl ClientError {
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::FallbackModel { .. } => "required_model_unavailable",
+            Self::ChatGptAuthRequired => "chatgpt_auth_required",
+            Self::QuotaUnavailable => "quota_unavailable",
+            Self::AuthTokensRefreshUnavailable => "auth_refresh_unavailable",
+            Self::RemoteRejected { class, .. } => class,
+            _ => "protocol_failure",
+        }
+    }
+
+    pub fn remote_code(&self) -> Option<i64> {
+        match self {
+            Self::RemoteRejected { code, .. } => *code,
+            _ => None,
+        }
+    }
+
     /// Whether this error is a JSONL protocol desync (oversized/malformed
     /// frame or an unexpected response id) that poisoned the session and may
     /// be worth a single controlled app-server restart. Other failures
@@ -122,6 +145,25 @@ fn fallback_model(class: &'static str, observed: &str) -> ClientError {
         class,
         hash: remote_value_hash(observed),
         required: REQUIRED_MODEL,
+    }
+}
+
+fn remote_rejection_class(method: &str, code: Option<i64>) -> &'static str {
+    if method == "account/rateLimits/read" {
+        return match code {
+            Some(-32601) => "rate_limits_method_not_found",
+            Some(-32602) => "rate_limits_params_rejected",
+            _ => "rate_limits_read_rejected",
+        };
+    }
+    match method {
+        "initialize" => "initialize_rejected",
+        "account/read" => "account_read_rejected",
+        "model/list" => "model_list_rejected",
+        "thread/start" => "thread_start_rejected",
+        "turn/start" => "turn_start_rejected",
+        "turn/interrupt" => "turn_interrupt_rejected",
+        _ => "rpc_rejected",
     }
 }
 
@@ -182,7 +224,7 @@ pub struct PendingApproval {
     pub method: String,
     pub descriptor: ApprovalDescriptor,
     /// A permission grant is permitted only when the exact requested profile
-    /// passed the bounded 0.144.3-shaped validation below.
+    /// passed the bounded 0.144.6-shaped validation below.
     pub allow_permitted: bool,
     /// The owner, not a detached client future, owns expiry.  This lets the
     /// same cancellation command deny, interrupt, await terminal completion,
@@ -290,13 +332,13 @@ pub struct RequestedFileSystemPermission {
 }
 
 /// The authority-bearing fields of every server approval request supported by
-/// the pinned 0.144.3 protocol schema.  This is deliberately explicit rather
+/// the pinned 0.144.6 protocol schema.  This is deliberately explicit rather
 /// than inferred from a generic JSON object: an added field must be placed in
 /// one of these buckets before it can become approvable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApprovalSchemaMatrixEntry {
     pub method: &'static str,
-    /// Every top-level field declared by the pinned 0.144.3 request schema.
+    /// Every top-level field declared by the pinned 0.144.6 request schema.
     /// An extension is deny-only, even when a generated schema would accept
     /// it, until it has been classified in this matrix. This prevents a newer
     /// authority-bearing field from being silently ignored by an old owner.
@@ -453,6 +495,45 @@ fn approval_schema_variant(method: &str) -> Option<&'static ApprovalSchemaMatrix
     APPROVAL_SCHEMA_MATRIX
         .iter()
         .find(|variant| variant.method == method)
+}
+
+fn approval_route_matches(
+    method: &str,
+    params: &Value,
+    active_thread_id: Option<&str>,
+    active_turn_id: Option<&str>,
+) -> bool {
+    let Some(schema) = approval_schema_variant(method) else {
+        return false;
+    };
+    let Some(thread_id) = active_thread_id else {
+        return false;
+    };
+    let Some(turn_id) = active_turn_id else {
+        return false;
+    };
+
+    (!schema.schema_fields.contains(&"threadId")
+        || params.get("threadId").and_then(Value::as_str) == Some(thread_id))
+        && (!schema.schema_fields.contains(&"turnId")
+            || params.get("turnId").and_then(Value::as_str) == Some(turn_id))
+        && (!schema.schema_fields.contains(&"conversationId")
+            || params.get("conversationId").and_then(Value::as_str) == Some(thread_id))
+}
+
+fn terminal_route_matches(
+    params: &Value,
+    active_thread_id: Option<&str>,
+    active_turn_id: Option<&str>,
+) -> bool {
+    params.get("threadId").and_then(Value::as_str) == active_thread_id
+        && params
+            .get("turn")
+            .and_then(|turn| turn.get("id"))
+            .and_then(Value::as_str)
+            == active_turn_id
+        && active_thread_id.is_some()
+        && active_turn_id.is_some()
 }
 
 /// Keep the schema list honest: every top-level request field must be mapped
@@ -731,11 +812,19 @@ pub struct CodexClient {
     rpc: JsonlClient,
     process: ChildProcess,
     state: SessionState,
+    active_thread_id: Option<String>,
+    active_turn_id: Option<String>,
     approval_policy: ApprovalPolicy,
     auth_refresh_policy: AuthRefreshPolicy,
     /// Requests can arrive while any ordinary RPC is awaited.  Keep this
     /// shared with that dispatch path so an id can never receive two answers.
     seen_approvals: Arc<Mutex<SeenApprovals>>,
+}
+
+#[derive(Clone, Copy)]
+struct ActiveRoute<'a> {
+    thread_id: Option<&'a str>,
+    turn_id: Option<&'a str>,
 }
 
 impl CodexClient {
@@ -753,10 +842,28 @@ impl CodexClient {
         stdout: tokio::process::ChildStdout,
         approval_policy: ApprovalPolicy,
     ) -> Self {
+        Self::with_approval_policy_and_timeout(
+            process,
+            stdin,
+            stdout,
+            approval_policy,
+            crate::jsonl::DEFAULT_WAIT_TIMEOUT,
+        )
+    }
+
+    pub fn with_approval_policy_and_timeout(
+        process: ChildProcess,
+        stdin: tokio::process::ChildStdin,
+        stdout: tokio::process::ChildStdout,
+        approval_policy: ApprovalPolicy,
+        wait_timeout: Duration,
+    ) -> Self {
         Self {
-            rpc: JsonlClient::new(stdin, stdout),
+            rpc: JsonlClient::with_timeout(stdin, stdout, wait_timeout),
             process,
             state: SessionState::new(),
+            active_thread_id: None,
+            active_turn_id: None,
             approval_policy,
             auth_refresh_policy: AuthRefreshPolicy::Unavailable,
             seen_approvals: Arc::new(Mutex::new(SeenApprovals::default())),
@@ -790,6 +897,8 @@ impl CodexClient {
         let approval_policy = self.approval_policy.clone();
         let auth_refresh_policy = self.auth_refresh_policy.clone();
         let seen_approvals = Arc::clone(&self.seen_approvals);
+        let active_thread_id = self.active_thread_id.clone();
+        let active_turn_id = self.active_turn_id.clone();
         match rpc
             .call_with_server_request_handler_and_delivery(
                 method,
@@ -799,12 +908,16 @@ impl CodexClient {
                     let approval_policy = approval_policy.clone();
                     let auth_refresh_policy = auth_refresh_policy.clone();
                     let seen_approvals = Arc::clone(&seen_approvals);
+                    let active_thread_id = active_thread_id.clone();
+                    let active_turn_id = active_turn_id.clone();
                     async move {
                         Self::dispatch_server_request_during_call(
                             rpc,
                             &approval_policy,
                             &auth_refresh_policy,
                             &seen_approvals,
+                            active_thread_id.as_deref(),
+                            active_turn_id.as_deref(),
                             message,
                         )
                         .await
@@ -816,6 +929,12 @@ impl CodexClient {
         {
             Ok(value) => Ok(value),
             Err(error) => {
+                if let JsonlError::Remote { code, .. } = &error {
+                    return Err(ClientError::RemoteRejected {
+                        class: remote_rejection_class(method, *code),
+                        code: *code,
+                    });
+                }
                 if error.is_desync() {
                     self.state.poison();
                     // A server request can be interleaved with any ordinary
@@ -862,7 +981,7 @@ impl CodexClient {
     }
 
     pub async fn rate_limits_read(&mut self) -> Result<Value, ClientError> {
-        self.rpc_call("account/rateLimits/read", json!({})).await
+        self.rpc_call("account/rateLimits/read", Value::Null).await
     }
 
     /// Admission checks shared by every live turn. They run before the first
@@ -873,28 +992,15 @@ impl CodexClient {
         if account.pointer("/account/type").and_then(Value::as_str) != Some("chatgpt") {
             return Err(ClientError::ChatGptAuthRequired);
         }
-        let models = self.model_list().await?;
-        let has_required_model = models
-            .get("data")
-            .or_else(|| models.get("models"))
-            .and_then(Value::as_array)
-            .is_some_and(|models| {
-                models
-                    .iter()
-                    .any(|model| model.get("id").and_then(Value::as_str) == Some(REQUIRED_MODEL))
-            });
-        if !has_required_model {
-            return Err(fallback_model(
-                "missing_from_model_list",
-                "missing-from-model-list",
-            ));
-        }
+        // Research-preview models can be selectable even when the app-server
+        // catalog omits them. The subsequent `thread_start` requests and verifies the
+        // exact required model, which is the authoritative no-fallback gate.
+        self.model_list().await?;
         let rate_limits = self.rate_limits_read().await?;
-        // A secondary window being available does not override an exhausted
-        // primary bucket (nor a workspace-credit exhaustion).  The native
-        // 0.144.3 response deliberately carries both the legacy single view
-        // and the metered-by-limit view; every advertised bucket must be
-        // usable before we spend a non-idempotent turn request.
+        // A secondary or model-specific window being available does not
+        // override an exhausted bucket. The native response carries both the
+        // legacy single view and the metered-by-limit view; every advertised
+        // usage window must be usable before we spend a non-idempotent turn.
         let has_quota = quota_available(&rate_limits);
         if !has_quota {
             return Err(ClientError::QuotaUnavailable);
@@ -942,6 +1048,7 @@ impl CodexClient {
         }
 
         self.state.on_thread_started()?;
+        self.active_thread_id = Some(thread_id.clone());
         Ok(ThreadStarted { thread_id, model })
     }
 
@@ -967,12 +1074,14 @@ impl CodexClient {
             .rpc_call_with_delivery("turn/start", params, delivery)
             .await?;
         self.state.on_turn_started()?;
-        result
+        let turn_id = result
             .get("turn")
             .and_then(|turn| turn.get("id"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
-            .ok_or(ClientError::MissingTurnId)
+            .ok_or(ClientError::MissingTurnId)?;
+        self.active_turn_id = Some(turn_id.clone());
+        Ok(turn_id)
     }
 
     /// Wait for the terminal `turn/completed` notification while the same
@@ -1004,8 +1113,16 @@ impl CodexClient {
                     continue;
                 }
                 if method == "turn/completed" {
-                    return self
-                        .handle_turn_completed(message.get("params").unwrap_or(&Value::Null));
+                    let params = message.get("params").unwrap_or(&Value::Null);
+                    if !terminal_route_matches(
+                        params,
+                        self.active_thread_id.as_deref(),
+                        self.active_turn_id.as_deref(),
+                    ) {
+                        self.state.poison();
+                        return Err(ClientError::SessionPoisoned);
+                    }
+                    return self.handle_turn_completed(params);
                 }
                 if method == "model/rerouted" {
                     self.state.poison();
@@ -1062,6 +1179,10 @@ impl CodexClient {
             &self.approval_policy,
             &self.auth_refresh_policy,
             &self.seen_approvals,
+            ActiveRoute {
+                thread_id: self.active_thread_id.as_deref(),
+                turn_id: self.active_turn_id.as_deref(),
+            },
             message,
         )
         .await
@@ -1073,6 +1194,7 @@ impl CodexClient {
         approval_policy: &ApprovalPolicy,
         auth_refresh_policy: &AuthRefreshPolicy,
         seen_approvals: &Arc<Mutex<SeenApprovals>>,
+        active_route: ActiveRoute<'_>,
         message: &Value,
     ) -> Result<(), ClientError> {
         let method = message
@@ -1094,6 +1216,15 @@ impl CodexClient {
         }
 
         let params = message.get("params").unwrap_or(&Value::Null);
+        if !approval_route_matches(method, params, active_route.thread_id, active_route.turn_id) {
+            rpc.respond(
+                id,
+                approval_response(method, ApprovalDecision::Deny, Some(params)),
+            )
+            .await?;
+            state.poison();
+            return Err(ClientError::SessionPoisoned);
+        }
         let request_key = approval_request_key(method, &id, params);
         let seen = seen_approvals
             .lock()
@@ -1203,6 +1334,8 @@ impl CodexClient {
         approval_policy: &ApprovalPolicy,
         auth_refresh_policy: &AuthRefreshPolicy,
         seen_approvals: &Arc<Mutex<SeenApprovals>>,
+        active_thread_id: Option<&str>,
+        active_turn_id: Option<&str>,
         message: Value,
     ) -> Result<(), ClientError> {
         let id = message
@@ -1224,6 +1357,14 @@ impl CodexClient {
             return Err(ClientError::UnknownServerRequest);
         }
         let params = message.get("params").unwrap_or(&Value::Null);
+        if !approval_route_matches(method, params, active_thread_id, active_turn_id) {
+            rpc.respond(
+                id,
+                approval_response(method, ApprovalDecision::Deny, Some(params)),
+            )
+            .await?;
+            return Err(ClientError::SessionPoisoned);
+        }
         let request_key = approval_request_key(method, &id, params);
         let seen = seen_approvals
             .lock()
@@ -1396,7 +1537,7 @@ impl CodexClient {
     }
 
     /// Interrupt the exact live turn before process cleanup.  The generated
-    /// 0.144.3 shape requires both identifiers; callers must not fabricate a
+    /// 0.144.6 shape requires both identifiers; callers must not fabricate a
     /// terminal state without making this protocol attempt.
     pub async fn turn_interrupt(
         &mut self,
@@ -1480,27 +1621,6 @@ fn rate_limit_windows(rate_limits: &Value) -> Vec<&Value> {
     windows
 }
 
-fn credits_available(rate_limits: &Value) -> bool {
-    fn snapshot_credits_available(snapshot: &Value) -> bool {
-        snapshot.get("credits").is_none_or(|credits| {
-            credits.is_null()
-                || credits
-                    .get("unlimited")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                || credits
-                    .get("hasCredits")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-        })
-    }
-    snapshot_credits_available(rate_limits.get("rateLimits").unwrap_or(&Value::Null))
-        && rate_limits
-            .get("rateLimitsByLimitId")
-            .and_then(Value::as_object)
-            .is_none_or(|by_id| by_id.values().all(snapshot_credits_available))
-}
-
 fn quota_available(rate_limits: &Value) -> bool {
     let windows = rate_limit_windows(rate_limits);
     rate_limits
@@ -1523,7 +1643,6 @@ fn quota_available(rate_limits: &Value) -> bool {
                 .and_then(Value::as_i64)
                 .is_some_and(|used| (0..100).contains(&used))
         })
-        && credits_available(rate_limits)
 }
 
 fn is_known_approval_method(method: &str) -> bool {
@@ -1609,7 +1728,7 @@ fn describe_network_approval(value: Option<&Value>) -> (Option<ApprovalNetworkAp
     )
 }
 
-/// Every accepted patch variant has exactly the keys defined by the 0.144.3
+/// Every accepted patch variant has exactly the keys defined by the 0.144.6
 /// `FileChange` union. Rejecting extensions prevents an action-bearing byte
 /// from being silently dropped from an otherwise approvable descriptor.
 fn has_exact_keys(change: &serde_json::Map<String, Value>, allowed: &[&str]) -> bool {
@@ -2059,7 +2178,7 @@ fn approval_response(method: &str, decision: ApprovalDecision, params: Option<&V
             json!({ "decision": value })
         }
         "item/permissions/requestApproval" => {
-            // 0.144.3 requires a GrantedPermissionProfile rather than a
+            // 0.144.6 requires a GrantedPermissionProfile rather than a
             // decision enum. An explicit owner Allow grants the exact
             // profile requested on this one original request; Deny/timeout
             // use an empty profile. The profile is never persisted; a bounded
@@ -2593,7 +2712,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} must be a declared schema variant", case.name));
             assert_eq!(
                 entry.schema_fields, case.schema_fields,
-                "{} must enumerate every top-level 0.144.3 schema field",
+                "{} must enumerate every top-level 0.144.6 schema field",
                 case.name
             );
             assert_eq!(
@@ -2783,7 +2902,7 @@ mod tests {
         }
     }
 
-    /// T10: canonical 0.144.3 quota admission is fail-closed.  An available
+    /// T10: canonical 0.144.6 quota admission is fail-closed.  An available
     /// secondary window never overrides an exhausted primary or an explicit
     /// reached type, and malformed snapshots do not become capacity.
     #[test]
@@ -2798,9 +2917,21 @@ mod tests {
             "rateLimitsByLimitId": null
         });
         assert!(!quota_available(&exhausted_primary));
-        assert!(!credits_available(
-            &json!({ "rateLimits": { "credits": { "hasCredits": false, "unlimited": false } } })
-        ));
+        let subscription_without_purchased_credits = json!({
+            "rateLimits": {
+                "primary": { "usedPercent": 46 },
+                "rateLimitReachedType": null,
+                "credits": { "hasCredits": false, "unlimited": false }
+            },
+            "rateLimitsByLimitId": {
+                "codex_bengalfox": {
+                    "primary": { "usedPercent": 0 },
+                    "rateLimitReachedType": null,
+                    "credits": null
+                }
+            }
+        });
+        assert!(quota_available(&subscription_without_purchased_credits));
 
         let reached = json!({
             "rateLimits": { "primary": { "usedPercent": 0 }, "rateLimitReachedType": "workspace_owner_credits_depleted", "credits": null },
@@ -2867,7 +2998,65 @@ mod tests {
         ));
     }
 
-    /// The generated 0.144.3 permissions response has no decision enum.
+    #[test]
+    fn protocol_messages_must_match_the_active_route() {
+        let approval = json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "approvalId": "approval-1",
+            "command": "pwd"
+        });
+        assert!(approval_route_matches(
+            "item/commandExecution/requestApproval",
+            &approval,
+            Some("thread-1"),
+            Some("turn-1")
+        ));
+        assert!(!approval_route_matches(
+            "item/commandExecution/requestApproval",
+            &approval,
+            Some("thread-1"),
+            Some("turn-other")
+        ));
+
+        let terminal = json!({
+            "threadId": "thread-1",
+            "turn": { "id": "turn-1", "status": "completed" }
+        });
+        assert!(terminal_route_matches(
+            &terminal,
+            Some("thread-1"),
+            Some("turn-1")
+        ));
+        assert!(!terminal_route_matches(
+            &terminal,
+            Some("thread-other"),
+            Some("turn-1")
+        ));
+    }
+
+    #[test]
+    fn admission_failures_have_safe_operator_classes() {
+        assert_eq!(
+            ClientError::ChatGptAuthRequired.class(),
+            "chatgpt_auth_required"
+        );
+        assert_eq!(ClientError::QuotaUnavailable.class(), "quota_unavailable");
+        assert_eq!(
+            ClientError::AuthTokensRefreshUnavailable.class(),
+            "auth_refresh_unavailable"
+        );
+        assert_eq!(
+            ClientError::RemoteRejected {
+                class: remote_rejection_class("account/rateLimits/read", None),
+                code: None
+            }
+            .class(),
+            "rate_limits_read_rejected"
+        );
+    }
+
+    /// The generated 0.144.6 permissions response has no decision enum.
     /// Allow must therefore preserve the requested bounded-in-flight profile,
     /// while deny remains an empty fail-closed profile.
     #[test]

@@ -8,7 +8,7 @@
 //! errors) are never retried; they fail closed on the first attempt.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -236,6 +236,19 @@ async fn spawn_client_with_launcher(
     launcher: &RuntimeLauncher,
     approval_policy: ApprovalPolicy,
 ) -> Result<(CodexClient, PathBuf), AppError> {
+    spawn_client_with_launcher_timeout(
+        launcher,
+        approval_policy,
+        crate::jsonl::DEFAULT_WAIT_TIMEOUT,
+    )
+    .await
+}
+
+async fn spawn_client_with_launcher_timeout(
+    launcher: &RuntimeLauncher,
+    approval_policy: ApprovalPolicy,
+    wait_timeout: Duration,
+) -> Result<(CodexClient, PathBuf), AppError> {
     let mut launch = launch_spec(launcher)?;
     let cwd = config::ephemeral_cwd()?;
     // `launch` stays alive across spawn. On Linux its program is an inherited
@@ -254,11 +267,12 @@ async fn spawn_client_with_launcher(
             return Err(error.into());
         }
     };
-    let client = CodexClient::with_approval_policy(
+    let client = CodexClient::with_approval_policy_and_timeout(
         spawned.process,
         spawned.stdin,
         spawned.stdout,
         approval_policy,
+        wait_timeout,
     );
     Ok((client, cwd))
 }
@@ -754,7 +768,7 @@ async fn run_controlled_flow(
         biased;
         control = controls.recv() => {
             control_received(control, control_acknowledgement)?;
-            // Both ids come from accepted 0.144.3 responses; do not
+            // Both ids come from accepted 0.144.6 responses; do not
             // synthesize a terminal state if delivery failed or its result
             // was rejected. That boundary is ambiguous and is deliberately
             // left recoverable as Unknown on restart.
@@ -834,6 +848,7 @@ pub async fn run_turn_with_launcher_controlled_with_journal(
     turn_timeout: std::time::Duration,
     controls: &mut mpsc::Receiver<RuntimeControl>,
     shared_journal: Option<JournalWriter>,
+    workspace: PathBuf,
 ) -> Result<String, AppError> {
     let live = launcher.is_live();
     let (journal, owns_journal) = match shared_journal {
@@ -870,33 +885,37 @@ pub async fn run_turn_with_launcher_controlled_with_journal(
     let approval_events_are_synchronous =
         matches!(&approval_policy, ApprovalPolicy::External { .. });
     let approval_policy = with_approval_receipt(approval_policy, journal.as_ref(), &execution_id);
-    let (mut client, cwd) = match spawn_client_with_launcher(&launcher, approval_policy).await {
-        Ok(client) => client,
-        Err(error) => {
-            let completion = append_journal(
-                journal.as_ref(),
-                JournalEvent::ExecutionCompleted {
-                    execution_id,
-                    status: ExecutionTerminalStatus::Failed,
-                },
-            )
-            .await;
-            let mut result = completion.and(Err(error));
-            if owns_journal {
-                if let Some(journal) = journal {
-                    retain_first_error(
-                        &mut result,
-                        journal.shutdown().await.map_err(AppError::from),
-                    );
+    let wait_timeout = turn_timeout
+        .saturating_add(CONTROLLED_CANCEL_TIMEOUT)
+        .saturating_add(Duration::from_secs(1));
+    let (mut client, cwd) =
+        match spawn_client_with_launcher_timeout(&launcher, approval_policy, wait_timeout).await {
+            Ok(client) => client,
+            Err(error) => {
+                let completion = append_journal(
+                    journal.as_ref(),
+                    JournalEvent::ExecutionCompleted {
+                        execution_id,
+                        status: ExecutionTerminalStatus::Failed,
+                    },
+                )
+                .await;
+                let mut result = completion.and(Err(error));
+                if owns_journal {
+                    if let Some(journal) = journal {
+                        retain_first_error(
+                            &mut result,
+                            journal.shutdown().await.map_err(AppError::from),
+                        );
+                    }
                 }
+                return result;
             }
-            return result;
-        }
-    };
+        };
     let mut control_acknowledgement = None;
     let mut result = run_controlled_flow(
         &mut client,
-        &cwd,
+        &workspace,
         &prompt,
         turn_timeout,
         controls,

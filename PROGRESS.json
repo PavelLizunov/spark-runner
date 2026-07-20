@@ -3,11 +3,11 @@
   "repo": "PavelLizunov/spark-runner",
   "current_checkpoint": "CP6",
   "previous_checkpoint": "CP5",
-  "state": "partial",
+  "state": "active",
   "completed_checkpoints": [],
   "blocker": null,
-  "updated_at": "2026-07-13T20:22:07Z",
-  "next_command": "Controlled live UAT on uap-build-1 remains pending; do not run it without separate authorization.",
+  "updated_at": "2026-07-19T22:18:08Z",
+  "next_command": "Require green GitHub Actions for the live-evidence update on PR #9, then request owner review and merge before CP7 service installation and soak.",
   "checkpoints": {
     "CP1": {
       "name": "Phase 0 bootstrap: raw app-server + Python SDK oracle",
@@ -78,6 +78,35 @@
           "https://github.com/PavelLizunov/spark-runner/actions/runs/29281705056"
         ],
         "offline_test_count": 76
+      },
+      "integration_ready_candidate": {
+        "commit": "3e54de89acdd01dcffc5140da41360d5f0bf6281",
+        "pull_request": "https://github.com/PavelLizunov/spark-runner/pull/9",
+        "offline_test_count": 80,
+        "live_uat": {
+          "host": "uap-build-1",
+          "status": "passed",
+          "observed_at": "2026-07-19T21:57:21Z",
+          "codex_version": "0.144.6",
+          "egress_proxy": "192.168.0.202:30880",
+          "failure_classification": null,
+          "remote_code": null,
+          "required_model": "gpt-5.3-codex-spark",
+          "fallback_model_used": false,
+          "turn_started": true,
+          "turn_status": "completed",
+          "process_cleanup": "clean",
+          "http_sse": {
+            "status": "passed",
+            "observed_at": "2026-07-19T22:18:08Z",
+            "invalid_token": "rejected",
+            "happy_path_terminal": "completed",
+            "sse_disconnect_terminal": "interrupted",
+            "explicit_interrupt_terminal": "interrupted",
+            "thread_cleanup": "clean",
+            "readiness_after_tests": "ready"
+          }
+        }
       }
     },
     "CP7": {

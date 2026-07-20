@@ -16,7 +16,6 @@ jobs:
           python3 -c "import json; json.load(open('PROGRESS.json'))"
           python3 -c "import json; json.load(open('docs/evidence/run.json'))"
           python3 -c "import json; json.load(open('protocol/0.142.0/stable.schema.json'))"
-          python3 -c "import json; json.load(open('protocol/0.144.3/codex_app_server_protocol.v2.schemas.json'))"
           python3 - <<'PY'
           import hashlib
           import json
@@ -24,6 +23,8 @@ jobs:
           with open("codex.lock", "r", encoding="utf-8") as handle:
               lock = json.load(handle)
           path = lock["schema_path"]
+          with open(path, "r", encoding="utf-8") as handle:
+              json.load(handle)
           actual = hashlib.sha256(open(path, "rb").read()).hexdigest()
           if actual != lock["schema_hash"]:
               raise SystemExit(f"{path}: SHA-256 does not match codex.lock")

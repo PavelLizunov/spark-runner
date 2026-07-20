@@ -2,6 +2,9 @@
 //! binary, which reuses [`jsonl::MAX_FRAME_LEN`]). The `spark-runner` binary
 //! also uses this crate directly.
 
+#[cfg(not(target_os = "linux"))]
+compile_error!("spark-runner supports Linux only");
+
 pub mod api;
 pub mod client;
 pub mod config;

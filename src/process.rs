@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use crate::config::VerifiedSubscriptionAuth;
 
 pub const STDERR_TAIL_BYTES: usize = 16 * 1024;
+pub const EGRESS_PROXY_ENV: &str = "SPARK_RUNNER_EGRESS_PROXY";
 /// Upper bound on kill/wait and stderr-task join during shutdown, so cleanup
 /// can never hang even if a process-group kill somehow fails to land.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -90,6 +91,11 @@ fn configure_environment(
             command.env(name, value);
         }
     }
+    if let Some(proxy) = explicit_egress_proxy()? {
+        for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            command.env(name, &proxy);
+        }
+    }
     if let Some(dir) = cwd {
         let codex_home = dir.join("codex-home");
         std::fs::create_dir_all(&codex_home).map_err(ProcessError::CodexHome)?;
@@ -111,6 +117,32 @@ fn configure_environment(
     Ok(())
 }
 
+fn explicit_egress_proxy() -> Result<Option<String>, ProcessError> {
+    let proxy = match std::env::var(EGRESS_PROXY_ENV) {
+        Ok(proxy) => proxy,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => return Err(ProcessError::InvalidEgressProxy),
+    };
+    let authority = proxy
+        .strip_prefix("http://")
+        .or_else(|| proxy.strip_prefix("https://"))
+        .ok_or(ProcessError::InvalidEgressProxy)?;
+    if authority.is_empty()
+        || authority.contains(['/', '?', '#', '@'])
+        || authority.chars().any(char::is_whitespace)
+    {
+        return Err(ProcessError::InvalidEgressProxy);
+    }
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or(ProcessError::InvalidEgressProxy)?;
+    let valid_port = port.parse::<u16>().is_ok_and(|port| port != 0);
+    if host.is_empty() || !valid_port {
+        return Err(ProcessError::InvalidEgressProxy);
+    }
+    Ok(Some(proxy))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessError {
     #[error("failed to spawn {program}: {source}")]
@@ -125,6 +157,8 @@ pub enum ProcessError {
     SubscriptionAuth(crate::config::ConfigError),
     #[error("selected subscription auth requires a private CODEX_HOME")]
     MissingCodexHome,
+    #[error("invalid explicit egress proxy")]
+    InvalidEgressProxy,
     #[error("child process did not expose a piped {0} handle")]
     MissingHandle(&'static str),
 }

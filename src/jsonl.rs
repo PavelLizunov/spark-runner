@@ -1,6 +1,6 @@
 //! JSON-RPC-ish JSONL client over a child process's stdin/stdout.
 //!
-//! Writer sends `{"id":N,"method":"...","params":...}` lines. Reader tolerates
+//! Writer sends JSONL requests and omits `params` for parameterless methods. Reader tolerates
 //! unknown notifications while waiting for a specific response id or
 //! notification method, but poisons the session on protocol desync: an
 //! oversized frame, a malformed frame, or a response whose id does not match
@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 /// Default bound for a single response/notification wait. Generous enough for
 /// a live model turn, but short enough that a protocol desync fails loudly
 /// instead of hanging the `doctor`/`run` commands indefinitely.
-const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Upper bound on a single JSONL frame (line), measured via
 /// [`tokio::io::AsyncBufReadExt::read_line`]'s returned byte count. Protects
@@ -69,9 +69,9 @@ pub enum JsonlError {
     #[error("app-server stdout closed while waiting for a response or notification")]
     StreamClosed,
     #[error(
-        "app-server returned a remote error for request id {id} (diagnostic payload suppressed)"
+        "app-server returned a remote error for request id {id}, code {code:?} (diagnostic payload suppressed)"
     )]
-    Remote { id: u64 },
+    Remote { id: u64, code: Option<i64> },
     #[error("timed out after {0:?} waiting for an app-server response or notification")]
     Timeout(Duration),
     #[error(
@@ -206,11 +206,13 @@ impl JsonlClient {
         // pending. A conforming app-server may wait for that response before
         // returning ours; buffering it would deadlock both peers.
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let request = serde_json::json!({
+        let mut request = serde_json::json!({
             "id": id,
             "method": method,
-            "params": params,
         });
+        if !params.is_null() {
+            request["params"] = params;
+        }
         let line = serde_json::to_string(&request)?;
 
         {
@@ -235,8 +237,10 @@ impl JsonlClient {
         .map_err(|_| JsonlError::Timeout(self.wait_timeout))??;
 
         if let Some(error) = response.get("error") {
-            let _ = error;
-            return Err(JsonlError::Remote { id });
+            return Err(JsonlError::Remote {
+                id,
+                code: error.get("code").and_then(Value::as_i64),
+            });
         }
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }

@@ -35,21 +35,23 @@ async fn owner_allow_approval_completes_turn() {
     );
 }
 
-/// T11: a signed-i64 server approval may arrive while account/read is still
-/// awaited. The same owner must answer it and continue the original RPC.
+/// A signed-i64 approval before any active thread/turn has no route. The
+/// owner still answers it fail-closed, then poisons the session.
 #[tokio::test]
-async fn known_interleaved_approval_uses_owner_policy_and_preserves_i64_id() {
+async fn approval_before_an_active_turn_fails_closed() {
     let args = vec![
         "--fake-mode".to_string(),
         "approval_during_account".to_string(),
     ];
-    let summary =
+    let error =
         run_doctor_with_fake_server_args_and_approval_policy(&args, ApprovalPolicy::AllowForTests)
             .await
-            .expect("owner must answer the interleaved signed-i64 approval");
+            .expect_err("an uncorrelated approval must poison the session");
     assert!(
-        summary.contains("turn_status=completed"),
-        "summary: {summary}"
+        error
+            .to_string()
+            .contains("request was rejected and session poisoned"),
+        "error: {error}"
     );
 }
 

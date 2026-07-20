@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::body::{to_bytes, Body};
@@ -13,7 +13,10 @@ fn config() -> ApiConfig {
     ApiConfig {
         bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8787),
         bearer_token: "test-token".to_string(),
-        workspace_aliases: HashSet::from(["default".to_string(), "repo".to_string()]),
+        workspaces: HashMap::from([
+            ("default".to_string(), std::env::current_dir().unwrap()),
+            ("repo".to_string(), std::env::current_dir().unwrap()),
+        ]),
         live: false,
     }
 }
@@ -139,6 +142,16 @@ async fn rejects_payload_token_paths_wrong_model_and_large_contexts() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = request_json(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{}/turns", thread["id"].as_str().unwrap()),
+        json!({ "workspace_alias": "default", "input": "wrong target" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "WORKSPACE_MISMATCH");
 
     let too_large = "x".repeat(8 * 1024 + 1);
     let (status, _) = request_json(

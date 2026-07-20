@@ -5,20 +5,21 @@
 //! turn/approval state, SSE replay, and the command channel into the one
 //! active protocol/process execution.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::env;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{sse::Event as SseEvent, IntoResponse, Response, Sse};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::stream::BoxStream;
 use futures_util::Stream;
@@ -49,6 +50,7 @@ const MAX_TURNS: usize = 256;
 const MAX_APPROVALS: usize = 256;
 const OWNER_COMMAND_CAPACITY: usize = 128;
 const OWNER_DEADLINE: Duration = Duration::from_secs(6);
+const BOOTSTRAP_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DEFAULT_TURN_TIMEOUT_SECONDS: u64 = 120;
 
 #[derive(Debug, thiserror::Error)]
@@ -65,6 +67,8 @@ pub enum ApiError {
     DuplicateTokenSources,
     #[error("configure a non-empty SPARK_RUNNER_BEARER_TOKEN or SPARK_RUNNER_BEARER_TOKEN_FILE")]
     MissingBearerToken,
+    #[error("SPARK_RUNNER_WORKSPACES must contain alias=/absolute/directory entries")]
+    InvalidWorkspaces,
     #[error("HTTP server error: {0}")]
     Serve(std::io::Error),
 }
@@ -73,7 +77,7 @@ pub enum ApiError {
 pub struct ApiConfig {
     pub bind: SocketAddr,
     pub bearer_token: String,
-    pub workspace_aliases: HashSet<String>,
+    pub workspaces: HashMap<String, PathBuf>,
     pub live: bool,
 }
 
@@ -89,7 +93,7 @@ impl ApiConfig {
         Ok(Self {
             bind,
             bearer_token: load_token()?,
-            workspace_aliases: workspace_aliases(),
+            workspaces: workspaces()?,
             live,
         })
     }
@@ -135,17 +139,44 @@ fn validate_token_file_permissions(_path: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn workspace_aliases() -> HashSet<String> {
-    env::var("SPARK_RUNNER_WORKSPACES")
+fn workspaces() -> Result<HashMap<String, PathBuf>, ApiError> {
+    let Some(raw) = env::var("SPARK_RUNNER_WORKSPACES")
         .ok()
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|alias| !alias.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_else(|| HashSet::from(["default".to_string(), "repo".to_string()]))
+        .filter(|raw| !raw.trim().is_empty())
+    else {
+        let cwd = env::current_dir()
+            .ok()
+            .and_then(|path| path.canonicalize().ok())
+            .filter(|path| path.is_dir())
+            .ok_or(ApiError::InvalidWorkspaces)?;
+        return Ok(HashMap::from([
+            ("default".to_string(), cwd.clone()),
+            ("repo".to_string(), cwd),
+        ]));
+    };
+
+    let mut workspaces = HashMap::new();
+    for entry in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (alias, path) = entry
+            .split_once('=')
+            .filter(|(alias, path)| !alias.trim().is_empty() && !path.trim().is_empty())
+            .ok_or(ApiError::InvalidWorkspaces)?;
+        let path = PathBuf::from(path.trim())
+            .canonicalize()
+            .ok()
+            .filter(|path| path.is_absolute() && path.is_dir())
+            .ok_or(ApiError::InvalidWorkspaces)?;
+        if workspaces.insert(alias.trim().to_string(), path).is_some() {
+            return Err(ApiError::InvalidWorkspaces);
+        }
+    }
+    (!workspaces.is_empty())
+        .then_some(workspaces)
+        .ok_or(ApiError::InvalidWorkspaces)
 }
 
 #[derive(Clone)]
@@ -176,6 +207,7 @@ struct RuntimeSnapshot {
 #[derive(Clone)]
 struct ThreadRecord {
     workspace_alias: String,
+    workspace_path: PathBuf,
 }
 
 struct TurnRecord {
@@ -200,6 +232,7 @@ struct ApprovalRecord {
 
 struct OwnerState {
     snapshot: RuntimeSnapshot,
+    last_bootstrap_failure: Option<Instant>,
     // Opened once by the owner and cloned only into its active execution.
     // HTTP adapters never open, write, or shut down a journal.
     journal: Option<JournalWriter>,
@@ -224,6 +257,7 @@ impl OwnerState {
                 model: (!live).then_some(REQUIRED_MODEL),
                 quota_available: !live,
             },
+            last_bootstrap_failure: None,
             journal: None,
             next_thread: 1,
             next_turn: 1,
@@ -243,10 +277,12 @@ enum OwnerCommand {
     Snapshot(oneshot::Sender<RuntimeSnapshot>),
     CreateThread {
         workspace_alias: String,
+        workspace_path: PathBuf,
         reply: oneshot::Sender<Result<ThreadResponse, ApiRejection>>,
     },
     CreateTurn {
         thread_id: String,
+        workspace_alias: Option<String>,
         input: String,
         timeout: Duration,
         reply: oneshot::Sender<Result<TurnResponse, ApiRejection>>,
@@ -254,6 +290,10 @@ enum OwnerCommand {
     GetTurn {
         id: String,
         reply: oneshot::Sender<Result<TurnResponse, ApiRejection>>,
+    },
+    DeleteThread {
+        id: String,
+        reply: oneshot::Sender<Result<(), ApiRejection>>,
     },
     Subscribe {
         id: String,
@@ -289,7 +329,6 @@ enum OwnerCommand {
         turn_id: String,
         result: Result<String, crate::orchestrator::AppError>,
     },
-    #[allow(dead_code)]
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -330,11 +369,7 @@ impl RuntimeOwner {
         if self.tx.send(OwnerCommand::Bootstrap(reply)).await.is_err() {
             return false;
         }
-        tokio::time::timeout(OWNER_DEADLINE, response)
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(false)
+        response.await.unwrap_or(false)
     }
 
     async fn command<T>(
@@ -346,17 +381,14 @@ impl RuntimeOwner {
             .send(build(reply))
             .await
             .map_err(|_| owner_closed())?;
-        tokio::time::timeout(OWNER_DEADLINE, response)
-            .await
-            .map_err(|_| {
-                rejection(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "OWNER_TIMEOUT",
-                    "runtime owner timed out",
-                    true,
-                )
-            })?
-            .map_err(|_| owner_closed())?
+        response.await.map_err(|_| owner_closed())?
+    }
+
+    async fn shutdown(&self) {
+        let (reply, response) = oneshot::channel();
+        if self.tx.send(OwnerCommand::Shutdown(reply)).await.is_ok() {
+            let _ = response.await;
+        }
     }
 
     fn controller_dropped(&self, turn_id: String) {
@@ -384,6 +416,17 @@ async fn owner_loop(
                 // Only `serve` and explicitly injected test owners invoke
                 // this. `app(live=true)` remains inert/fail-closed, avoiding
                 // accidental real authentication attempts in unit tests.
+                if state.snapshot.ready {
+                    let _ = reply.send(true);
+                    continue;
+                }
+                if state
+                    .last_bootstrap_failure
+                    .is_some_and(|failed| failed.elapsed() < BOOTSTRAP_RETRY_DELAY)
+                {
+                    let _ = reply.send(false);
+                    continue;
+                }
                 let admitted = if ensure_owner_journal(&mut state).await.is_ok() {
                     tokio::time::timeout(OWNER_DEADLINE, bootstrap_runtime(launcher.clone()))
                         .await
@@ -408,6 +451,7 @@ async fn owner_loop(
                 state.snapshot.ready = ready;
                 state.snapshot.model = ready.then_some(REQUIRED_MODEL);
                 state.snapshot.quota_available = ready;
+                state.last_bootstrap_failure = (!ready).then(Instant::now);
                 let _ = reply.send(ready);
             }
             OwnerCommand::Snapshot(reply) => {
@@ -415,18 +459,38 @@ async fn owner_loop(
             }
             OwnerCommand::CreateThread {
                 workspace_alias,
+                workspace_path,
                 reply,
             } => {
-                let _ = reply.send(owner_create_thread(&mut state, workspace_alias));
+                if reply.is_closed() {
+                    continue;
+                }
+                let _ = reply.send(owner_create_thread(
+                    &mut state,
+                    workspace_alias,
+                    workspace_path,
+                ));
             }
             OwnerCommand::CreateTurn {
                 thread_id,
+                workspace_alias,
                 input,
                 timeout,
                 reply,
             } => {
+                if reply.is_closed() {
+                    continue;
+                }
                 let result = if ensure_owner_journal(&mut state).await.is_ok() {
-                    owner_create_turn(&mut state, &tx, launcher.clone(), thread_id, input, timeout)
+                    owner_create_turn(
+                        &mut state,
+                        &tx,
+                        launcher.clone(),
+                        thread_id,
+                        workspace_alias,
+                        input,
+                        timeout,
+                    )
                 } else {
                     state.snapshot.ready = false;
                     state.snapshot.model = None;
@@ -443,6 +507,12 @@ async fn owner_loop(
             OwnerCommand::GetTurn { id, reply } => {
                 let _ = reply.send(turn_response(&state, &id));
             }
+            OwnerCommand::DeleteThread { id, reply } => {
+                if reply.is_closed() {
+                    continue;
+                }
+                let _ = reply.send(owner_delete_thread(&mut state, &id));
+            }
             OwnerCommand::Subscribe {
                 id,
                 last_seen,
@@ -457,6 +527,9 @@ async fn owner_loop(
                 decision,
                 reply,
             } => {
+                if reply.is_closed() {
+                    continue;
+                }
                 let result = owner_decide(&mut state, &id, decision).await;
                 let _ = reply.send(result);
             }
@@ -465,6 +538,9 @@ async fn owner_loop(
                 authority,
                 reply,
             } => {
+                if reply.as_ref().is_some_and(oneshot::Sender::is_closed) {
+                    continue;
+                }
                 let result = owner_interrupt(&mut state, &turn_id, authority).await;
                 if let Some(reply) = reply {
                     let _ = reply.send(result);
@@ -527,6 +603,7 @@ async fn ensure_owner_journal(state: &mut OwnerState) -> Result<(), crate::orche
 fn owner_create_thread(
     state: &mut OwnerState,
     workspace_alias: String,
+    workspace_path: PathBuf,
 ) -> Result<ThreadResponse, ApiRejection> {
     if state.threads.len() >= MAX_THREADS {
         prune_terminal_records(state);
@@ -545,6 +622,7 @@ fn owner_create_thread(
         id.clone(),
         ThreadRecord {
             workspace_alias: workspace_alias.clone(),
+            workspace_path,
         },
     );
     Ok(ThreadResponse {
@@ -561,6 +639,7 @@ fn owner_create_turn(
     owner_tx: &mpsc::Sender<OwnerCommand>,
     launcher: RuntimeLauncher,
     thread_id: String,
+    requested_workspace_alias: Option<String>,
     input: String,
     timeout: Duration,
 ) -> Result<TurnResponse, ApiRejection> {
@@ -591,10 +670,15 @@ fn owner_create_turn(
             true,
         ));
     }
-    let workspace_alias = state
+    let (workspace_alias, workspace_path) = state
         .threads
         .get(&thread_id)
-        .map(|thread| thread.workspace_alias.clone())
+        .map(|thread| {
+            (
+                thread.workspace_alias.clone(),
+                thread.workspace_path.clone(),
+            )
+        })
         .ok_or_else(|| {
             rejection(
                 StatusCode::NOT_FOUND,
@@ -603,6 +687,17 @@ fn owner_create_turn(
                 false,
             )
         })?;
+    if requested_workspace_alias
+        .as_deref()
+        .is_some_and(|requested| requested != workspace_alias)
+    {
+        return Err(rejection(
+            StatusCode::BAD_REQUEST,
+            "WORKSPACE_MISMATCH",
+            "workspace_alias does not match the thread",
+            false,
+        ));
+    }
     let turn_id = format!("turn_{}", state.next_turn);
     state.next_turn += 1;
     state.active_turns += 1;
@@ -675,6 +770,7 @@ fn owner_create_turn(
             timeout.saturating_add(OWNER_DEADLINE),
             &mut control_rx,
             journal,
+            workspace_path,
         )
         .await;
         let _ = finished_owner_tx
@@ -691,6 +787,45 @@ fn owner_create_turn(
         workspace_alias,
         status: TurnStatus::Running,
     })
+}
+
+fn owner_delete_thread(state: &mut OwnerState, id: &str) -> Result<(), ApiRejection> {
+    if state
+        .turns
+        .values()
+        .any(|turn| turn.thread_id == id && !is_terminal(turn.status))
+    {
+        return Err(rejection(
+            StatusCode::CONFLICT,
+            "THREAD_ACTIVE",
+            "thread still has an active turn",
+            true,
+        ));
+    }
+    if state.threads.remove(id).is_none() {
+        return Err(rejection(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "thread not found",
+            false,
+        ));
+    }
+
+    let turns: Vec<String> = state
+        .turns
+        .iter()
+        .filter(|(_, turn)| turn.thread_id == id)
+        .map(|(turn_id, _)| turn_id.clone())
+        .collect();
+    for turn_id in turns {
+        if let Some(turn) = state.turns.remove(&turn_id) {
+            state.replay_bytes = state.replay_bytes.saturating_sub(turn.event_bytes);
+        }
+    }
+    state
+        .approvals
+        .retain(|_, approval| state.turns.contains_key(&approval.turn_id));
+    Ok(())
 }
 
 fn owner_subscribe(
@@ -1115,6 +1250,7 @@ fn owner_finished(
         state.snapshot.ready = false;
         state.snapshot.model = None;
         state.snapshot.quota_available = false;
+        state.last_bootstrap_failure = None;
     }
     let (status, kind, payload) = match result {
         Ok(summary) if summary.contains("turn_status=completed") => (
@@ -1382,6 +1518,7 @@ fn app_with_owner(config: ApiConfig, owner: RuntimeOwner) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/rate-limits", get(rate_limits))
         .route("/v1/threads", post(create_thread))
+        .route("/v1/threads/:id", delete(delete_thread))
         .route("/v1/threads/:id/turns", post(create_turn))
         .route("/v1/turns/:id", get(get_turn))
         .route("/v1/turns/:id/events", get(turn_events))
@@ -1428,13 +1565,7 @@ async fn health() -> Json<HealthResponse<'static>> {
 async fn ready(
     State(state): State<AppState>,
 ) -> Result<Json<HealthResponse<'static>>, ApiRejection> {
-    if state
-        .inner
-        .owner
-        .snapshot()
-        .await
-        .is_some_and(|snapshot| snapshot.ready)
-    {
+    if state.inner.owner.bootstrap().await {
         Ok(Json(HealthResponse { status: "ready" }))
     } else {
         Err(rejection(
@@ -1447,13 +1578,7 @@ async fn ready(
 }
 
 async fn runtime(State(state): State<AppState>) -> Json<RuntimeResponse> {
-    let mut aliases: Vec<String> = state
-        .inner
-        .config
-        .workspace_aliases
-        .iter()
-        .cloned()
-        .collect();
+    let mut aliases: Vec<String> = state.inner.config.workspaces.keys().cloned().collect();
     aliases.sort();
     Json(RuntimeResponse {
         runtime: "spark-runner",
@@ -1517,7 +1642,7 @@ async fn create_thread(
     Json(req): Json<CreateThreadRequest>,
 ) -> Result<Json<ThreadResponse>, ApiRejection> {
     reject_payload_token(req.bearer_token.as_deref())?;
-    validate_workspace(&state, &req.workspace_alias)?;
+    let workspace_path = workspace_path(&state, &req.workspace_alias)?;
     if req
         .model
         .as_deref()
@@ -1555,6 +1680,7 @@ async fn create_thread(
         .owner
         .command(|reply| OwnerCommand::CreateThread {
             workspace_alias: req.workspace_alias,
+            workspace_path,
             reply,
         })
         .await
@@ -1587,7 +1713,15 @@ async fn create_turn(
         ));
     }
     if let Some(alias) = req.workspace_alias.as_deref() {
-        validate_workspace(&state, alias)?;
+        workspace_path(&state, alias)?;
+    }
+    if !state.inner.owner.bootstrap().await {
+        return Err(rejection(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "RUNTIME_NOT_READY",
+            "runtime admission has not completed",
+            true,
+        ));
     }
     let timeout = Duration::from_secs(req.timeout_seconds.unwrap_or(DEFAULT_TURN_TIMEOUT_SECONDS));
     state
@@ -1595,12 +1729,25 @@ async fn create_turn(
         .owner
         .command(|reply| OwnerCommand::CreateTurn {
             thread_id,
+            workspace_alias: req.workspace_alias,
             input: req.input,
             timeout,
             reply,
         })
         .await
         .map(Json)
+}
+
+async fn delete_thread(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiRejection> {
+    state
+        .inner
+        .owner
+        .command(|reply| OwnerCommand::DeleteThread { id, reply })
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_turn(
@@ -1640,10 +1787,14 @@ async fn turn_events(
         })
         .await?;
     let replay = tokio_stream::iter(subscription.replay);
-    let live = BroadcastStream::new(subscription.receiver).filter_map(move |event| match event {
-        Ok(event) if event.id > last_seen => Some(event),
-        Ok(_) | Err(_) => None,
-    });
+    let live = BroadcastStream::new(subscription.receiver)
+        // A lagged stream must close so the client reconnects with
+        // Last-Event-ID; silently skipping would hide a protocol gap.
+        .take_while(Result::is_ok)
+        .filter_map(move |event| match event {
+            Ok(event) if event.id > last_seen => Some(event),
+            Ok(_) | Err(_) => None,
+        });
     let stream: BoxStream<'static, TurnEvent> = if subscription.terminal {
         Box::pin(replay)
     } else {
@@ -1765,7 +1916,7 @@ fn reject_payload_token(value: Option<&str>) -> Result<(), ApiRejection> {
         Ok(())
     }
 }
-fn validate_workspace(state: &AppState, alias: &str) -> Result<(), ApiRejection> {
+fn workspace_path(state: &AppState, alias: &str) -> Result<PathBuf, ApiRejection> {
     if alias.contains('/') || alias.contains('\\') || alias.contains("..") || alias.is_empty() {
         return Err(rejection(
             StatusCode::BAD_REQUEST,
@@ -1774,15 +1925,20 @@ fn validate_workspace(state: &AppState, alias: &str) -> Result<(), ApiRejection>
             false,
         ));
     }
-    if !state.inner.config.workspace_aliases.contains(alias) {
-        return Err(rejection(
-            StatusCode::BAD_REQUEST,
-            "UNKNOWN_WORKSPACE",
-            "unknown workspace alias",
-            false,
-        ));
-    }
-    Ok(())
+    state
+        .inner
+        .config
+        .workspaces
+        .get(alias)
+        .cloned()
+        .ok_or_else(|| {
+            rejection(
+                StatusCode::BAD_REQUEST,
+                "UNKNOWN_WORKSPACE",
+                "unknown workspace alias",
+                false,
+            )
+        })
 }
 
 fn push_event(
@@ -1928,10 +2084,38 @@ pub async fn serve(config: ApiConfig) -> Result<SocketAddr, ApiError> {
         .await
         .map_err(ApiError::Serve)?;
     let addr = listener.local_addr().map_err(ApiError::Serve)?;
-    axum::serve(listener, app_with_owner(config, owner))
-        .await
-        .map_err(ApiError::Serve)?;
+    tracing::info!(%addr, "serve: listening");
+    let shutdown_owner = owner.clone();
+    let result = axum::serve(listener, app_with_owner(config, owner.clone()))
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            shutdown_owner.shutdown().await;
+        })
+        .await;
+    owner.shutdown().await;
+    result.map_err(ApiError::Serve)?;
     Ok(addr)
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]

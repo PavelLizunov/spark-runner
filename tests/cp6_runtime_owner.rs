@@ -2,7 +2,7 @@
 //! app-server injected through the production owner constructor; no OAuth,
 //! network, or model call is made here.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -32,7 +32,10 @@ fn config(live: bool) -> ApiConfig {
     ApiConfig {
         bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         bearer_token: "test-token".to_string(),
-        workspace_aliases: HashSet::from(["default".to_string(), "repo".to_string()]),
+        workspaces: HashMap::from([
+            ("default".to_string(), std::env::current_dir().unwrap()),
+            ("repo".to_string(), std::env::current_dir().unwrap()),
+        ]),
         live,
     }
 }
@@ -578,9 +581,10 @@ async fn repeated_oversized_child_approval_ids_are_opaque_and_bounded() {
     cleanup(&[journal, wire_marker]);
 }
 
-/// A reroute invalidates the owner snapshot, not merely a temporary client.
+/// A reroute invalidates the owner snapshot, then /ready re-admits a fresh
+/// pinned runtime instead of leaving the service permanently unavailable.
 #[tokio::test]
-async fn reroute_failure_clears_owner_ready_model_and_quota_snapshot() {
+async fn reroute_failure_triggers_fresh_admission_on_ready() {
     let _environment = environment_lock().lock().await;
     let router = app_with_launcher(
         config(true),
@@ -596,15 +600,15 @@ async fn reroute_failure_clears_owner_ready_model_and_quota_snapshot() {
         request_json(router.clone(), "GET", "/ready", json!({}))
             .await
             .0,
-        StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::OK
     );
     let (_, models) = request_json(router.clone(), "GET", "/v1/models", json!({})).await;
-    assert_eq!(models["data"], json!([]));
+    assert_eq!(models["data"][0]["id"], "gpt-5.3-codex-spark");
     let (_, limits) = request_json(router, "GET", "/v1/rate-limits", json!({})).await;
-    assert_eq!(limits["quota_available"], false);
+    assert_eq!(limits["quota_available"], true);
 }
 
-/// 0.144.3 permission approvals carry a granted profile rather than a
+/// 0.144.6 permission approvals carry a granted profile rather than a
 /// decision string. The injected owner preserves the exact in-flight request
 /// profile for an authenticated Allow and does not fabricate a command shape.
 #[tokio::test]
@@ -706,21 +710,20 @@ async fn token_file_permissions_and_api_thread_capacity_are_enforced() {
     std::env::remove_var("SPARK_RUNNER_BEARER_TOKEN_FILE");
 
     let router = app(config(false));
+    let mut first_thread = None;
     for _ in 0..128 {
-        assert_eq!(
-            request_json(
-                router.clone(),
-                "POST",
-                "/v1/threads",
-                json!({ "workspace_alias": "repo" })
-            )
-            .await
-            .0,
-            StatusCode::OK
-        );
+        let (status, thread) = request_json(
+            router.clone(),
+            "POST",
+            "/v1/threads",
+            json!({ "workspace_alias": "repo" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        first_thread.get_or_insert_with(|| thread["id"].as_str().unwrap().to_string());
     }
     let (status, body) = request_json(
-        router,
+        router.clone(),
         "POST",
         "/v1/threads",
         json!({ "workspace_alias": "repo" }),
@@ -728,7 +731,91 @@ async fn token_file_permissions_and_api_thread_capacity_are_enforced() {
     .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(body["error"]["code"], "THREAD_CAPACITY");
+
+    let (status, _) = request_json(
+        router.clone(),
+        "DELETE",
+        &format!("/v1/threads/{}", first_thread.unwrap()),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        request_json(
+            router,
+            "POST",
+            "/v1/threads",
+            json!({ "workspace_alias": "repo" })
+        )
+        .await
+        .0,
+        StatusCode::OK,
+        "an explicitly deleted thread releases capacity"
+    );
     cleanup(&[token]);
+}
+
+#[tokio::test]
+async fn failed_bootstrap_is_retried_before_the_next_turn() {
+    let _environment = environment_lock().lock().await;
+    let marker = unique_path("bootstrap-retry", "txt");
+    let router = app_with_launcher(
+        config(true),
+        RuntimeLauncher::Fake {
+            args: vec![
+                "--fake-mode".to_string(),
+                "unknown_response_id_once".to_string(),
+                "--fail-marker".to_string(),
+                marker.display().to_string(),
+            ],
+        },
+    );
+    wait_for_marker(&marker).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    let thread = create_thread(router.clone()).await;
+    let turn = create_turn(router.clone(), &thread).await;
+    let completed = wait_event(router, &turn, "turn.completed").await;
+    assert_eq!(completed["payload"]["status"], "completed");
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap().lines().count(),
+        3,
+        "the failed bootstrap, successful admission, and turn each spawn once"
+    );
+    cleanup(&[marker]);
+}
+
+#[tokio::test]
+async fn workspace_alias_selects_the_real_thread_cwd() {
+    let _environment = environment_lock().lock().await;
+    let workspace = unique_path("mapped-workspace", "dir");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let marker = unique_path("thread-cwd", "txt");
+    let mut mapped = config(true);
+    mapped
+        .workspaces
+        .insert("repo".to_string(), workspace.clone());
+    let router = app_with_launcher(
+        mapped,
+        RuntimeLauncher::Fake {
+            args: vec![
+                "--thread-cwd-marker".to_string(),
+                marker.display().to_string(),
+            ],
+        },
+    );
+    wait_ready(router.clone()).await;
+    let thread = create_thread(router.clone()).await;
+    let turn = create_turn(router.clone(), &thread).await;
+    wait_event(router, &turn, "turn.completed").await;
+
+    assert_eq!(
+        PathBuf::from(std::fs::read_to_string(&marker).unwrap()),
+        workspace
+    );
+    cleanup(&[marker]);
+    std::fs::remove_dir(workspace).unwrap();
 }
 
 /// T08 follow-up: only an explicit owner-only fake auth file is copied into
@@ -829,6 +916,7 @@ async fn control_races_are_interrupted_or_unknown_at_the_correct_boundary() {
                     Duration::from_secs(30),
                     &mut control_rx,
                     None,
+                    std::env::current_dir().unwrap(),
                 )
                 .await
             }
@@ -910,6 +998,7 @@ async fn queued_control_wins_before_any_protocol_write() {
         Duration::from_secs(30),
         &mut control_rx,
         None,
+        std::env::current_dir().unwrap(),
     )
     .await;
 

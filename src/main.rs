@@ -16,7 +16,7 @@ async fn main() -> ExitCode {
         Command::Serve { live } => match ApiConfig::from_env(live) {
             Ok(config) => serve(config)
                 .await
-                .map(|addr| format!("serve: listening on {addr}"))
+                .map(|addr| format!("serve: stopped on {addr}"))
                 .map_err(Into::into),
             Err(err) => Err(err.into()),
         },
@@ -31,7 +31,11 @@ async fn main() -> ExitCode {
             // The CLI is a trust boundary just like HTTP and must not render
             // arbitrary diagnostics verbatim.
             let class = error_class(&err);
-            tracing::error!(class, "spark-runner failed");
+            let remote_code = match &err {
+                spark_runner::orchestrator::AppError::Client(error) => error.remote_code(),
+                _ => None,
+            };
+            tracing::error!(class, ?remote_code, "spark-runner failed");
             eprintln!("spark-runner: error: {class}");
             ExitCode::FAILURE
         }
@@ -42,7 +46,7 @@ fn error_class(error: &spark_runner::orchestrator::AppError) -> &'static str {
     match error {
         spark_runner::orchestrator::AppError::Config(_) => "configuration_failure",
         spark_runner::orchestrator::AppError::Process(_) => "process_failure",
-        spark_runner::orchestrator::AppError::Client(_) => "protocol_failure",
+        spark_runner::orchestrator::AppError::Client(error) => error.class(),
         spark_runner::orchestrator::AppError::Journal(_) => "journal_failure",
         spark_runner::orchestrator::AppError::Api(_) => "api_failure",
         spark_runner::orchestrator::AppError::EphemeralCleanup(_) => "cleanup_failure",
