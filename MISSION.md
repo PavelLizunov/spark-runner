@@ -1,131 +1,61 @@
-# Hermes mission: Spark Runner full-cycle foundation
+# Spark Runner API product mission
 
-## Owner decisions required before START
+## Current objective
 
-- Repository: `PavelLizunov/spark-runner`
-- Visibility: `public`
-- License: `Apache-2.0`
-- Build host: `uap-build-1`
-- Independent deterministic test host: GitHub Actions `ubuntu-latest`
-- Live OAuth/model tests: `uap-build-1` only; never copy auth into CI
+Finish Spark Runner as a ready-to-use project so exact Codex Spark capability can be embedded into applications through `https://ninitux.com/api`.
 
-Do not start repository creation until `codex login status`
-on build-1 is authenticated. Never silently substitute another model for `gpt-5.3-codex-spark`.
+This contract supersedes the earlier rust-foundation intake. The old references to `IMPLEMENTATION-PLAN.md`, documents `01` through `09`, `adrs/`, `reference/`, and `08-source-license-matrix.csv` are obsolete; those files are not required and their absence is not a blocker. The current repository, its open pull requests, this file, `README.md`, `PROGRESS.json`, `docs/decisions/`, and verified runtime evidence are the sources of truth.
 
-## Objective
+## Delivery workflow
 
-Execute `IMPLEMENTATION-PLAN.md` from Phase 0 through CP7 and leave a release-ready Rust repository.
-One owner command starts the mission, but this is a durable multi-session run, not one LLM turn. Use
-repository checkpoints and Hermes Kanban so daily reset, compaction, worker crash, or CI wait cannot lose state.
+Repository work goes through the registered Central delivery flow on `uap-build-1`: isolated worktree, target checks, independent review, pull request, required CI, exact-head merge, post-verify, and cleanup. Do not bypass branch protection or place credentials in repository files, prompts, logs, fixtures, CI, or artifacts.
 
-## Sources of truth
+Before implementation:
 
-Read the entire intake bundle before implementation:
+1. Fetch the current `main` branch and enumerate all open pull requests.
+2. Evaluate PR #8 (independent audit), draft PR #9 (integration-ready), and any newer work against this product goal.
+3. Merge valid work through normal gates or supersede it with evidence-backed replacement work. A draft PR must be evaluated, not ignored merely because it is draft.
+4. Reconcile `README.md`, `MISSION.md`, `PROGRESS.json`, and evidence with the actual resulting state.
 
-1. `IMPLEMENTATION-PLAN.md`
-2. `README.md`
-3. `01-executive-summary.md` through `09-bake-off-checklist.md`
-4. every file under `adrs/` and `reference/`
-5. `08-source-license-matrix.csv`
+## Product outcome
 
-The plan and accepted ADRs are closed. If live Phase 0 evidence contradicts them, stop at CP1, record the
-evidence, and request an owner decision. Do not redesign silently.
+Provide a small, documented, stable API contract suitable for application developers:
 
-## Execution contract
+- versioned ninitux-compatible routes, preferably under `/api/v1/spark` unless an existing ninitux convention requires another prefix;
+- health and readiness endpoints;
+- thread or session creation;
+- message or run submission;
+- run status and cancellation;
+- SSE or streaming events where supported by the existing runner;
+- deterministic JSON schemas and safe error codes;
+- cancellation, timeout, startup, shutdown, and bounded lifecycle behavior.
 
-> **Note:** this repository currently uses the GitHub default branch `main`, not `master`. Branch protection
-> requirements below apply to whichever branch GitHub reports as the default branch — currently `main` — even
-> though the imported mission text below refers to it as `master`.
+Preserve exact-model enforcement for `gpt-5.3-codex-spark` and fail closed. Do not add fallback models.
 
-1. Work only on `uap-build-1` under `~/projects/spark-runner` and disposable GitHub Actions runners.
-2. Do not modify unified-agent-platform, k3s, Proxmox, VPN routing, Windows/Qwen, Mac/Ornith, or their secrets.
-3. Use subscription OAuth only. Never introduce paid API keys or copy Codex auth into git, CI, artifacts,
-   prompts, traces, or test fixtures.
-4. Create one Rust binary crate first. Follow Ponytail/YAGNI from the implementation plan: no speculative
-   workspace, adapters, database, or HTTP layer before its gate requires it.
-5. Every coding worker uses its own git worktree. One checkpoint/PR at a time unless file ownership is
-   disjoint and explicitly recorded.
-6. Protected `master`: PR plus required green CI; no direct push, bypass, force-push, or disabled checks.
-7. Each CP must finish in a terminal state: checks green, squash-merged, master confirmed, branch/worktree
-   removed, and handoff files updated.
-8. On gate failure, attempt bounded diagnosis and one root-cause fix. If the same blocker repeats three
-   times or needs owner credentials/architecture, stop safely and report it. Never weaken a gate.
+Add the minimum operator and developer assets needed for a ready project:
 
-## Phase 0 bootstrap
+- documented configuration and environment variables;
+- a Dockerfile or clear container deployment instructions if missing;
+- reverse-proxy notes for mounting below `ninitux.com/api`;
+- safe logging and redaction guidance;
+- an explicit integration boundary for upstream authentication;
+- an OpenAPI specification or equivalent endpoint contract;
+- curl examples and one minimal application integration example;
+- a clear distinction between deterministic offline checks and live Spark/model checks.
 
-Before Rust implementation:
+Address still-relevant audit blockers that prevent UAT or soak readiness, including permanent 503 after a failed live turn, unbounded thread/session or journal growth, timeout inconsistency, graceful shutdown, and Linux-only compilation hazards. Reuse existing Rust code and standard patterns. Do not add speculative dependencies or abstractions.
 
-- install/verify official Codex CLI, rustfmt and clippy on build-1;
-- pin Codex version and SHA-256;
-- verify `codex app-server --listen stdio://`, stable schema generation, account/model/rate-limit reads;
-- run the official Python SDK oracle with an ephemeral read-only prompt;
-- prove the exact `gpt-5.3-codex-spark` model, auth route, and terminal event;
-- store only normalized/redacted protocol evidence.
+## Verification
 
-If exact Spark is absent, auth is unavailable, schema generation fails, or the server substitutes a model,
-CP1 fails and implementation stops. Produce a factual blocker report; do not fall back to Luna, Qwen, Claude,
-another Codex model, `codex exec --json`, or an OpenAI-compatible proxy.
-
-## Checkpoint loop
-
-For CP1 through CP7:
-
-1. Read current `PROGRESS.json` and the relevant plan section.
-2. Create/update Kanban tasks with dependencies and acceptance commands.
-3. Implement the smallest change that can pass the current gate.
-4. Run local checks on build-1.
-5. Push a branch and run deterministic tests on GitHub Actions (`ubuntu-latest`).
-6. Run live OAuth/Spark tests only on build-1 and redact their evidence.
-7. Record results, failures, retries, durations and resource measurements.
-8. Merge only after all current gates are green; clean branch/worktree; advance `PROGRESS.json` atomically.
-
-For CP7, install the release candidate as a build-1 user service and run the required 24h soak, then 72h
-release-candidate soak. Monitoring must survive logout and Hermes session reset. A failed soak opens an incident,
-returns the phase to active, and does not publish a release.
-
-## Required repository evidence
-
-Create these early and keep them current:
+Run on `uap-build-1`:
 
 ```text
-MISSION.md                 # this contract, copied into the new repository
-PROGRESS.json              # machine-readable current CP, state, blocker and next command
-docs/evidence/run.json     # run id, timestamps, Hermes/build/CI versions and final outcome
-docs/evidence/events.jsonl # sanitized phase/gate/command-result timeline
-docs/evidence/cp/CP1.md ... CP7.md
-docs/decisions/            # project ADRs and any owner-approved amendments
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
+cargo build --locked --release
 ```
 
-Each event records: timestamp, run/session/worker id, phase/checkpoint, action class, duration, exit status,
-retry number, git commit/PR/CI URL, test counts, and failure classification. Never record auth values, prompts,
-personal paths, raw environment, private command output, or model response content. Store aggregate token/turn
-counts when Hermes exposes them, not message bodies.
+Add deterministic fake-app-server API tests for the ninitux-compatible surface. CI remains offline and contains no OAuth material. Run live doctor/UAT only through the configured build-1 path when credentials and egress are available; otherwise record a precise blocked result instead of claiming success.
 
-Track at minimum:
-
-- wall time and active agent time per CP;
-- model/provider used by orchestrator and coding worker;
-- tool calls, delegated workers, retries, timeouts and compactions;
-- commits, PRs, CI runs, review/fix loops and changed LOC;
-- test counts/durations, clippy/fmt/audit/deny results;
-- startup/handshake latency, RSS, FD count, descendants, queue high-water and rate-limit snapshots;
-- every gate failure, root cause, recovery action and whether human input was required.
-
-## CI and security
-
-- CI uses fake app-server fixtures only and has no Codex OAuth or other secrets.
-- Run fmt, clippy `-D warnings`, tests, locked release build, dependency/license checks and secret scan.
-- Pin actions by full commit SHA before release readiness.
-- Preserve provenance/notices. BSL/AGPL and unknown-license sources are reference-only unless the owner approves
-  a compatible reuse decision. Do not copy code merely because it is public.
-- Default API bind is loopback; approvals fail closed; process and queue limits remain bounded.
-
-## Terminal outcome
-
-Success requires CP1..CP7 green, 24h and 72h soaks green, a tagged release with checksums/SBOM/notices,
-clean protected master, no disposable branches/worktrees/processes, and a final report linking every evidence
-file, PR, CI run and release artifact.
-
-Failure is also terminal when a hard gate is genuinely blocked: leave no running/disposable state, preserve
-sanitized evidence, set `PROGRESS.json` to `blocked`, and send the owner one concise Telegram report with the
-exact blocker and minimal required action.
+Completion requires green target checks and CI, independent review, merged PRs, fresh `main` verification at the exact merge SHA, current documentation/evidence, and removal of disposable branches and worktrees.
