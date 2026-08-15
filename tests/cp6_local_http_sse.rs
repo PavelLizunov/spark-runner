@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::body::{to_bytes, Body};
@@ -13,7 +13,10 @@ fn config() -> ApiConfig {
     ApiConfig {
         bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8787),
         bearer_token: "test-token".to_string(),
-        workspace_aliases: HashSet::from(["default".to_string(), "repo".to_string()]),
+        workspaces: HashMap::from([
+            ("default".to_string(), std::env::current_dir().unwrap()),
+            ("repo".to_string(), std::env::current_dir().unwrap()),
+        ]),
         live: false,
     }
 }
@@ -71,6 +74,19 @@ async fn exposes_only_cp6_routes_and_authenticates_from_header() {
         router.clone().oneshot(health).await.unwrap().status(),
         StatusCode::OK
     );
+    let product_health = Request::builder()
+        .uri("/api/v1/spark/health")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(product_health)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
 
     let unauth = Request::builder()
         .uri("/ready")
@@ -81,7 +97,16 @@ async fn exposes_only_cp6_routes_and_authenticates_from_header() {
         StatusCode::UNAUTHORIZED
     );
 
-    for path in ["/ready", "/v1/runtime", "/v1/models", "/v1/rate-limits"] {
+    for path in [
+        "/ready",
+        "/v1/runtime",
+        "/v1/models",
+        "/v1/rate-limits",
+        "/api/v1/spark/ready",
+        "/api/v1/spark/runtime",
+        "/api/v1/spark/models",
+        "/api/v1/spark/rate-limits",
+    ] {
         assert_eq!(
             get_json(router.clone(), path).await.0,
             StatusCode::OK,
@@ -105,6 +130,87 @@ async fn exposes_only_cp6_routes_and_authenticates_from_header() {
 }
 
 #[tokio::test]
+async fn canonical_product_routes_cover_session_run_events_and_cleanup() {
+    let router = app(config());
+    let (status, session) = request_json(
+        router.clone(),
+        "POST",
+        "/api/v1/spark/sessions",
+        json!({ "workspace_alias": "repo" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let session_id = session["id"].as_str().unwrap();
+
+    let (status, mismatch) = request_json(
+        router.clone(),
+        "POST",
+        &format!("/api/v1/spark/sessions/{session_id}/runs"),
+        json!({ "workspace_alias": "default", "input": "wrong workspace" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(mismatch["error"]["code"], "WORKSPACE_MISMATCH");
+
+    let (status, run) = request_json(
+        router.clone(),
+        "POST",
+        &format!("/api/v1/spark/sessions/{session_id}/runs"),
+        json!({ "input": "canonical product contract" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let run_id = run["id"].as_str().unwrap();
+    assert_eq!(
+        get_json(router.clone(), &format!("/api/v1/spark/runs/{run_id}"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    let events_request = Request::builder()
+        .uri(format!("/api/v1/spark/runs/{run_id}/events"))
+        .header(header::AUTHORIZATION, "Bearer test-token")
+        .header("x-spark-runner-observer", "1")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(events_request).await.unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        if std::str::from_utf8(&chunk.unwrap())
+            .unwrap()
+            .contains("approval.requested")
+        {
+            break;
+        }
+    }
+    let (status, _) = request_json(
+        router.clone(),
+        "POST",
+        "/api/v1/spark/approvals/approval_1/deny",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = fetch_sse(
+        router.clone(),
+        &format!("/api/v1/spark/runs/{run_id}/events"),
+        None,
+    )
+    .await;
+    assert!(events.iter().any(|event| event["terminal"] == true));
+
+    let (status, _) = request_json(
+        router,
+        "DELETE",
+        &format!("/api/v1/spark/sessions/{session_id}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn rejects_payload_token_paths_wrong_model_and_large_contexts() {
     let router = app(config());
 
@@ -125,6 +231,19 @@ async fn rejects_payload_token_paths_wrong_model_and_large_contexts() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let unknown_field = Request::builder()
+        .method("POST")
+        .uri("/api/v1/spark/sessions")
+        .header(header::AUTHORIZATION, "Bearer test-token")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"workspace_alias":"repo","unknown":true}"#))
+        .unwrap();
+    let response = router.clone().oneshot(unknown_field).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "INVALID_JSON");
 
     let (status, thread) = request_json(
         router.clone(),

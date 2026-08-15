@@ -15,3 +15,11 @@ The accepted remediation's deterministic fake-fixture suite passed 76 tests. It 
 ## Residual live risk
 
 Controlled UAT of the real live bootstrap, authenticated account/model admission, and operational process behavior has not been performed. The selected subscription-auth-file path has only fake-canary coverage. CP6 is therefore not complete, and CP7 remains pending.
+
+## API-product pre-delivery candidate
+
+At `2026-08-15T18:47:49Z`, a new candidate was prepared from `main` SHA `397aacd2cd4b350f59cbdffefae178eb4fd096bf` under the corrected API-product mission. It adds the canonical `/api/v1/spark` sessions/runs/SSE contract and OpenAPI JSON, explicit session cleanup, bounded journal history, workspace-to-directory mapping, timeout propagation, runtime re-admission, safe explicit egress, deterministic JSON request errors, graceful signal shutdown, a Linux-only compilation boundary, container instructions, and ninitux reverse-proxy/authentication guidance.
+
+PR #8 was used as an audit input for the blockers that remain applicable to current code. Draft PR #9 diverges from current `main`; its relevant runtime ideas were selectively reimplemented, while its obsolete protocol pin and delivery-state claims were not imported.
+
+At `2026-08-15T19:04:47Z`, local remediation replaced timestamp-only ephemeral runtime-directory allocation with collision-safe process sequencing and retry behavior. A deterministic repeated-timestamp regression passed, the parallel HTTP/SSE suite then passed 20 consecutive runs (180 tests), and the complete local gate passed formatting, locked clippy with warnings denied, 82 locked offline tests across all targets/features, and locked release build. No OAuth material, account request, network request, live app-server, or model turn was used. These are pre-delivery local results only: authoritative `uap-build-1` checks, independent review, PR, required CI, merge, fresh-main verification, cleanup, live UAT, and soak remain outstanding.

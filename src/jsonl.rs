@@ -1,7 +1,7 @@
 //! JSON-RPC-ish JSONL client over a child process's stdin/stdout.
 //!
-//! Writer sends `{"id":N,"method":"...","params":...}` lines. Reader tolerates
-//! unknown notifications while waiting for a specific response id or
+//! Writer sends JSONL requests and omits `params` for parameterless methods.
+//! Reader tolerates unknown notifications while waiting for a specific response id or
 //! notification method, but poisons the session on protocol desync: an
 //! oversized frame, a malformed frame, or a response whose id does not match
 //! the one being awaited (ADR-004: tolerant reader, strict writer,
@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 /// Default bound for a single response/notification wait. Generous enough for
 /// a live model turn, but short enough that a protocol desync fails loudly
 /// instead of hanging the `doctor`/`run` commands indefinitely.
-const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Upper bound on a single JSONL frame (line), measured via
 /// [`tokio::io::AsyncBufReadExt::read_line`]'s returned byte count. Protects
@@ -206,11 +206,13 @@ impl JsonlClient {
         // pending. A conforming app-server may wait for that response before
         // returning ours; buffering it would deadlock both peers.
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let request = serde_json::json!({
+        let mut request = serde_json::json!({
             "id": id,
             "method": method,
-            "params": params,
         });
+        if !params.is_null() {
+            request["params"] = params;
+        }
         let line = serde_json::to_string(&request)?;
 
         {

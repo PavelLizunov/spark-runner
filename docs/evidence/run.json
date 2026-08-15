@@ -1,7 +1,8 @@
 {
-  "run_id": "spark-runner-foundation-20260712",
+  "run_id": "spark-runner-api-product-20260815",
+  "previous_run_id": "spark-runner-foundation-20260712",
   "repo": "PavelLizunov/spark-runner",
-  "started_at": "2026-07-12T22:59:38Z",
-  "current_checkpoint": "CP6",
-  "final_outcome": "partial"
+  "started_at": "2026-08-15T18:29:30Z",
+  "current_checkpoint": "API_PRODUCT",
+  "final_outcome": "pre_delivery_candidate"
 }

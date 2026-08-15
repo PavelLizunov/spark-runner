@@ -1,13 +1,14 @@
 {
-  "run_id": "spark-runner-foundation-20260712",
+  "run_id": "spark-runner-api-product-20260815",
+  "previous_run_id": "spark-runner-foundation-20260712",
   "repo": "PavelLizunov/spark-runner",
-  "current_checkpoint": "CP6",
-  "previous_checkpoint": "CP5",
-  "state": "partial",
+  "current_checkpoint": "API_PRODUCT",
+  "previous_checkpoint": "CP6",
+  "state": "active",
   "completed_checkpoints": [],
   "blocker": null,
-  "updated_at": "2026-07-13T20:22:07Z",
-  "next_command": "Controlled live UAT on uap-build-1 remains pending; do not run it without separate authorization.",
+  "updated_at": "2026-08-15T19:04:47Z",
+  "next_command": "Coordinator reruns authoritative uap-build-1 gates and independent review before any PR, CI, merge, fresh-main verification, or cleanup action.",
   "checkpoints": {
     "CP1": {
       "name": "Phase 0 bootstrap: raw app-server + Python SDK oracle",
@@ -86,6 +87,42 @@
       "started_at": null,
       "completed_at": null,
       "evidence_file": "docs/evidence/cp/CP7.md"
+    },
+    "API_PRODUCT": {
+      "name": "Versioned ninitux-compatible Spark Runner API product",
+      "state": "pre_delivery_candidate",
+      "started_at": "2026-08-15T18:29:30Z",
+      "completed_at": null,
+      "base_sha": "397aacd2cd4b350f59cbdffefae178eb4fd096bf",
+      "api_prefix": "/api/v1/spark",
+      "required_model": "gpt-5.3-codex-spark",
+      "fallback_model_used": false,
+      "pull_request_evaluation": {
+        "8": "Useful independent audit of 6c2b914; findings were revalidated against current main and the still-relevant runtime blockers were addressed in the candidate. The stale audit document is not a current-state delivery artifact.",
+        "9": "Diverged draft based on 6c2b914. Relevant bounded lifecycle, workspace, timeout, readiness, graceful-shutdown, and egress ideas were selectively reimplemented without importing its obsolete pin or delivery claims."
+      },
+      "local_offline_verification": {
+        "observed_at": "2026-08-15T19:04:47Z",
+        "fmt": "passed",
+        "clippy_locked_all_targets_all_features": "passed",
+        "tests_locked_all_targets_all_features": {
+          "status": "passed",
+          "count": 82
+        },
+        "build_locked_release": "passed",
+        "openapi_json": "valid_json",
+        "live_model_call_performed": false
+      },
+      "remaining_delivery_gates": [
+        "authoritative uap-build-1 target checks",
+        "independent review",
+        "branch protection and required-check enforcement",
+        "pull request and required CI",
+        "exact-head merge",
+        "fresh-main post-verification",
+        "disposable branch and worktree cleanup",
+        "authorized live UAT and later soak"
+      ]
     }
   }
 }

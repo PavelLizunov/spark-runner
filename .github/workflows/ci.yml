@@ -15,6 +15,7 @@ jobs:
           set -euo pipefail
           python3 -c "import json; json.load(open('PROGRESS.json'))"
           python3 -c "import json; json.load(open('docs/evidence/run.json'))"
+          python3 -c "import json; json.load(open('openapi/spark-runner-v1.json'))"
           python3 -c "import json; json.load(open('protocol/0.142.0/stable.schema.json'))"
           python3 -c "import json; json.load(open('protocol/0.144.3/codex_app_server_protocol.v2.schemas.json'))"
           python3 - <<'PY'
@@ -54,3 +55,4 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked --all-targets --all-features
+          cargo build --locked --release

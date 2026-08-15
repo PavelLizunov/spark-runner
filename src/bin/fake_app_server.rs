@@ -117,6 +117,7 @@ fn main() -> io::Result<()> {
     let barrier_phase = arg_value(&args, "--barrier-phase");
     let barrier_marker = arg_value(&args, "--barrier-marker").map(PathBuf::from);
     let codex_home_marker = arg_value(&args, "--codex-home-marker").map(PathBuf::from);
+    let thread_cwd_marker = arg_value(&args, "--thread-cwd-marker").map(PathBuf::from);
     if let Some(marker) = arg_value(&args, "--pid-marker") {
         std::fs::write(marker, std::process::id().to_string())?;
     }
@@ -287,6 +288,14 @@ fn main() -> io::Result<()> {
             "thread/start" => {
                 thread_counter += 1;
                 let thread_id = format!("fake-thread-{thread_counter}");
+                let cwd = params
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if let Some(marker) = thread_cwd_marker.as_ref() {
+                    std::fs::write(marker, &cwd)?;
+                }
                 let model = params
                     .get("model")
                     .and_then(Value::as_str)
@@ -302,7 +311,7 @@ fn main() -> io::Result<()> {
                                 "cliVersion": "0.144.3",
                                 "createdAt": 1,
                                 "updatedAt": 1,
-                                "cwd": "/tmp",
+                                "cwd": cwd,
                                 "ephemeral": true,
                                 "modelProvider": "openai",
                                 "preview": "",
@@ -315,7 +324,7 @@ fn main() -> io::Result<()> {
                             "modelProvider": "openai",
                             "approvalPolicy": "on-request",
                             "approvalsReviewer": "user",
-                            "cwd": "/tmp",
+                            "cwd": cwd,
                             "sandbox": "read-only"
                         }
                     }),
@@ -330,7 +339,7 @@ fn main() -> io::Result<()> {
                                 "cliVersion": "0.144.3",
                                 "createdAt": 1,
                                 "updatedAt": 1,
-                                "cwd": "/tmp",
+                                "cwd": cwd,
                                 "ephemeral": true,
                                 "modelProvider": "openai",
                                 "preview": "",
