@@ -1,0 +1,866 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Spark Runner API",
+    "version": "1.0.0",
+    "description": "Authenticated, bounded API for exact gpt-5.3-codex-spark runs. Upstream authentication remains the reverse proxy's responsibility."
+  },
+  "servers": [
+    {
+      "url": "https://ninitux.com/api/v1/spark"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "summary": "Process liveness",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Process is alive",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "operationId": "ready",
+        "summary": "Runtime readiness and bounded re-admission",
+        "responses": {
+          "200": {
+            "description": "Pinned runtime is admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ready"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/RuntimeNotReady"
+          }
+        }
+      }
+    },
+    "/runtime": {
+      "get": {
+        "operationId": "getRuntime",
+        "summary": "Runtime capabilities and bounded limits",
+        "responses": {
+          "200": {
+            "description": "Runtime capabilities",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Runtime"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/models": {
+      "get": {
+        "operationId": "listModels",
+        "summary": "Admitted model metadata",
+        "responses": {
+          "200": {
+            "description": "Only the admitted exact model is returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelList"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/rate-limits": {
+      "get": {
+        "operationId": "getRateLimits",
+        "summary": "Sanitized admission and local capacity",
+        "responses": {
+          "200": {
+            "description": "Sanitized quota and local limits",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimits"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sessions": {
+      "post": {
+        "operationId": "createSession",
+        "summary": "Create a bounded ephemeral session",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSession"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Session created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "429": {
+            "$ref": "#/components/responses/Capacity"
+          }
+        }
+      }
+    },
+    "/sessions/{session_id}": {
+      "delete": {
+        "operationId": "deleteSession",
+        "summary": "Release an idle session and retained runs",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SessionId"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Session deleted"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/sessions/{session_id}/runs": {
+      "post": {
+        "operationId": "createRun",
+        "summary": "Submit one run to a session",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SessionId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRun"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Run accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Run"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/Capacity"
+          },
+          "503": {
+            "$ref": "#/components/responses/RuntimeNotReady"
+          }
+        }
+      }
+    },
+    "/runs/{run_id}": {
+      "get": {
+        "operationId": "getRun",
+        "summary": "Read run status",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RunId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Run"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/runs/{run_id}/events": {
+      "get": {
+        "operationId": "streamRunEvents",
+        "summary": "Replay and stream ordered run events",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RunId"
+          },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "X-Spark-Runner-Observer",
+            "in": "header",
+            "required": false,
+            "description": "Set to 1 for monitoring. The first non-observer stream controls cancellation on disconnect.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE frames; each data field is a TurnEvent JSON object",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/runs/{run_id}/cancel": {
+      "post": {
+        "operationId": "cancelRun",
+        "summary": "Cancel a running run and await bounded cleanup",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RunId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Terminal run state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Run"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/approvals/{approval_id}/approve": {
+      "post": {
+        "operationId": "approveAction",
+        "summary": "Approve an exactly reviewable pending action",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ApprovalId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Decision delivered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Approval"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/approvals/{approval_id}/deny": {
+      "post": {
+        "operationId": "denyAction",
+        "summary": "Deny a pending action",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ApprovalId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Decision delivered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Approval"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "parameters": {
+      "SessionId": {
+        "name": "session_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^thread_[0-9]+$"
+        }
+      },
+      "RunId": {
+        "name": "run_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^turn_[0-9]+$"
+        }
+      },
+      "ApprovalId": {
+        "name": "approval_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^approval_[0-9]+$"
+        }
+      }
+    },
+    "schemas": {
+      "Health": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok"
+            ]
+          }
+        }
+      },
+      "Ready": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ready"
+            ]
+          }
+        }
+      },
+      "Runtime": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "runtime",
+          "mode",
+          "public_access",
+          "full_access",
+          "chat_completions",
+          "bind_default",
+          "max_body_bytes",
+          "max_input_chars",
+          "workspace_aliases"
+        ],
+        "properties": {
+          "runtime": {
+            "type": "string",
+            "enum": [
+              "spark-runner"
+            ]
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "live",
+              "offline-fake-app-server"
+            ]
+          },
+          "public_access": {
+            "type": "boolean"
+          },
+          "full_access": {
+            "type": "boolean"
+          },
+          "chat_completions": {
+            "type": "boolean"
+          },
+          "bind_default": {
+            "type": "string"
+          },
+          "max_body_bytes": {
+            "type": "integer"
+          },
+          "max_input_chars": {
+            "type": "integer"
+          },
+          "workspace_aliases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ModelList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "object",
+          "data"
+        ],
+        "properties": {
+          "object": {
+            "type": "string",
+            "enum": [
+              "list"
+            ]
+          },
+          "data": {
+            "type": "array",
+            "maxItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "object",
+                "owned_by"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "enum": [
+                    "gpt-5.3-codex-spark"
+                  ]
+                },
+                "object": {
+                  "type": "string",
+                  "enum": [
+                    "model"
+                  ]
+                },
+                "owned_by": {
+                  "type": "string",
+                  "enum": [
+                    "openai"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "RateLimits": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "quota_available",
+          "concurrent_turns",
+          "max_body_bytes",
+          "max_input_chars"
+        ],
+        "properties": {
+          "quota_available": {
+            "type": "boolean"
+          },
+          "concurrent_turns": {
+            "type": "integer",
+            "enum": [
+              1
+            ]
+          },
+          "max_body_bytes": {
+            "type": "integer",
+            "enum": [
+              16384
+            ]
+          },
+          "max_input_chars": {
+            "type": "integer",
+            "enum": [
+              8192
+            ]
+          }
+        }
+      },
+      "CreateSession": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "workspace_alias"
+        ],
+        "properties": {
+          "workspace_alias": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$"
+          },
+          "model": {
+            "type": "string",
+            "enum": [
+              "gpt-5.3-codex-spark"
+            ]
+          },
+          "sandbox": {
+            "type": "string",
+            "enum": [
+              "read_only"
+            ]
+          },
+          "ephemeral": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          }
+        }
+      },
+      "Session": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "workspace_alias",
+          "model",
+          "sandbox",
+          "ephemeral"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "workspace_alias": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string",
+            "enum": [
+              "gpt-5.3-codex-spark"
+            ]
+          },
+          "sandbox": {
+            "type": "string",
+            "enum": [
+              "read_only"
+            ]
+          },
+          "ephemeral": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          }
+        }
+      },
+      "CreateRun": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "input"
+        ],
+        "properties": {
+          "workspace_alias": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$"
+          },
+          "input": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "timeout_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 300,
+            "default": 120
+          }
+        }
+      },
+      "Run": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "thread_id",
+          "workspace_alias",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "thread_id": {
+            "type": "string"
+          },
+          "workspace_alias": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "running",
+              "waiting_approval",
+              "interrupted",
+              "completed",
+              "failed"
+            ]
+          }
+        }
+      },
+      "Approval": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "turn_id",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "turn_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "approved",
+              "denied"
+            ]
+          }
+        }
+      },
+      "TurnEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "type",
+          "turn_id",
+          "payload",
+          "terminal"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "turn.started",
+              "approval.requested",
+              "approval.decided",
+              "turn.completed",
+              "turn.interrupted",
+              "turn.failed"
+            ]
+          },
+          "turn_id": {
+            "type": "string"
+          },
+          "payload": {
+            "type": "object"
+          },
+          "terminal": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Invalid or unsafe request",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Resource not found",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "Lifecycle conflict or ambiguous delivery",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Capacity": {
+        "description": "Bounded local capacity is full",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "RuntimeNotReady": {
+        "description": "Pinned runtime is not admitted",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Timeout": {
+        "description": "Bounded cleanup timed out",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    }
+  }
+}

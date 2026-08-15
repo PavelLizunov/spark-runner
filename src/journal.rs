@@ -1,9 +1,10 @@
-//! Append-only SQLite journal and restart projection for CP5.
+//! Bounded SQLite lifecycle journal and restart projection for CP5.
 //!
 //! The journal owns exactly one writer task. Callers send typed events; the
 //! writer redacts the payload before it reaches SQLite. Raw capture and
 //! terminal output are persisted only when explicitly supplied and the matching
-//! TTL is configured.
+//! TTL is configured. Core lifecycle rows use a rolling, operator-configurable
+//! event bound so service uptime cannot grow the database without limit.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -16,11 +17,15 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
+pub const DEFAULT_JOURNAL_MAX_EVENTS: usize = 100_000;
+const HARD_JOURNAL_MAX_EVENTS: usize = 1_000_000;
+
 #[derive(Debug, Clone)]
 pub struct JournalConfig {
     pub path: PathBuf,
     pub terminal_output_ttl: Option<Duration>,
     pub raw_capture_ttl: Option<Duration>,
+    pub max_events: usize,
 }
 
 impl JournalConfig {
@@ -29,6 +34,7 @@ impl JournalConfig {
             path: path.into(),
             terminal_output_ttl: None,
             raw_capture_ttl: None,
+            max_events: DEFAULT_JOURNAL_MAX_EVENTS,
         }
     }
 
@@ -37,6 +43,11 @@ impl JournalConfig {
         let mut config = Self::new(PathBuf::from(path));
         config.terminal_output_ttl = ttl_from_env("SPARK_RUNNER_TERMINAL_OUTPUT_TTL_SECS");
         config.raw_capture_ttl = ttl_from_env("SPARK_RUNNER_RAW_CAPTURE_TTL_SECS");
+        config.max_events = std::env::var("SPARK_RUNNER_JOURNAL_MAX_EVENTS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| (1..=HARD_JOURNAL_MAX_EVENTS).contains(value))
+            .unwrap_or(DEFAULT_JOURNAL_MAX_EVENTS);
         Some(config)
     }
 }
@@ -415,7 +426,26 @@ fn append_record(
             params![event_id, serde_json::to_string(&raw)?, now.saturating_add(duration_ms(ttl))],
         )?;
     }
+    prune_history(connection, config.max_events)?;
     Ok(())
+}
+
+fn prune_history(connection: &Connection, max_events: usize) -> JournalResult<usize> {
+    let offset = i64::try_from(max_events).unwrap_or(i64::MAX);
+    connection.execute(
+        "DELETE FROM journal_captures
+         WHERE event_id IN (
+             SELECT id FROM journal_events ORDER BY id DESC LIMIT -1 OFFSET ?1
+         )",
+        params![offset],
+    )?;
+    Ok(connection.execute(
+        "DELETE FROM journal_events
+         WHERE id IN (
+             SELECT id FROM journal_events ORDER BY id DESC LIMIT -1 OFFSET ?1
+         )",
+        params![offset],
+    )?)
 }
 
 fn prune_expired(connection: &Connection) -> JournalResult<usize> {

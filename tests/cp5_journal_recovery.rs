@@ -265,9 +265,41 @@ async fn opt_in_capture_is_redacted_and_pruned_by_ttl() {
         .unwrap();
     assert_eq!(
         remaining_events, 1,
-        "core audit event must remain append-only"
+        "capture expiry must not delete the core lifecycle event"
     );
     writer.shutdown().await.unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn journal_history_is_bounded_by_configured_event_capacity() {
+    let path = unique_journal("bounded-history");
+    let mut config = JournalConfig::new(&path);
+    config.max_events = 3;
+    let writer = JournalWriter::open(config).unwrap();
+    for index in 0..5 {
+        writer
+            .append(JournalEvent::Incident {
+                execution_id: None,
+                class: format!("bounded-{index}"),
+                message: "safe message".to_string(),
+            })
+            .await
+            .unwrap();
+    }
+    writer.shutdown().await.unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    let payloads: Vec<String> = connection
+        .prepare("SELECT payload_json FROM journal_events ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(payloads.len(), 3);
+    assert!(payloads.first().unwrap().contains("bounded-2"));
+    assert!(payloads.last().unwrap().contains("bounded-4"));
     let _ = std::fs::remove_file(&path);
 }
 
