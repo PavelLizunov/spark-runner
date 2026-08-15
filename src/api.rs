@@ -159,6 +159,10 @@ fn workspaces() -> Result<HashMap<String, PathBuf>, ApiError> {
         ]));
     };
 
+    parse_workspaces(&raw)
+}
+
+fn parse_workspaces(raw: &str) -> Result<HashMap<String, PathBuf>, ApiError> {
     let mut workspaces = HashMap::new();
     for entry in raw
         .split(',')
@@ -170,10 +174,14 @@ fn workspaces() -> Result<HashMap<String, PathBuf>, ApiError> {
             .map(|(alias, path)| (alias.trim(), path.trim()))
             .filter(|(alias, path)| valid_workspace_alias(alias) && !path.is_empty())
             .ok_or(ApiError::InvalidWorkspaces)?;
-        let path = PathBuf::from(path)
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(ApiError::InvalidWorkspaces);
+        }
+        let path = path
             .canonicalize()
             .ok()
-            .filter(|path| path.is_absolute() && path.is_dir())
+            .filter(|path| path.is_dir())
             .ok_or(ApiError::InvalidWorkspaces)?;
         if workspaces.insert(alias.to_string(), path).is_some() {
             return Err(ApiError::InvalidWorkspaces);
@@ -2164,6 +2172,14 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use crate::client::ApprovalDescriptor;
+
+    #[test]
+    fn configured_workspace_paths_must_be_absolute_before_canonicalization() {
+        assert!(matches!(
+            parse_workspaces("repo=."),
+            Err(ApiError::InvalidWorkspaces)
+        ));
+    }
 
     #[tokio::test]
     async fn oversized_approval_descriptor_is_denied_before_becoming_actionable() {
