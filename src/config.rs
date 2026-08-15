@@ -4,6 +4,7 @@ use std::env;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
@@ -19,6 +20,7 @@ const EXPECTED_CODEX_VERSION: &str = "0.144.3";
 const EXPECTED_CODEX_SCHEMA_PATH: &str =
     "protocol/0.144.3/codex_app_server_protocol.v2.schemas.json";
 const PLACEHOLDER_SCHEMA_HASH: &str = "generated-after-implementation";
+static EPHEMERAL_CWD_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A verified live executable kept open from byte verification through spawn.
 /// On Linux the launcher executes `/proc/self/fd/N`, which names this exact
@@ -570,23 +572,55 @@ pub fn fake_app_server_path() -> Result<PathBuf, ConfigError> {
 
 /// A fresh, empty, read-only-safe temp directory for an ephemeral thread's cwd.
 pub fn ephemeral_cwd() -> Result<PathBuf, ConfigError> {
-    let unique = SystemTime::now()
+    let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    let dir = env::temp_dir().join(format!("spark-runner-{}-{unique}", std::process::id()));
-    std::fs::create_dir(&dir).map_err(ConfigError::EphemeralDir)?;
-    Ok(dir)
+    create_ephemeral_cwd(timestamp)
+}
+
+fn create_ephemeral_cwd(timestamp: u128) -> Result<PathBuf, ConfigError> {
+    loop {
+        let sequence = EPHEMERAL_CWD_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let dir = env::temp_dir().join(format!(
+            "spark-runner-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(ConfigError::EphemeralDir(error)),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     #[cfg(unix)]
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{sha256_hex, CodexLock, ConfigError};
+    use super::{create_ephemeral_cwd, sha256_hex, CodexLock, ConfigError};
+
+    #[test]
+    fn ephemeral_cwds_are_unique_when_timestamps_repeat() {
+        let handles: Vec<_> = (0..16)
+            .map(|_| std::thread::spawn(|| create_ephemeral_cwd(0)))
+            .collect();
+        let directories: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect();
+        assert_eq!(
+            directories.iter().collect::<HashSet<_>>().len(),
+            directories.len()
+        );
+        for directory in directories {
+            fs::remove_dir(directory).unwrap();
+        }
+    }
 
     #[test]
     fn sha256_matches_the_standard_test_vector() {
